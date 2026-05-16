@@ -1,0 +1,4 @@
+comment = 'Roaring bitmap index access method'
+default_version = '1.0'
+module_pathname = '$libdir/pg_roaring_index'
+relocatable = false

@@ -1,0 +1,9 @@
+*.o
+*.so
+*.dylib
+*.a
+results/
+tmp_check/
+src/vendor/croaring/roaring.c
+src/vendor/croaring/roaring.h
+vaults/

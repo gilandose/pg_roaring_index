@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Validate conventional commit format.
+# Skips merge commits, fixups, and squashes.
+
+MSG_FILE="$1"
+MSG="$(cat "$MSG_FILE")"
+
+# Skip generated commit messages
+case "$MSG" in
+    Merge*|Revert*|fixup!*|squash!*)
+        exit 0 ;;
+esac
+
+# Strip comments and leading/trailing whitespace
+FIRST_LINE="$(echo "$MSG" | grep -v '^#' | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+# Conventional commit pattern:
+#   type(scope)!: description   or   type!: description   or   type: description
+PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9_/-]+\))?(!)?: .+'
+
+if ! echo "$FIRST_LINE" | grep -qE "$PATTERN"; then
+    echo ""
+    echo "ERROR: commit message does not follow conventional commits format."
+    echo ""
+    echo "  Expected: <type>[(<scope>)]: <description>"
+    echo "  Got:      $FIRST_LINE"
+    echo ""
+    echo "  Types: feat fix docs style refactor perf test build ci chore revert"
+    echo "  Example: feat(scan): implement roaring_getbitmap"
+    echo ""
+    exit 1
+fi
+
+# Warn (don't fail) if subject line exceeds 72 chars
+if [ ${#FIRST_LINE} -gt 72 ]; then
+    echo "WARNING: subject line is ${#FIRST_LINE} chars (recommended max 72)"
+fi
+
+exit 0
