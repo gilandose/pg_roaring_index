@@ -1,0 +1,13 @@
+.git/
+.claude/
+docker/
+vaults/
+results/
+tmp_check/
+**/*.dylib
+**/*.so
+**/*.o
+**/*.a
+**/*.bc
+regression.diffs
+regression.out

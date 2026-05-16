@@ -1,0 +1,22 @@
+services:
+  postgres:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: roaring
+      POSTGRES_DB: roaring_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql   # PG18+ expects mount here, not /data subdir
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d roaring_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
