@@ -20,7 +20,7 @@
 /* ----------
  * On-disk constants
  * ---------- */
-#define ROARING_MAGIC               UINT32CONST(0x524F4152)  /* "ROAR" */
+#define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
 #define ROARING_INDEX_VERSION       1   /* not ROARING_VERSION — clashes with CRoaring */
 
 /* Page type tags (stored in special->page_type) */
@@ -49,6 +49,9 @@
 
 /* Pending list merge threshold (entries); override via storage param later */
 #define ROARING_PENDING_MERGE_THRESHOLD 100000
+
+/* Fixed block number for the metapage */
+#define ROARING_METAPAGE_BLKNO          0
 
 /* ----------
  * On-disk page structures

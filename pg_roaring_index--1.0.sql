@@ -18,3 +18,8 @@ CREATE ACCESS METHOD roaring
 CREATE OPERATOR CLASS roaring_int8_tid_ops
     DEFAULT FOR TYPE int8 USING roaring AS
     OPERATOR 1 =(int8, int8);
+
+-- int4 variant: DatumGetInt64 is safe for int4 on 64-bit (PG sign-extends)
+CREATE OPERATOR CLASS roaring_int4_tid_ops
+    DEFAULT FOR TYPE int4 USING roaring AS
+    OPERATOR 1 =(int4, int4);

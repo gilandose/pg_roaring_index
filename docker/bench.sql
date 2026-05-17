@@ -65,27 +65,33 @@ ORDER BY pg_relation_size(indexrelid) DESC;
 -- ---- 4. Roaring index ------------------------------------------------
 \echo ''
 \echo '--- 4. Roaring index ---'
-\echo '    (ambuild not yet implemented — shows AM registration only)'
 
 -- Confirm the AM is registered.
 SELECT amname, amtype FROM pg_am WHERE amname = 'roaring';
 
--- This will error until Phase 1 step 1.1 is complete.
--- Uncomment when roaring_build() is implemented:
---
--- CREATE INDEX idx_items_roaring_loc
---     ON items USING roaring (location_id);
--- ANALYZE items;
---
--- EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
--- SELECT count(*) FROM items WHERE location_id = 42;
---
--- SELECT
---     indexrelname,
---     pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
--- FROM pg_stat_user_indexes
--- WHERE relname = 'items'
--- ORDER BY pg_relation_size(indexrelid) DESC;
+DROP INDEX IF EXISTS idx_items_roaring_loc;
+
+\echo ''
+\echo '--- 4a. Build roaring index ---'
+\timing on
+CREATE INDEX idx_items_roaring_loc
+    ON items USING roaring (location_id);
+\timing off
+ANALYZE items;
+
+\echo ''
+\echo '--- 4b. Roaring: single location lookup ---'
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT count(*) FROM items WHERE location_id = 42;
+
+\echo ''
+\echo '--- 4c. Index sizes ---'
+SELECT
+    indexrelname,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+FROM pg_stat_user_indexes
+WHERE relname = 'items'
+ORDER BY pg_relation_size(indexrelid) DESC;
 
 \echo ''
 \echo '======================================================'
