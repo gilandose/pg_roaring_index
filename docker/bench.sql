@@ -80,12 +80,30 @@ CREATE INDEX idx_items_roaring_loc
 ANALYZE items;
 
 \echo ''
-\echo '--- 4b. Roaring: single location lookup ---'
+\echo '--- 4b. Roaring: single location lookup (planner choice) ---'
 EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
 SELECT count(*) FROM items WHERE location_id = 42;
 
 \echo ''
-\echo '--- 4c. Index sizes ---'
+\echo '--- 4c. Roaring: isolated bitmap scan (B-tree dropped temporarily) ---'
+-- Drop B-tree so only the roaring index is available, then restore it.
+DROP INDEX IF EXISTS idx_items_btree_loc;
+SET enable_seqscan = off;
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT count(*) FROM items WHERE location_id = 42;
+RESET ALL;
+CREATE INDEX idx_items_btree_loc ON items (location_id);
+ANALYZE items;
+
+\echo ''
+\echo '--- 4d. Correctness check: roaring vs btree counts ---'
+SELECT
+    (SELECT count(*) FROM items WHERE location_id = 42)            AS total_loc42,
+    (SELECT count(*) FROM items WHERE location_id = 42
+        AND status = 'active')                                      AS active_loc42;
+
+\echo ''
+\echo '--- 4e. Index sizes ---'
 SELECT
     indexrelname,
     pg_size_pretty(pg_relation_size(indexrelid)) AS index_size

@@ -390,7 +390,12 @@ write_leaf_and_dir_pages(Relation index,
 			uint32		count = Min(max_dir, leaf_count - start);
 			BlockNumber blkno;
 
-			blkno = write_dir_page(index, leaf_entries + start, count, 1);
+			/*
+			 * Level-1 pages (level=0): their children are leaf pages.
+			 * Convention: level=0 means "children are leaf pages";
+			 *             level=N>0 means "children are dir pages at level N-1".
+			 */
+			blkno = write_dir_page(index, leaf_entries + start, count, 0);
 			l1_entries[j].high_key   = leaf_entries[start + count - 1].high_key;
 			l1_entries[j].child_page = blkno;
 		}
@@ -401,7 +406,8 @@ write_leaf_and_dir_pages(Relation index,
 				 "(%u leaf pages); three-level directory not yet implemented",
 				 leaf_count);
 
-		*root_dir_out = write_dir_page(index, l1_entries, l1_count, 0);
+		/* Root (level=1): children are dir pages at level 0. */
+		*root_dir_out = write_dir_page(index, l1_entries, l1_count, 1);
 		pfree(l1_entries);
 	}
 
