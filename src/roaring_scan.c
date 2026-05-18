@@ -1,8 +1,11 @@
 #include "pg_roaring_index.h"
 
 #include "access/relscan.h"
+#include "access/transam.h"
+#include "access/xact.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 /* ----------------------------------------------------------------
  * roaring_dir_lookup
@@ -16,7 +19,7 @@
  *
  * Returns InvalidBlockNumber if value is beyond all high_keys.
  * ---------------------------------------------------------------- */
-static BlockNumber
+BlockNumber
 roaring_dir_lookup(Relation index, BlockNumber dir_blkno, int64 value)
 {
 	Buffer			   buf;
@@ -102,14 +105,37 @@ roaring_endscan(IndexScanDesc scan)
 }
 
 /* ----------------------------------------------------------------
+ * roaring_pending_visible
+ *
+ * MVCC visibility check for a pending-list entry's xmin against the
+ * current scan snapshot.
+ * ---------------------------------------------------------------- */
+static bool
+roaring_pending_visible(TransactionId xmin, Snapshot snapshot)
+{
+	if (!TransactionIdIsValid(xmin))
+		return false;
+	if (TransactionIdIsCurrentTransactionId(xmin))
+		return true;					/* own insert */
+	if (XidInMVCCSnapshot(xmin, snapshot))
+		return false;					/* was in-progress when snapshot taken */
+	return TransactionIdDidCommit(xmin);
+}
+
+/* ----------------------------------------------------------------
  * roaring_getbitmap
  *
  * Lookup the single equality scan key in the roaring index and
  * populate the TIDBitmap with matching TIDs.
+ *
+ * Two sources are consulted:
+ *   (a) Main index: metapage → directory → leaf → roaring64 bitmap.
+ *   (b) Pending insert list: linear scan for matching value/xmin.
  * ---------------------------------------------------------------- */
 int64
 roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
+#define ROARING_TID_BATCH 512
 	Relation			index = scan->indexRelation;
 	RoaringScanOpaque  *so    = (RoaringScanOpaque *) scan->opaque;
 	int64				ntids = 0;
@@ -118,16 +144,11 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	Buffer				metabuf;
 	RoaringMetaPageData *meta;
 	BlockNumber			root_blkno;
-	BlockNumber			leaf_blkno;
+	BlockNumber			pending_head;
+	uint32				pending_count;
 
-	Buffer				leafbuf;
-	Page				leafpage;
-	OffsetNumber		lo, hi;
-	OffsetNumber		found_off = InvalidOffsetNumber;
-	RoaringLeafEntry   *le = NULL;
-
-	roaring64_bitmap_t *bm;
-	roaring64_iterator_t *it;
+	ItemPointerData		tid_buf[ROARING_TID_BATCH];
+	int					tid_count = 0;
 
 	/* getbitmap is called once per scan; subsequent calls return 0. */
 	if (so->bitmap_loaded)
@@ -142,110 +163,158 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	/* ---- 1. Read metapage ---- */
 	metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
-	meta	   = RoaringPageGetMeta(BufferGetPage(metabuf));
+	meta = RoaringPageGetMeta(BufferGetPage(metabuf));
 
 	if (meta->magic != ROARING_MAGIC)
 		elog(ERROR, "pg_roaring_index: bad magic in metapage of index \"%s\"",
 			 RelationGetRelationName(index));
 
-	root_blkno = meta->root_directory_page;
+	root_blkno    = meta->root_directory_page;
+	pending_head  = meta->pending_insert_head;
+	pending_count = meta->pending_insert_count;
 	UnlockReleaseBuffer(metabuf);
 
-	if (root_blkno == InvalidBlockNumber)
-		return 0;			/* empty index */
-
-	/* ---- 2. Walk directory to find the right leaf page ---- */
-	leaf_blkno = roaring_dir_lookup(index, root_blkno, scan_value);
-	if (leaf_blkno == InvalidBlockNumber)
-		return 0;			/* value beyond all indexed values */
-
-	/* ---- 3. Binary-search leaf page for exact value ---- */
-	leafbuf  = ReadBuffer(index, leaf_blkno);
-	LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
-	leafpage = BufferGetPage(leafbuf);
-
-	lo = 1;
-	hi = PageGetMaxOffsetNumber(leafpage);
-	while (lo <= hi)
+	/* ---- 2–5. Main index lookup (directory → leaf → bitmap). ---- */
+	if (root_blkno != InvalidBlockNumber)
 	{
-		OffsetNumber	  mid = (lo + hi) / 2;
-		RoaringLeafEntry *e   = (RoaringLeafEntry *)
-								PageGetItem(leafpage,
-											PageGetItemId(leafpage, mid));
-		if (e->value == scan_value)
+		BlockNumber			 leaf_blkno;
+		Buffer				 leafbuf;
+		Page				 leafpage;
+		OffsetNumber		 lo, hi;
+		OffsetNumber		 found_off = InvalidOffsetNumber;
+		RoaringLeafEntry	*le		   = NULL;
+
+		leaf_blkno = roaring_dir_lookup(index, root_blkno, scan_value);
+
+		if (leaf_blkno != InvalidBlockNumber)
 		{
-			le		  = e;
-			found_off = mid;
-			break;
-		}
-		else if (e->value < scan_value)
-			lo = mid + 1;
-		else
-			hi = mid - 1;
-	}
+			leafbuf  = ReadBuffer(index, leaf_blkno);
+			LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
+			leafpage = BufferGetPage(leafbuf);
 
-	if (le == NULL)
-	{
-		UnlockReleaseBuffer(leafbuf);
-		return 0;			/* value not found */
-	}
-
-	if (le->flags != ROARING_ENTRY_INLINE)
-	{
-		UnlockReleaseBuffer(leafbuf);
-		elog(ERROR, "pg_roaring_index: overflow entries not yet implemented");
-	}
-
-	/* ---- 4. Deserialize bitmap ---- */
-	{
-		Size item_len  = ItemIdGetLength(PageGetItemId(leafpage, found_off));
-		Size bitmap_len = item_len - sizeof(RoaringLeafEntry);
-
-		bm = roaring64_bitmap_portable_deserialize_safe(
-				(const char *)(le + 1), bitmap_len);
-
-		if (bm == NULL)
-		{
-			UnlockReleaseBuffer(leafbuf);
-			elog(ERROR, "pg_roaring_index: failed to deserialize bitmap for value "
-				 INT64_FORMAT, scan_value);
-		}
-	}
-
-	UnlockReleaseBuffer(leafbuf);
-
-	/* ---- 5. Add all TIDs to the TIDBitmap ---- */
-	{
-#define ROARING_TID_BATCH 512
-		ItemPointerData tid_buf[ROARING_TID_BATCH];
-		int				tid_count = 0;
-
-		it = roaring64_iterator_create(bm);
-		while (roaring64_iterator_has_value(it))
-		{
-			uint64		 linear = roaring64_iterator_value(it);
-			BlockNumber  block  = (BlockNumber)(linear >> 16);
-			OffsetNumber off    = (OffsetNumber)(linear & 0xFFFF);
-
-			if (tid_count == ROARING_TID_BATCH)
+			lo = 1;
+			hi = PageGetMaxOffsetNumber(leafpage);
+			while (lo <= hi)
 			{
-				tbm_add_tuples(tbm, tid_buf, tid_count, false);
-				tid_count = 0;
+				OffsetNumber	  mid = (lo + hi) / 2;
+				RoaringLeafEntry *e   = (RoaringLeafEntry *)
+										PageGetItem(leafpage,
+													PageGetItemId(leafpage, mid));
+				if (e->value == scan_value)
+				{
+					le        = e;
+					found_off = mid;
+					break;
+				}
+				else if (e->value < scan_value)
+					lo = mid + 1;
+				else
+					hi = mid - 1;
 			}
 
-			ItemPointerSet(&tid_buf[tid_count], block, off);
-			tid_count++;
-			ntids++;
+			if (le != NULL)
+			{
+				if (le->flags != ROARING_ENTRY_INLINE)
+				{
+					UnlockReleaseBuffer(leafbuf);
+					elog(ERROR,
+						 "pg_roaring_index: overflow entries not yet implemented");
+				}
 
-			roaring64_iterator_advance(it);
+				/* Deserialize bitmap and drain into tid_buf. */
+				{
+					Size				item_len   = ItemIdGetLength(
+						PageGetItemId(leafpage, found_off));
+					Size				bitmap_len = item_len - sizeof(RoaringLeafEntry);
+					roaring64_bitmap_t *bm;
+					roaring64_iterator_t *it;
+
+					bm = roaring64_bitmap_portable_deserialize_safe(
+							(const char *)(le + 1), bitmap_len);
+					if (bm == NULL)
+					{
+						UnlockReleaseBuffer(leafbuf);
+						elog(ERROR,
+							 "pg_roaring_index: failed to deserialize bitmap "
+							 "for value " INT64_FORMAT, scan_value);
+					}
+
+					UnlockReleaseBuffer(leafbuf);
+
+					it = roaring64_iterator_create(bm);
+					while (roaring64_iterator_has_value(it))
+					{
+						uint64		 linear = roaring64_iterator_value(it);
+						BlockNumber  block  = (BlockNumber)(linear >> 16);
+						OffsetNumber off    = (OffsetNumber)(linear & 0xFFFF);
+
+						if (tid_count == ROARING_TID_BATCH)
+						{
+							tbm_add_tuples(tbm, tid_buf, tid_count, false);
+							tid_count = 0;
+						}
+						ItemPointerSet(&tid_buf[tid_count++], block, off);
+						ntids++;
+						roaring64_iterator_advance(it);
+					}
+					roaring64_iterator_free(it);
+					roaring64_bitmap_free(bm);
+				}
+			}
+			else
+				UnlockReleaseBuffer(leafbuf);
 		}
-		if (tid_count > 0)
-			tbm_add_tuples(tbm, tid_buf, tid_count, false);
-
-		roaring64_iterator_free(it);
-#undef ROARING_TID_BATCH
 	}
 
-	roaring64_bitmap_free(bm);
+	/* ---- 6. Pending insert list scan. ---- */
+	if (pending_count > 0)
+	{
+		BlockNumber		cur      = pending_head;
+		Snapshot		snapshot = scan->xs_snapshot;
+
+		while (cur != InvalidBlockNumber)
+		{
+			Buffer				  buf;
+			Page				  page;
+			RoaringPendingSpecial *spc;
+			RoaringPendingEntry	  *raw;
+			uint16				  k;
+
+			buf  = ReadBuffer(index, cur);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
+			raw  = (RoaringPendingEntry *) PageGetContents(page);
+
+			for (k = 0; k < spc->entry_count; k++)
+			{
+				if (raw[k].value != scan_value)
+					continue;
+				if (!roaring_pending_visible(raw[k].xmin, snapshot))
+					continue;
+
+				if (tid_count == ROARING_TID_BATCH)
+				{
+					tbm_add_tuples(tbm, tid_buf, tid_count, false);
+					tid_count = 0;
+				}
+				{
+					BlockNumber  block = (BlockNumber)(raw[k].linear_tid >> 16);
+					OffsetNumber off   = (OffsetNumber)(raw[k].linear_tid & 0xFFFF);
+					ItemPointerSet(&tid_buf[tid_count++], block, off);
+					ntids++;
+				}
+			}
+
+			cur = spc->next_page;
+			UnlockReleaseBuffer(buf);
+		}
+	}
+
+	/* Flush any remaining TIDs. */
+	if (tid_count > 0)
+		tbm_add_tuples(tbm, tid_buf, tid_count, false);
+
 	return ntids;
+#undef ROARING_TID_BATCH
 }

@@ -1,6 +1,7 @@
 MODULE_big = pg_roaring_index
 OBJS = \
 	src/pg_roaring_index.o \
+	src/roaring_util.o \
 	src/roaring_build.o \
 	src/roaring_insert.o \
 	src/roaring_scan.o \

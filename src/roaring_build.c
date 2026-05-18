@@ -25,26 +25,6 @@ typedef struct RoaringBuildState
 } RoaringBuildState;
 
 /* ----------------------------------------------------------------
- * Helpers
- * ---------------------------------------------------------------- */
-
-static Buffer
-roaring_extend_page(Relation index)
-{
-	return ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
-							 EB_LOCK_FIRST);
-}
-
-static void
-roaring_log_and_release(Relation index, Buffer buf)
-{
-	MarkBufferDirty(buf);
-	if (RelationNeedsWAL(index))
-		log_newpage_buffer(buf, true);
-	UnlockReleaseBuffer(buf);
-}
-
-/* ----------------------------------------------------------------
  * roaring_build_callback
  * ---------------------------------------------------------------- */
 static void
@@ -85,32 +65,6 @@ cmp_build_entry(const void *a, const void *b)
 	return (va > vb) - (va < vb);
 }
 
-/* ----------------------------------------------------------------
- * write_pending_page
- * ---------------------------------------------------------------- */
-static BlockNumber
-write_pending_page(Relation index, uint8 page_type)
-{
-	Buffer				  buf;
-	Page				  page;
-	RoaringPendingSpecial *spc;
-	BlockNumber			  blkno;
-
-	buf   = roaring_extend_page(index);
-	blkno = BufferGetBlockNumber(buf);
-	page  = BufferGetPage(buf);
-
-	PageInit(page, BLCKSZ, sizeof(RoaringPendingSpecial));
-	spc				 = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
-	spc->page_type	 = page_type;
-	spc->flags		 = 0;
-	spc->entry_count = 0;
-	spc->next_page	 = InvalidBlockNumber;
-	spc->xmin_low	 = InvalidTransactionId;
-
-	roaring_log_and_release(index, buf);
-	return blkno;
-}
 
 /* ----------------------------------------------------------------
  * write_metapage
@@ -154,47 +108,16 @@ write_metapage(Relation index,
 	meta->total_entries			 = total_entries;
 	meta->pending_merge_threshold = ROARING_PENDING_MERGE_THRESHOLD;
 
-	roaring_log_and_release(index, buf);
-}
-
-/* ----------------------------------------------------------------
- * write_dir_page
- *
- * Writes a single directory page containing the given flat array of
- * RoaringDirEntry records.  Returns the block number of the new page.
- * level: 0 = root, 1 = level-1 (children of root), etc.
- * ---------------------------------------------------------------- */
-static BlockNumber
-write_dir_page(Relation index,
-			   RoaringDirEntry *entries, uint32 count, uint8 level)
-{
-	Buffer			   buf;
-	Page			   page;
-	RoaringDirSpecial *spc;
-	RoaringDirEntry   *data;
-	BlockNumber		   blkno;
-
-	buf   = roaring_extend_page(index);
-	blkno = BufferGetBlockNumber(buf);
-	page  = BufferGetPage(buf);
-
-	PageInit(page, BLCKSZ, sizeof(RoaringDirSpecial));
-
-	spc				= (RoaringDirSpecial *) PageGetSpecialPointer(page);
-	spc->page_type	= ROARING_PAGE_DIRECTORY;
-	spc->level		= level;
-	spc->entry_count = count;
-	spc->right_page	= InvalidBlockNumber;
-	spc->reserved	= 0;
-
-	data = (RoaringDirEntry *) PageGetContents(page);
-	memcpy(data, entries, count * sizeof(RoaringDirEntry));
+	/*
+	 * Set pd_lower past the metapage data so GenericXLog's mask_unused_space
+	 * does not zero our fields when computing WAL deltas.
+	 */
 	((PageHeader) page)->pd_lower =
-		(LocationIndex)(SizeOfPageHeaderData + count * sizeof(RoaringDirEntry));
+		(LocationIndex)(SizeOfPageHeaderData + sizeof(RoaringMetaPageData));
 
-	roaring_log_and_release(index, buf);
-	return blkno;
+	roaring_wal_and_release(index, buf);
 }
+
 
 /* ----------------------------------------------------------------
  * write_leaf_and_dir_pages
@@ -295,7 +218,7 @@ write_leaf_and_dir_pages(Relation index,
 				new_blkno = BufferGetBlockNumber(new_buf);
 
 				leaf_spc->right_page = new_blkno;
-				roaring_log_and_release(index, leaf_buf);
+				roaring_wal_and_release(index, leaf_buf);
 
 				leaf_buf  = new_buf;
 				leaf_page = BufferGetPage(leaf_buf);
@@ -359,14 +282,14 @@ write_leaf_and_dir_pages(Relation index,
 		leaf_count++;
 
 		rightmost = blkno;
-		roaring_log_and_release(index, leaf_buf);
+		roaring_wal_and_release(index, leaf_buf);
 	}
 
 	/* ---- Phase B: build directory ---- */
 	if (leaf_count <= max_dir)
 	{
 		/* Single-level: root points directly to leaf pages. */
-		*root_dir_out = write_dir_page(index, leaf_entries, leaf_count, 0);
+		*root_dir_out = roaring_write_dir_page(index, leaf_entries, leaf_count, 0);
 	}
 	else
 	{
@@ -395,7 +318,7 @@ write_leaf_and_dir_pages(Relation index,
 			 * Convention: level=0 means "children are leaf pages";
 			 *             level=N>0 means "children are dir pages at level N-1".
 			 */
-			blkno = write_dir_page(index, leaf_entries + start, count, 0);
+			blkno = roaring_write_dir_page(index, leaf_entries + start, count, 0);
 			l1_entries[j].high_key   = leaf_entries[start + count - 1].high_key;
 			l1_entries[j].child_page = blkno;
 		}
@@ -407,7 +330,7 @@ write_leaf_and_dir_pages(Relation index,
 				 leaf_count);
 
 		/* Root (level=1): children are dir pages at level 0. */
-		*root_dir_out = write_dir_page(index, l1_entries, l1_count, 1);
+		*root_dir_out = roaring_write_dir_page(index, l1_entries, l1_count, 1);
 		pfree(l1_entries);
 	}
 
@@ -447,7 +370,7 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 		Assert(BufferGetBlockNumber(buf) == ROARING_METAPAGE_BLKNO);
 		PageInit(BufferGetPage(buf), BLCKSZ, 0);
-		roaring_log_and_release(index, buf);
+		roaring_wal_and_release(index, buf);
 	}
 
 	/* Heap scan. */
@@ -482,8 +405,8 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	hash_destroy(bstate.bitmaps);
 
 	/* Pending-list pages. */
-	pending_insert = write_pending_page(index, ROARING_PAGE_PENDING_INSERT);
-	pending_delete = write_pending_page(index, ROARING_PAGE_PENDING_DELETE);
+	pending_insert = roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
+	pending_delete = roaring_init_pending_page(index, ROARING_PAGE_PENDING_DELETE);
 
 	/* Write metapage into block 0. */
 	write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
@@ -507,10 +430,10 @@ roaring_buildempty(Relation index)
 	buf = roaring_extend_page(index);
 	Assert(BufferGetBlockNumber(buf) == ROARING_METAPAGE_BLKNO);
 	PageInit(BufferGetPage(buf), BLCKSZ, 0);
-	roaring_log_and_release(index, buf);
+	roaring_wal_and_release(index, buf);
 
-	pending_insert = write_pending_page(index, ROARING_PAGE_PENDING_INSERT);
-	pending_delete = write_pending_page(index, ROARING_PAGE_PENDING_DELETE);
+	pending_insert = roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
+	pending_delete = roaring_init_pending_page(index, ROARING_PAGE_PENDING_DELETE);
 
 	write_metapage(index,
 				   InvalidBlockNumber, InvalidBlockNumber, InvalidBlockNumber,

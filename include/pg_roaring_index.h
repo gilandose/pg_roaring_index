@@ -44,11 +44,11 @@
 /* Capacities derived from 8KB page size */
 #define ROARING_PAGE_SIZE           BLCKSZ
 #define ROARING_DIR_ENTRY_SIZE      12      /* int64 high_key + BlockNumber */
-#define ROARING_PENDING_ENTRY_SIZE  16      /* int64 + uint32 + TransactionId */
-#define ROARING_PENDING_PER_PAGE    512     /* (8192-24-16)/16 */
+#define ROARING_PENDING_ENTRY_SIZE  24      /* int64 + uint64 + TransactionId + pad */
+#define ROARING_PENDING_PER_PAGE    339     /* (8192-24-16)/24 */
 
 /* Pending list merge threshold (entries); override via storage param later */
-#define ROARING_PENDING_MERGE_THRESHOLD 100000
+#define ROARING_PENDING_MERGE_THRESHOLD 10000
 
 /* Fixed block number for the metapage */
 #define ROARING_METAPAGE_BLKNO          0
@@ -142,16 +142,21 @@ typedef struct RoaringLeafSpecial
     BlockNumber right_page;
 } RoaringLeafSpecial;   /* 16 bytes */
 
-/* Fixed-size pending entry — 16 bytes, 512 per page */
+/*
+ * Fixed-size pending entry — 24 bytes, 339 per page.
+ * linear_tid = (BlockNumber << 16) | OffsetNumber; needs uint64 since
+ * BlockNumber alone can be up to 2^32-1 (doesn't fit with offset in uint32).
+ */
 typedef struct RoaringPendingEntry
 {
     int64           value;
-    uint32          page_or_tid;    /* BlockNumber (lossy) or linearized TID (exact) */
+    uint64          linear_tid;     /* (block << 16) | offset */
     TransactionId   xmin;
+    uint32          reserved;       /* explicit padding */
 } RoaringPendingEntry;
 
 StaticAssertDecl(sizeof(RoaringPendingEntry) == ROARING_PENDING_ENTRY_SIZE,
-                 "RoaringPendingEntry must be 16 bytes");
+                 "RoaringPendingEntry must be 24 bytes");
 
 typedef struct RoaringPendingSpecial
 {
@@ -183,6 +188,17 @@ typedef struct RoaringScanOpaque
  * Function prototypes
  * ---------- */
 
+/* roaring_util.c */
+extern Buffer roaring_extend_page(Relation index);
+extern void   roaring_wal_and_release(Relation index, Buffer buf);
+extern BlockNumber roaring_init_pending_page(Relation index, uint8 page_type);
+extern BlockNumber roaring_write_dir_page(Relation index,
+                                           RoaringDirEntry *entries,
+                                           uint32 count, uint8 level);
+
+/* roaring_vacuum.c — also called from roaring_insert for back-pressure */
+extern void roaring_merge_pending(Relation index);
+
 /* roaring_build.c */
 extern IndexBuildResult *roaring_build(Relation heap, Relation index,
                                        struct IndexInfo *indexInfo);
@@ -196,6 +212,8 @@ extern bool roaring_insert(Relation index, Datum *values, bool *isnull,
                            struct IndexInfo *indexInfo);
 
 /* roaring_scan.c */
+extern BlockNumber   roaring_dir_lookup(Relation index, BlockNumber dir_blkno,
+                                        int64 value);
 extern IndexScanDesc roaring_beginscan(Relation rel, int nkeys, int norderbys);
 extern void roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
                            ScanKey orderbys, int norderbys);
