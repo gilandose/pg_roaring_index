@@ -2,6 +2,7 @@
 
 #include "access/xloginsert.h"
 #include "storage/bufmgr.h"
+#include "storage/bufpage.h"
 
 /*
  * roaring_extend_page
@@ -100,4 +101,118 @@ roaring_write_dir_page(Relation index,
 
 	roaring_wal_and_release(index, buf);
 	return blkno;
+}
+
+/*
+ * roaring_write_overflow_chain
+ *
+ * Write the portion of a serialized bitmap that exceeds the inline capacity
+ * to a chain of ROARING_PAGE_OVERFLOW pages.  Only bytes [prefix_len..total_len)
+ * go to overflow pages; the first prefix_len bytes are stored by the caller
+ * inside the RoaringOverflowEntry on the leaf page.
+ *
+ * Returns the block number of the first overflow page, or InvalidBlockNumber
+ * if chain_len == 0.  Uses roaring_wal_and_release (full-page WAL) for
+ * each new page — safe for both build and merge paths.
+ */
+BlockNumber
+roaring_write_overflow_chain(Relation index,
+							 const char *data, size_t total_len,
+							 size_t prefix_len)
+{
+	const char *chain_data  = data + prefix_len;
+	size_t		chain_len   = total_len - prefix_len;
+	Size		cap			= ROARING_OVERFLOW_PAGE_CAP;
+	int			npages, i;
+	Buffer	   *bufs;
+	BlockNumber *blknos;
+	BlockNumber first;
+
+	if (chain_len == 0)
+		return InvalidBlockNumber;
+
+	npages = (int)((chain_len + cap - 1) / cap);
+	bufs   = palloc(npages * sizeof(Buffer));
+	blknos = palloc(npages * sizeof(BlockNumber));
+
+	for (i = 0; i < npages; i++)
+	{
+		bufs[i]   = roaring_extend_page(index);
+		blknos[i] = BufferGetBlockNumber(bufs[i]);
+	}
+
+	for (i = 0; i < npages; i++)
+	{
+		Page					p   = BufferGetPage(bufs[i]);
+		RoaringOverflowSpecial *spc;
+		char				   *dp;
+		size_t					co  = (size_t)i * cap;
+		size_t					cl  = Min(cap, chain_len - co);
+
+		PageInit(p, BLCKSZ, sizeof(RoaringOverflowSpecial));
+		spc				= (RoaringOverflowSpecial *) PageGetSpecialPointer(p);
+		spc->page_type  = ROARING_PAGE_OVERFLOW;
+		spc->flags		= 0;
+		spc->sequence	= (uint16) i;
+		spc->next_page	= (i + 1 < npages) ? blknos[i + 1] : InvalidBlockNumber;
+		spc->owner_page = InvalidBlockNumber;
+
+		dp = PageGetContents(p);
+		memcpy(dp, chain_data + co, cl);
+		((PageHeader) p)->pd_lower =
+			(LocationIndex)(SizeOfPageHeaderData + cl);
+
+		roaring_wal_and_release(index, bufs[i]);
+	}
+
+	first = blknos[0];
+	pfree(bufs);
+	pfree(blknos);
+	return first;
+}
+
+/*
+ * roaring_read_overflow_bitmap
+ *
+ * Reassemble and deserialize the bitmap for a leaf entry that uses overflow
+ * pages.  Concatenates the inline_prefix bytes with data from the chain.
+ */
+roaring64_bitmap_t *
+roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
+{
+	size_t		 total_len = oe->total_len;
+	Size		 cap	   = ROARING_OVERFLOW_PAGE_CAP;
+	char		*buf	   = palloc(total_len);
+	size_t		 off;
+	BlockNumber	 cur;
+	roaring64_bitmap_t *bm;
+
+	/* Inline prefix stored directly in the entry. */
+	off = Min(sizeof(oe->inline_prefix), total_len);
+	memcpy(buf, oe->inline_prefix, off);
+
+	/* Walk overflow chain. */
+	cur = oe->overflow_blkno;
+	while (cur != InvalidBlockNumber && off < total_len)
+	{
+		Buffer					ovbuf = ReadBuffer(index, cur);
+		Page					ovpage;
+		RoaringOverflowSpecial *spc;
+		char				   *dp;
+		size_t					cl;
+
+		LockBuffer(ovbuf, BUFFER_LOCK_SHARE);
+		ovpage = BufferGetPage(ovbuf);
+		spc    = (RoaringOverflowSpecial *) PageGetSpecialPointer(ovpage);
+		dp     = PageGetContents(ovpage);
+		cl     = Min(cap, total_len - off);
+		memcpy(buf + off, dp, cl);
+		off   += cl;
+		cur    = spc->next_page;
+		UnlockReleaseBuffer(ovbuf);
+	}
+
+	bm = roaring64_bitmap_portable_deserialize_safe(buf, total_len);
+	pfree(buf);
+	return bm;
 }

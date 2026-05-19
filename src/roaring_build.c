@@ -185,12 +185,9 @@ write_leaf_and_dir_pages(Relation index,
 		bitmap_size = roaring64_bitmap_portable_size_in_bytes(be->bitmap);
 
 		if ((int) bitmap_size > max_inline)
-			elog(ERROR,
-				 "roaring_build: bitmap for value " INT64_FORMAT " is "
-				 "%zu bytes; overflow pages not yet implemented",
-				 be->value, bitmap_size);
-
-		entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bitmap_size);
+			entry_size = MAXALIGN(sizeof(RoaringOverflowEntry));
+		else
+			entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bitmap_size);
 
 		/* ---- transition to new leaf page if needed ---- */
 		if (leaf_buf == InvalidBuffer ||
@@ -247,19 +244,47 @@ write_leaf_and_dir_pages(Relation index,
 			}
 		}
 
-		le = (RoaringLeafEntry *) palloc(sizeof(RoaringLeafEntry) + bitmap_size);
-		le->value		= be->value;
-		le->cardinality = (uint32) roaring64_bitmap_get_cardinality(be->bitmap);
-		le->flags		= ROARING_ENTRY_INLINE;
-		roaring64_bitmap_portable_serialize(be->bitmap, (char *)(le + 1));
+		if ((int) bitmap_size > max_inline)
+		{
+			char				 *bm_data;
+			size_t				  pfx_len;
+			RoaringOverflowEntry *oe;
 
-		if (PageAddItem(leaf_page, (Item) le,
-						sizeof(RoaringLeafEntry) + bitmap_size,
-						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-			elog(ERROR, "roaring_build: PageAddItem failed unexpectedly");
+			bm_data	   = (char *) palloc(bitmap_size);
+			roaring64_bitmap_portable_serialize(be->bitmap, bm_data);
+			pfx_len	   = Min(ROARING_OVERFLOW_INLINE_BYTES, bitmap_size);
+			oe		   = (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
+			oe->value		   = be->value;
+			oe->cardinality	   = (uint32) roaring64_bitmap_get_cardinality(be->bitmap);
+			oe->flags		   = ROARING_ENTRY_OVERFLOW;
+			oe->total_len	   = (uint32) bitmap_size;
+			oe->overflow_blkno = roaring_write_overflow_chain(index, bm_data,
+															   bitmap_size, pfx_len);
+			memcpy(oe->inline_prefix, bm_data, pfx_len);
+			pfree(bm_data);
+
+			if (PageAddItem(leaf_page, (Item) oe,
+							sizeof(RoaringOverflowEntry),
+							InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+				elog(ERROR, "roaring_build: PageAddItem failed unexpectedly");
+			pfree(oe);
+		}
+		else
+		{
+			le = (RoaringLeafEntry *) palloc(sizeof(RoaringLeafEntry) + bitmap_size);
+			le->value		= be->value;
+			le->cardinality = (uint32) roaring64_bitmap_get_cardinality(be->bitmap);
+			le->flags		= ROARING_ENTRY_INLINE;
+			roaring64_bitmap_portable_serialize(be->bitmap, (char *)(le + 1));
+
+			if (PageAddItem(leaf_page, (Item) le,
+							sizeof(RoaringLeafEntry) + bitmap_size,
+							InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+				elog(ERROR, "roaring_build: PageAddItem failed unexpectedly");
+			pfree(le);
+		}
 
 		leaf_spc->entry_count++;
-		pfree(le);
 
 		roaring64_bitmap_free(be->bitmap);
 		be->bitmap = NULL;

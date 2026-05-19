@@ -47,6 +47,18 @@
 #define ROARING_PENDING_ENTRY_SIZE  24      /* int64 + uint64 + TransactionId + pad */
 #define ROARING_PENDING_PER_PAGE    339     /* (8192-24-16)/24 */
 
+/*
+ * Overflow pages: bitmap bytes that don't fit on a single leaf page are
+ * chained via ROARING_PAGE_OVERFLOW pages.  The first ROARING_OVERFLOW_INLINE_BYTES
+ * of the serialized bitmap are stored in the RoaringOverflowEntry itself;
+ * the remainder occupies the chain.
+ */
+#define ROARING_OVERFLOW_INLINE_BYTES   64
+/* Usable data area per overflow page */
+#define ROARING_OVERFLOW_PAGE_CAP \
+    ((Size)(BLCKSZ - SizeOfPageHeaderData \
+            - MAXALIGN(sizeof(RoaringOverflowSpecial))))
+
 /* Pending list merge threshold (entries); override via storage param later */
 #define ROARING_PENDING_MERGE_THRESHOLD 10000
 
@@ -195,6 +207,12 @@ extern BlockNumber roaring_init_pending_page(Relation index, uint8 page_type);
 extern BlockNumber roaring_write_dir_page(Relation index,
                                            RoaringDirEntry *entries,
                                            uint32 count, uint8 level);
+extern BlockNumber roaring_write_overflow_chain(Relation index,
+                                                const char *data,
+                                                size_t total_len,
+                                                size_t prefix_len);
+extern roaring64_bitmap_t *roaring_read_overflow_bitmap(
+    Relation index, const RoaringOverflowEntry *oe);
 
 /* roaring_vacuum.c — also called from roaring_insert for back-pressure */
 extern void roaring_merge_pending(Relation index);

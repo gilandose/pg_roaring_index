@@ -253,6 +253,11 @@ rebuild_directory(Relation index, BlockNumber leftmost_leaf)
 void
 roaring_merge_pending(Relation index)
 {
+	const int			 max_inline = (int)(BLCKSZ
+									   - MAXALIGN(sizeof(RoaringLeafSpecial))
+									   - SizeOfPageHeaderData
+									   - sizeof(ItemIdData)
+									   - MAXALIGN(sizeof(RoaringLeafEntry)));
 	Buffer				 metabuf;
 	Page				 metapage;
 	RoaringMetaPageData *meta;
@@ -378,15 +383,28 @@ roaring_merge_pending(Relation index)
 				size_t				new_size;
 				Size				new_item_size;
 				RoaringLeafEntry   *new_le;
+				bool				was_overflow;
 
 				le		   = (RoaringLeafEntry *)
 							 PageGetItem(leafpage, PageGetItemId(leafpage, found_off));
 				item_len   = ItemIdGetLength(PageGetItemId(leafpage, found_off));
-				bitmap_len = item_len - sizeof(RoaringLeafEntry);
+				was_overflow = (le->flags == ROARING_ENTRY_OVERFLOW);
 
-				bm = roaring64_bitmap_portable_deserialize_safe(
-						(const char *)(le + 1), bitmap_len);
-				UnlockReleaseBuffer(leafbuf);
+				if (was_overflow)
+				{
+					RoaringOverflowEntry oe_copy;
+
+					memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+					UnlockReleaseBuffer(leafbuf);
+					bm = roaring_read_overflow_bitmap(index, &oe_copy);
+				}
+				else
+				{
+					bitmap_len = item_len - sizeof(RoaringLeafEntry);
+					bm = roaring64_bitmap_portable_deserialize_safe(
+							(const char *)(le + 1), bitmap_len);
+					UnlockReleaseBuffer(leafbuf);
+				}
 
 				if (bm == NULL)
 					elog(ERROR,
@@ -400,7 +418,9 @@ roaring_merge_pending(Relation index)
 				new_size      = roaring64_bitmap_portable_size_in_bytes(bm);
 				new_item_size = MAXALIGN(sizeof(RoaringLeafEntry) + new_size);
 
-				if (PageGetFreeSpace(leafpage) + item_len < new_item_size)
+				/* Free-space check only applies to inline → inline transitions. */
+				if (!was_overflow && (int) new_size <= max_inline &&
+					PageGetFreeSpace(leafpage) + item_len < new_item_size)
 				{
 					roaring64_bitmap_free(bm);
 					elog(ERROR,
@@ -409,41 +429,89 @@ roaring_merge_pending(Relation index)
 						 "run REINDEX to rebuild", cur_value, new_size);
 				}
 
-				/* Re-read with exclusive lock to modify. */
-				leafbuf  = ReadBuffer(index, leaf_blkno);
-				LockBuffer(leafbuf, BUFFER_LOCK_EXCLUSIVE);
 				{
-					GenericXLogState *state = GenericXLogStart(index);
-					Page			  img   = GenericXLogRegisterBuffer(state,
-																 leafbuf, 0);
-
 					/*
-				 * Remove old item (compacting form so no LP_UNUSED hole
-				 * disrupts the sorted line-pointer array), then re-insert.
-				 */
-					PageIndexTupleDelete(img, found_off);
+					 * Serialize bitmap; write overflow chain (if needed) before
+					 * re-locking the leaf so overflow WAL precedes leaf update.
+					 */
+					uint32		 bm_card	   = (uint32)
+											   roaring64_bitmap_get_cardinality(bm);
+					bool		 write_ovf	   = ((int) new_size > max_inline);
+					char		*bm_data	   = (char *) palloc(new_size);
+					BlockNumber  new_ovf_blkno = InvalidBlockNumber;
+					char		 pfx_buf[ROARING_OVERFLOW_INLINE_BYTES];
+					size_t		 pfx_len	   = 0;
 
-					new_le			 = (RoaringLeafEntry *)
-									   palloc(sizeof(RoaringLeafEntry) + new_size);
-					new_le->value		 = cur_value;
-					new_le->cardinality  =
-						(uint32) roaring64_bitmap_get_cardinality(bm);
-					new_le->flags		 = ROARING_ENTRY_INLINE;
-					roaring64_bitmap_portable_serialize(bm, (char *)(new_le + 1));
+					roaring64_bitmap_portable_serialize(bm, bm_data);
+					roaring64_bitmap_free(bm);
 
-					if (PageAddItem(img, (Item) new_le,
-									sizeof(RoaringLeafEntry) + new_size,
-									found_off, false, false)
-						== InvalidOffsetNumber)
-						elog(ERROR,
-							 "pg_roaring_index: merge: PageAddItem failed "
-							 "for value " INT64_FORMAT, cur_value);
+					if (write_ovf)
+					{
+						pfx_len		  = Min(ROARING_OVERFLOW_INLINE_BYTES, new_size);
+						memcpy(pfx_buf, bm_data, pfx_len);
+						new_ovf_blkno = roaring_write_overflow_chain(index,
+																	  bm_data,
+																	  new_size,
+																	  pfx_len);
+					}
 
-					pfree(new_le);
-					GenericXLogFinish(state);
+					/* Re-read with exclusive lock to modify. */
+					leafbuf  = ReadBuffer(index, leaf_blkno);
+					LockBuffer(leafbuf, BUFFER_LOCK_EXCLUSIVE);
+					{
+						GenericXLogState *state = GenericXLogStart(index);
+						Page			  img   = GenericXLogRegisterBuffer(state,
+																	 leafbuf, 0);
+
+						/*
+					 * Remove old item (compacting form so no LP_UNUSED hole
+					 * disrupts the sorted line-pointer array), then re-insert.
+					 */
+						PageIndexTupleDelete(img, found_off);
+
+						if (write_ovf)
+						{
+							RoaringOverflowEntry new_oe;
+
+							new_oe.value		 = cur_value;
+							new_oe.cardinality	 = bm_card;
+							new_oe.flags		 = ROARING_ENTRY_OVERFLOW;
+							new_oe.total_len	 = (uint32) new_size;
+							new_oe.overflow_blkno = new_ovf_blkno;
+							memcpy(new_oe.inline_prefix, pfx_buf, pfx_len);
+
+							if (PageAddItem(img, (Item) &new_oe,
+											sizeof(RoaringOverflowEntry),
+											found_off, false, false)
+								== InvalidOffsetNumber)
+								elog(ERROR,
+									 "pg_roaring_index: merge: PageAddItem failed "
+									 "for value " INT64_FORMAT, cur_value);
+						}
+						else
+						{
+							new_le			 = (RoaringLeafEntry *)
+											   palloc(sizeof(RoaringLeafEntry) + new_size);
+							new_le->value		 = cur_value;
+							new_le->cardinality  = bm_card;
+							new_le->flags		 = ROARING_ENTRY_INLINE;
+							memcpy((char *)(new_le + 1), bm_data, new_size);
+
+							if (PageAddItem(img, (Item) new_le,
+											sizeof(RoaringLeafEntry) + new_size,
+											found_off, false, false)
+								== InvalidOffsetNumber)
+								elog(ERROR,
+									 "pg_roaring_index: merge: PageAddItem failed "
+									 "for value " INT64_FORMAT, cur_value);
+							pfree(new_le);
+						}
+
+						GenericXLogFinish(state);
+					}
+					UnlockReleaseBuffer(leafbuf);
+					pfree(bm_data);
 				}
-				UnlockReleaseBuffer(leafbuf);
-				roaring64_bitmap_free(bm);
 				found_in_index = true;
 			}
 			else
@@ -734,16 +802,28 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 		roaring64_bitmap_t *dead_bm;
 		roaring64_iterator_t *it;
 		bool				has_dead;
+		bool				was_overflow;
 
 		iid = PageGetItemId(img, off);
 		if (!ItemIdIsUsed(iid))
 			continue;
 
-		le		 = (RoaringLeafEntry *) PageGetItem(img, iid);
-		bm_bytes = ItemIdGetLength(iid) - sizeof(RoaringLeafEntry);
+		le = (RoaringLeafEntry *) PageGetItem(img, iid);
+		was_overflow = (le->flags == ROARING_ENTRY_OVERFLOW);
 
-		bm = roaring64_bitmap_portable_deserialize_safe((char *)(le + 1),
-														bm_bytes);
+		if (was_overflow)
+		{
+			RoaringOverflowEntry oe_copy;
+
+			memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+			bm = roaring_read_overflow_bitmap(index, &oe_copy);
+		}
+		else
+		{
+			bm_bytes = ItemIdGetLength(iid) - sizeof(RoaringLeafEntry);
+			bm = roaring64_bitmap_portable_deserialize_safe((char *)(le + 1),
+															bm_bytes);
+		}
 		if (!bm)
 			continue;					/* corrupted — leave alone */
 
@@ -785,25 +865,58 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 		changed = true;
 
 		{
-			int64			  value		  = le->value;	/* save before overwrite */
-			size_t			  new_bm_bytes;
-			Size			  new_size;
-			RoaringLeafEntry *new_le;
+			int64  value	   = le->value;
+			size_t new_bm_bytes;
 
 			roaring64_bitmap_run_optimize(bm);
 			new_bm_bytes = roaring64_bitmap_portable_size_in_bytes(bm);
-			new_size	 = sizeof(RoaringLeafEntry) + new_bm_bytes;
-			new_le		 = (RoaringLeafEntry *) palloc(new_size);
-			new_le->value		= value;
-			new_le->cardinality	= (uint32) roaring64_bitmap_get_cardinality(bm);
-			new_le->flags		= ROARING_ENTRY_INLINE;
-			roaring64_bitmap_portable_serialize(bm, (char *)(new_le + 1));
 
-			if (!PageIndexTupleOverwrite(img, off, (Item) new_le, new_size))
-				elog(ERROR,
-					 "pg_roaring_index: vacuum: PageIndexTupleOverwrite failed "
-					 "for value " INT64_FORMAT, value);
-			pfree(new_le);
+			if (was_overflow)
+			{
+				/*
+				 * Entry was overflow: write a new overflow chain and update
+				 * the in-page entry in-place.  Old overflow pages are orphaned
+				 * (space leak acceptable for Phase 1; REINDEX reclaims them).
+				 */
+				char				 *bm_data  = (char *) palloc(new_bm_bytes);
+				size_t				  pfx_len  = Min(ROARING_OVERFLOW_INLINE_BYTES,
+													 new_bm_bytes);
+				RoaringOverflowEntry  new_oe;
+
+				roaring64_bitmap_portable_serialize(bm, bm_data);
+				new_oe.value		 = value;
+				new_oe.cardinality	 = (uint32) roaring64_bitmap_get_cardinality(bm);
+				new_oe.flags		 = ROARING_ENTRY_OVERFLOW;
+				new_oe.total_len	 = (uint32) new_bm_bytes;
+				new_oe.overflow_blkno = roaring_write_overflow_chain(index,
+																	  bm_data,
+																	  new_bm_bytes,
+																	  pfx_len);
+				memcpy(new_oe.inline_prefix, bm_data, pfx_len);
+				pfree(bm_data);
+
+				if (!PageIndexTupleOverwrite(img, off, (Item) &new_oe,
+											 sizeof(RoaringOverflowEntry)))
+					elog(ERROR,
+						 "pg_roaring_index: vacuum: PageIndexTupleOverwrite failed "
+						 "for value " INT64_FORMAT, value);
+			}
+			else
+			{
+				Size			  new_size = sizeof(RoaringLeafEntry) + new_bm_bytes;
+				RoaringLeafEntry *new_le   = (RoaringLeafEntry *) palloc(new_size);
+
+				new_le->value		= value;
+				new_le->cardinality	= (uint32) roaring64_bitmap_get_cardinality(bm);
+				new_le->flags		= ROARING_ENTRY_INLINE;
+				roaring64_bitmap_portable_serialize(bm, (char *)(new_le + 1));
+
+				if (!PageIndexTupleOverwrite(img, off, (Item) new_le, new_size))
+					elog(ERROR,
+						 "pg_roaring_index: vacuum: PageIndexTupleOverwrite failed "
+						 "for value " INT64_FORMAT, value);
+				pfree(new_le);
+			}
 		}
 
 		roaring64_bitmap_free(bm);
@@ -823,6 +936,9 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
  * Walk a pending list chain (insert or delete) starting at head_blkno.
  * For each entry, call callback; compact out dead entries via GenericXLog.
  * Each page is locked EXCLUSIVE during the update.
+ *
+ * After processing all pages, subtracts the total number of removed entries
+ * from pending_insert_count in the metapage so back-pressure stays accurate.
  * ---------------------------------------------------------------- */
 static void
 roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
@@ -831,6 +947,7 @@ roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
 							void *callback_state)
 {
 	BlockNumber cur = head_blkno;
+	uint32		total_removed = 0;
 
 	while (cur != InvalidBlockNumber)
 	{
@@ -865,6 +982,7 @@ roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
 			{
 				changed = true;
 				stats->tuples_removed++;
+				total_removed++;
 			}
 			else
 				live_buf[nlive++] = raw[i];
@@ -890,6 +1008,27 @@ roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
 
 		UnlockReleaseBuffer(buf);
 		cur = next;
+	}
+
+	/* Keep pending_insert_count in sync so back-pressure stays accurate. */
+	if (total_removed > 0)
+	{
+		Buffer				 metabuf;
+		GenericXLogState	*state;
+		Page				 img;
+		RoaringMetaPageData *meta;
+
+		metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+		state = GenericXLogStart(index);
+		img   = GenericXLogRegisterBuffer(state, metabuf, 0);
+		meta  = RoaringPageGetMeta(img);
+		meta->pending_insert_count =
+			(meta->pending_insert_count >= total_removed)
+			? meta->pending_insert_count - total_removed
+			: 0;
+		GenericXLogFinish(state);
+		UnlockReleaseBuffer(metabuf);
 	}
 }
 

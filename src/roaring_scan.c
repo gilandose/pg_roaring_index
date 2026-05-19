@@ -214,34 +214,34 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 			if (le != NULL)
 			{
-				if (le->flags != ROARING_ENTRY_INLINE)
-				{
-					UnlockReleaseBuffer(leafbuf);
-					elog(ERROR,
-						 "pg_roaring_index: overflow entries not yet implemented");
-				}
+				roaring64_bitmap_t *bm;
 
-				/* Deserialize bitmap and drain into tid_buf. */
+				if (le->flags == ROARING_ENTRY_OVERFLOW)
 				{
-					Size				item_len   = ItemIdGetLength(
-						PageGetItemId(leafpage, found_off));
-					Size				bitmap_len = item_len - sizeof(RoaringLeafEntry);
-					roaring64_bitmap_t *bm;
-					roaring64_iterator_t *it;
+					RoaringOverflowEntry oe_copy;
+
+					memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+					UnlockReleaseBuffer(leafbuf);
+					bm = roaring_read_overflow_bitmap(index, &oe_copy);
+				}
+				else
+				{
+					Size item_len   = ItemIdGetLength(PageGetItemId(leafpage, found_off));
+					Size bitmap_len = item_len - sizeof(RoaringLeafEntry);
 
 					bm = roaring64_bitmap_portable_deserialize_safe(
 							(const char *)(le + 1), bitmap_len);
-					if (bm == NULL)
-					{
-						UnlockReleaseBuffer(leafbuf);
-						elog(ERROR,
-							 "pg_roaring_index: failed to deserialize bitmap "
-							 "for value " INT64_FORMAT, scan_value);
-					}
-
 					UnlockReleaseBuffer(leafbuf);
+				}
 
-					it = roaring64_iterator_create(bm);
+				if (bm == NULL)
+					elog(ERROR,
+						 "pg_roaring_index: failed to deserialize bitmap "
+						 "for value " INT64_FORMAT, scan_value);
+
+				{
+					roaring64_iterator_t *it = roaring64_iterator_create(bm);
+
 					while (roaring64_iterator_has_value(it))
 					{
 						uint64		 linear = roaring64_iterator_value(it);
