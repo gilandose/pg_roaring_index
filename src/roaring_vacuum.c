@@ -231,6 +231,165 @@ rebuild_directory(Relation index, BlockNumber leftmost_leaf)
 }
 
 /* ----------------------------------------------------------------
+ * leaf_split_and_update
+ *
+ * Called when an updated inline leaf entry no longer fits on its page
+ * (the page is too full to absorb the bitmap growth).  Splits the page
+ * roughly in half, places the updated entry on the correct half, and
+ * wires both halves into the existing doubly-linked leaf chain.
+ *
+ * new_item / new_item_size: the replacement item to substitute at found_off.
+ * On return *rightmost_leaf_io is updated if a new rightmost page was
+ * created; *leaf_structure_changed is set to true.
+ * ---------------------------------------------------------------- */
+static void
+leaf_split_and_update(Relation index,
+					   BlockNumber   leaf_blkno,
+					   OffsetNumber  found_off,
+					   const char   *new_item,
+					   Size		     new_item_size,
+					   BlockNumber  *rightmost_leaf_io,
+					   bool		    *leaf_structure_changed)
+{
+	Buffer				 leafbuf;
+	Page				 leafpage;
+	RoaringLeafSpecial	*lspc;
+	OffsetNumber		 off, maxoff;
+	BlockNumber			 next_blkno;
+	int					 nentries, i, split_at;
+	char			   **items;
+	Size			    *item_sizes;
+	GenericXLogState	*state;
+	Page				 cur_img, new_img;
+	Buffer				 newleaf_buf;
+	BlockNumber			 newleaf_blkno;
+
+	leafbuf    = ReadBuffer(index, leaf_blkno);
+	LockBuffer(leafbuf, BUFFER_LOCK_EXCLUSIVE);
+	leafpage   = BufferGetPage(leafbuf);
+	lspc	   = (RoaringLeafSpecial *) PageGetSpecialPointer(leafpage);
+	maxoff	   = PageGetMaxOffsetNumber(leafpage);
+	next_blkno = lspc->right_page;
+	nentries   = (int) maxoff;
+
+	items	   = (char **) palloc(nentries * sizeof(char *));
+	item_sizes = (Size *)  palloc(nentries * sizeof(Size));
+
+	/* Collect all entries; substitute the updated one at found_off. */
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		if (off == found_off)
+		{
+			items[off - 1]		= (char *) new_item; /* caller-owned */
+			item_sizes[off - 1] = new_item_size;
+		}
+		else
+		{
+			ItemId iid = PageGetItemId(leafpage, off);
+			Size   sz  = ItemIdGetLength(iid);
+			char  *src = (char *) PageGetItem(leafpage, iid);
+
+			items[off - 1]		= (char *) palloc(sz);
+			item_sizes[off - 1] = sz;
+			memcpy(items[off - 1], src, sz);
+		}
+	}
+
+	/* Split at midpoint by entry count. */
+	split_at = nentries / 2;
+	if (split_at < 1)
+		split_at = 1;
+
+	/* Allocate and initialize new right leaf page. */
+	newleaf_buf   = roaring_extend_page(index);
+	newleaf_blkno = BufferGetBlockNumber(newleaf_buf);
+	{
+		Page				np = BufferGetPage(newleaf_buf);
+		RoaringLeafSpecial *ns;
+
+		PageInit(np, BLCKSZ, sizeof(RoaringLeafSpecial));
+		ns				= (RoaringLeafSpecial *) PageGetSpecialPointer(np);
+		ns->page_type	= ROARING_PAGE_LEAF;
+		ns->flags		= 0;
+		ns->entry_count = 0;
+		ns->left_page	= leaf_blkno;
+		ns->right_page	= next_blkno;
+	}
+
+	state   = GenericXLogStart(index);
+	cur_img = GenericXLogRegisterBuffer(state, leafbuf, 0);
+	new_img = GenericXLogRegisterBuffer(state, newleaf_buf, GENERIC_XLOG_FULL_IMAGE);
+	memcpy(new_img, BufferGetPage(newleaf_buf), BLCKSZ);
+
+	/*
+	 * Rewrite the current page with the left half.  PageInit clears it;
+	 * GenericXLog records the full delta from the registered snapshot.
+	 */
+	PageInit(cur_img, BLCKSZ, sizeof(RoaringLeafSpecial));
+	{
+		RoaringLeafSpecial *cs = (RoaringLeafSpecial *) PageGetSpecialPointer(cur_img);
+
+		cs->page_type	= ROARING_PAGE_LEAF;
+		cs->flags		= lspc->flags;
+		cs->entry_count = 0;
+		cs->left_page	= lspc->left_page;
+		cs->right_page	= newleaf_blkno;
+	}
+	for (i = 0; i < split_at; i++)
+	{
+		if (PageAddItem(cur_img, (Item) items[i], item_sizes[i],
+						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+			elog(ERROR, "pg_roaring_index: split: PageAddItem left-half failed");
+		((RoaringLeafSpecial *) PageGetSpecialPointer(cur_img))->entry_count++;
+	}
+
+	/* Write right half to new page. */
+	for (i = split_at; i < nentries; i++)
+	{
+		if (PageAddItem(new_img, (Item) items[i], item_sizes[i],
+						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+			elog(ERROR, "pg_roaring_index: split: PageAddItem right-half failed");
+		((RoaringLeafSpecial *) PageGetSpecialPointer(new_img))->entry_count++;
+	}
+
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(leafbuf);
+	UnlockReleaseBuffer(newleaf_buf);
+
+	/* Update next page's left_page link (if any). */
+	if (next_blkno != InvalidBlockNumber)
+	{
+		Buffer next_buf = ReadBuffer(index, next_blkno);
+
+		LockBuffer(next_buf, BUFFER_LOCK_EXCLUSIVE);
+		{
+			GenericXLogState *st2 = GenericXLogStart(index);
+			Page			  ni   = GenericXLogRegisterBuffer(st2, next_buf, 0);
+
+			((RoaringLeafSpecial *) PageGetSpecialPointer(ni))->left_page =
+				newleaf_blkno;
+			GenericXLogFinish(st2);
+		}
+		UnlockReleaseBuffer(next_buf);
+	}
+	else
+	{
+		*rightmost_leaf_io = newleaf_blkno;
+	}
+
+	/* Free per-entry palloc'd copies (skip found_off-1, which is caller-owned). */
+	for (i = 0; i < nentries; i++)
+	{
+		if (i != found_off - 1)
+			pfree(items[i]);
+	}
+	pfree(items);
+	pfree(item_sizes);
+
+	*leaf_structure_changed = true;
+}
+
+/* ----------------------------------------------------------------
  * roaring_merge_pending
  *
  * Merge all pending inserts into the main leaf pages.
@@ -378,17 +537,25 @@ roaring_merge_pending(Relation index)
 				RoaringLeafEntry   *le;
 				Size				item_len;
 				Size				bitmap_len;
+				Size				leaf_free;
 				roaring64_bitmap_t *bm;
 				int					j;
 				size_t				new_size;
-				Size				new_item_size;
-				RoaringLeafEntry   *new_le;
+				uint32				bm_card;
 				bool				was_overflow;
+				bool				write_ovf;
+				bool				needs_split;
+				char			   *bm_data;
+				BlockNumber			new_ovf_blkno;
+				char				pfx_buf[ROARING_OVERFLOW_INLINE_BYTES];
+				size_t				pfx_len;
 
-				le		   = (RoaringLeafEntry *)
-							 PageGetItem(leafpage, PageGetItemId(leafpage, found_off));
-				item_len   = ItemIdGetLength(PageGetItemId(leafpage, found_off));
+				le		  = (RoaringLeafEntry *)
+							PageGetItem(leafpage, PageGetItemId(leafpage, found_off));
+				item_len  = ItemIdGetLength(PageGetItemId(leafpage, found_off));
 				was_overflow = (le->flags == ROARING_ENTRY_OVERFLOW);
+				/* Save free space before releasing the buffer — pointer goes stale. */
+				leaf_free = PageGetFreeSpace(leafpage);
 
 				if (was_overflow)
 				{
@@ -415,48 +582,63 @@ roaring_merge_pending(Relation index)
 					roaring64_bitmap_add(bm, entries[j].linear_tid);
 
 				roaring64_bitmap_run_optimize(bm);
-				new_size      = roaring64_bitmap_portable_size_in_bytes(bm);
-				new_item_size = MAXALIGN(sizeof(RoaringLeafEntry) + new_size);
+				new_size  = roaring64_bitmap_portable_size_in_bytes(bm);
+				bm_card   = (uint32) roaring64_bitmap_get_cardinality(bm);
+				write_ovf = ((int) new_size > max_inline);
 
-				/* Free-space check only applies to inline → inline transitions. */
-				if (!was_overflow && (int) new_size <= max_inline &&
-					PageGetFreeSpace(leafpage) + item_len < new_item_size)
+				/*
+				 * Does the grown inline entry still fit on the current page?
+				 * (Overflow always fits: old and new entries are the same size.)
+				 * If not, a page split is needed.
+				 */
+				needs_split = (!write_ovf && !was_overflow &&
+							   leaf_free + item_len <
+							   MAXALIGN(sizeof(RoaringLeafEntry) + new_size));
+
+				/*
+				 * Serialize the bitmap.  For overflow, write the chain before
+				 * re-acquiring the leaf lock so overflow WAL precedes leaf WAL.
+				 */
+				bm_data		  = (char *) palloc(new_size);
+				new_ovf_blkno = InvalidBlockNumber;
+				pfx_len		  = 0;
+				roaring64_bitmap_portable_serialize(bm, bm_data);
+				roaring64_bitmap_free(bm);
+
+				if (write_ovf)
 				{
-					roaring64_bitmap_free(bm);
-					elog(ERROR,
-						 "pg_roaring_index: merge: updated bitmap for value "
-						 INT64_FORMAT " (%zu bytes) does not fit on leaf page; "
-						 "run REINDEX to rebuild", cur_value, new_size);
+					pfx_len		  = Min(ROARING_OVERFLOW_INLINE_BYTES, new_size);
+					memcpy(pfx_buf, bm_data, pfx_len);
+					new_ovf_blkno = roaring_write_overflow_chain(index, bm_data,
+																  new_size, pfx_len);
 				}
 
+				if (needs_split)
 				{
 					/*
-					 * Serialize bitmap; write overflow chain (if needed) before
-					 * re-locking the leaf so overflow WAL precedes leaf update.
+					 * Inline bitmap grew beyond the page's capacity.
+					 * Split the leaf page and place the updated entry on the
+					 * correct half.  Directory will be rebuilt at step 4.
 					 */
-					uint32		 bm_card	   = (uint32)
-											   roaring64_bitmap_get_cardinality(bm);
-					bool		 write_ovf	   = ((int) new_size > max_inline);
-					char		*bm_data	   = (char *) palloc(new_size);
-					BlockNumber  new_ovf_blkno = InvalidBlockNumber;
-					char		 pfx_buf[ROARING_OVERFLOW_INLINE_BYTES];
-					size_t		 pfx_len	   = 0;
+					RoaringLeafEntry *new_le =
+						(RoaringLeafEntry *) palloc(sizeof(RoaringLeafEntry) + new_size);
 
-					roaring64_bitmap_portable_serialize(bm, bm_data);
-					roaring64_bitmap_free(bm);
+					new_le->value		= cur_value;
+					new_le->cardinality = bm_card;
+					new_le->flags		= ROARING_ENTRY_INLINE;
+					memcpy((char *)(new_le + 1), bm_data, new_size);
 
-					if (write_ovf)
-					{
-						pfx_len		  = Min(ROARING_OVERFLOW_INLINE_BYTES, new_size);
-						memcpy(pfx_buf, bm_data, pfx_len);
-						new_ovf_blkno = roaring_write_overflow_chain(index,
-																	  bm_data,
-																	  new_size,
-																	  pfx_len);
-					}
-
-					/* Re-read with exclusive lock to modify. */
-					leafbuf  = ReadBuffer(index, leaf_blkno);
+					leaf_split_and_update(index, leaf_blkno, found_off,
+										  (const char *) new_le,
+										  sizeof(RoaringLeafEntry) + new_size,
+										  &rightmost_leaf,
+										  &leaf_structure_changed);
+					pfree(new_le);
+				}
+				else
+				{
+					/* Normal path: delete old entry and re-insert updated one. */
+					leafbuf = ReadBuffer(index, leaf_blkno);
 					LockBuffer(leafbuf, BUFFER_LOCK_EXCLUSIVE);
 					{
 						GenericXLogState *state = GenericXLogStart(index);
@@ -464,19 +646,18 @@ roaring_merge_pending(Relation index)
 																	 leafbuf, 0);
 
 						/*
-					 * Remove old item (compacting form so no LP_UNUSED hole
-					 * disrupts the sorted line-pointer array), then re-insert.
-					 */
+						 * Compacting delete so no LP_UNUSED hole breaks binary search.
+						 */
 						PageIndexTupleDelete(img, found_off);
 
 						if (write_ovf)
 						{
 							RoaringOverflowEntry new_oe;
 
-							new_oe.value		 = cur_value;
-							new_oe.cardinality	 = bm_card;
-							new_oe.flags		 = ROARING_ENTRY_OVERFLOW;
-							new_oe.total_len	 = (uint32) new_size;
+							new_oe.value		  = cur_value;
+							new_oe.cardinality	  = bm_card;
+							new_oe.flags		  = ROARING_ENTRY_OVERFLOW;
+							new_oe.total_len	  = (uint32) new_size;
 							new_oe.overflow_blkno = new_ovf_blkno;
 							memcpy(new_oe.inline_prefix, pfx_buf, pfx_len);
 
@@ -490,11 +671,13 @@ roaring_merge_pending(Relation index)
 						}
 						else
 						{
-							new_le			 = (RoaringLeafEntry *)
-											   palloc(sizeof(RoaringLeafEntry) + new_size);
-							new_le->value		 = cur_value;
-							new_le->cardinality  = bm_card;
-							new_le->flags		 = ROARING_ENTRY_INLINE;
+							RoaringLeafEntry *new_le =
+								(RoaringLeafEntry *)
+								palloc(sizeof(RoaringLeafEntry) + new_size);
+
+							new_le->value		= cur_value;
+							new_le->cardinality	= bm_card;
+							new_le->flags		= ROARING_ENTRY_INLINE;
 							memcpy((char *)(new_le + 1), bm_data, new_size);
 
 							if (PageAddItem(img, (Item) new_le,
@@ -510,8 +693,9 @@ roaring_merge_pending(Relation index)
 						GenericXLogFinish(state);
 					}
 					UnlockReleaseBuffer(leafbuf);
-					pfree(bm_data);
 				}
+
+				pfree(bm_data);
 				found_in_index = true;
 			}
 			else

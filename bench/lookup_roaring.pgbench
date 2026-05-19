@@ -1,0 +1,6 @@
+-- pgbench custom script: equality lookup via roaring index.
+-- Pass -D ndistinct=10000 to match setup cardinality.
+\set val random(1, :ndistinct)
+SET enable_seqscan = off;
+SET enable_bitmapscan = on;
+SELECT count(*) FROM bench_roaring WHERE val = :val;

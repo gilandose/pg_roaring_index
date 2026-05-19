@@ -1,0 +1,9 @@
+-- pgbench custom script: equality lookup via BRIN index.
+-- NOTE: with uniform uncorrelated data, BRIN degrades to a seq scan with
+-- recheck because every page range covers the full value domain.  This is
+-- intentional — our target workload is uncorrelated.
+-- Pass -D ndistinct=10000 to match setup cardinality.
+\set val random(1, :ndistinct)
+SET enable_seqscan = off;
+SET enable_bitmapscan = on;
+SELECT count(*) FROM bench_brin WHERE val = :val;
