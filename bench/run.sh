@@ -57,8 +57,8 @@ run_pgbench() {
     # pgbench exits non-zero on errors but also prints to stdout
     out=$(pgbench "${PGB_OPTS[@]}" "$@" 2>&1) || { echo "pgbench failed for $label"; echo "$out"; return 1; }
     local tps latency
-    tps=$(echo "$out"     | grep -oP 'tps = \K[\d.]+' | tail -1)
-    latency=$(echo "$out" | grep -oP 'latency average = \K[\d.]+')
+    tps=$(echo "$out"     | grep -Eo 'tps = [0-9.]+' | tail -1 | grep -Eo '[0-9.]+$')
+    latency=$(echo "$out" | grep -Eo 'latency average = [0-9.]+' | grep -Eo '[0-9.]+$')
     printf '  %-12s  %8.1f TPS   %7.3f ms avg latency\n' "$label" "${tps:-0}" "${latency:-0}"
 }
 
