@@ -417,8 +417,11 @@ roaring_merge_pending(Relation index)
 					Page			  img   = GenericXLogRegisterBuffer(state,
 																 leafbuf, 0);
 
-					/* Remove old item, insert updated one at the same offset. */
-					PageIndexTupleDeleteNoCompact(img, found_off);
+					/*
+				 * Remove old item (compacting form so no LP_UNUSED hole
+				 * disrupts the sorted line-pointer array), then re-insert.
+				 */
+					PageIndexTupleDelete(img, found_off);
 
 					new_le			 = (RoaringLeafEntry *)
 									   palloc(sizeof(RoaringLeafEntry) + new_size);
@@ -696,19 +699,256 @@ roaring_merge_pending(Relation index)
 }
 
 /* ----------------------------------------------------------------
+ * roaring_vacuum_one_leaf
+ *
+ * For every bitmap entry on a leaf page, call callback for each TID.
+ * Remove dead TIDs by reserialing the bitmap in place using
+ * PageIndexTupleOverwrite (which handles size shrinkage).  Empty bitmaps
+ * are written back with cardinality=0 rather than deleted, so the sorted
+ * order of line pointers stays intact for binary search in scan/merge.
+ *
+ * The caller must hold buf EXCLUSIVE.  GenericXLog is started lazily;
+ * GenericXLogAbort is called if the page turns out to be clean.
+ * ---------------------------------------------------------------- */
+static bool
+roaring_vacuum_one_leaf(Relation index, Buffer buf,
+						IndexBulkDeleteResult *stats,
+						IndexBulkDeleteCallback callback,
+						void *callback_state)
+{
+	GenericXLogState *state;
+	Page			  img;
+	OffsetNumber	  off, maxoff;
+	bool			  changed = false;
+
+	state  = GenericXLogStart(index);
+	img    = GenericXLogRegisterBuffer(state, buf, 0);
+	maxoff = PageGetMaxOffsetNumber(img);
+
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		ItemId				iid;
+		RoaringLeafEntry   *le;
+		size_t				bm_bytes;
+		roaring64_bitmap_t *bm;
+		roaring64_bitmap_t *dead_bm;
+		roaring64_iterator_t *it;
+		bool				has_dead;
+
+		iid = PageGetItemId(img, off);
+		if (!ItemIdIsUsed(iid))
+			continue;
+
+		le		 = (RoaringLeafEntry *) PageGetItem(img, iid);
+		bm_bytes = ItemIdGetLength(iid) - sizeof(RoaringLeafEntry);
+
+		bm = roaring64_bitmap_portable_deserialize_safe((char *)(le + 1),
+														bm_bytes);
+		if (!bm)
+			continue;					/* corrupted — leave alone */
+
+		dead_bm  = roaring64_bitmap_create();
+		has_dead = false;
+
+		it = roaring64_iterator_create(bm);
+		while (roaring64_iterator_has_value(it))
+		{
+			uint64			ltid = roaring64_iterator_value(it);
+			ItemPointerData	tid;
+
+			ItemPointerSetBlockNumber(&tid, (BlockNumber)(ltid >> 16));
+			ItemPointerSetOffsetNumber(&tid, (OffsetNumber)(ltid & 0xFFFF));
+
+			if (callback(&tid, callback_state))
+			{
+				roaring64_bitmap_add(dead_bm, ltid);
+				has_dead = true;
+				stats->tuples_removed++;
+			}
+			else
+				stats->num_index_tuples++;
+
+			roaring64_iterator_advance(it);
+		}
+		roaring64_iterator_free(it);
+
+		if (!has_dead)
+		{
+			roaring64_bitmap_free(bm);
+			roaring64_bitmap_free(dead_bm);
+			continue;
+		}
+
+		/* Remove dead TIDs and reserialize (possibly to an empty bitmap). */
+		roaring64_bitmap_andnot_inplace(bm, dead_bm);
+		roaring64_bitmap_free(dead_bm);
+		changed = true;
+
+		{
+			int64			  value		  = le->value;	/* save before overwrite */
+			size_t			  new_bm_bytes;
+			Size			  new_size;
+			RoaringLeafEntry *new_le;
+
+			roaring64_bitmap_run_optimize(bm);
+			new_bm_bytes = roaring64_bitmap_portable_size_in_bytes(bm);
+			new_size	 = sizeof(RoaringLeafEntry) + new_bm_bytes;
+			new_le		 = (RoaringLeafEntry *) palloc(new_size);
+			new_le->value		= value;
+			new_le->cardinality	= (uint32) roaring64_bitmap_get_cardinality(bm);
+			new_le->flags		= ROARING_ENTRY_INLINE;
+			roaring64_bitmap_portable_serialize(bm, (char *)(new_le + 1));
+
+			if (!PageIndexTupleOverwrite(img, off, (Item) new_le, new_size))
+				elog(ERROR,
+					 "pg_roaring_index: vacuum: PageIndexTupleOverwrite failed "
+					 "for value " INT64_FORMAT, value);
+			pfree(new_le);
+		}
+
+		roaring64_bitmap_free(bm);
+	}
+
+	if (changed)
+		GenericXLogFinish(state);
+	else
+		GenericXLogAbort(state);
+
+	return changed;
+}
+
+/* ----------------------------------------------------------------
+ * roaring_vacuum_pending_list
+ *
+ * Walk a pending list chain (insert or delete) starting at head_blkno.
+ * For each entry, call callback; compact out dead entries via GenericXLog.
+ * Each page is locked EXCLUSIVE during the update.
+ * ---------------------------------------------------------------- */
+static void
+roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
+							IndexBulkDeleteResult *stats,
+							IndexBulkDeleteCallback callback,
+							void *callback_state)
+{
+	BlockNumber cur = head_blkno;
+
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				  buf;
+		Page				  page;
+		RoaringPendingSpecial *spc;
+		RoaringPendingEntry	  *raw;
+		BlockNumber			  next;
+		int					  n, nlive, i;
+		RoaringPendingEntry	  live_buf[ROARING_PENDING_PER_PAGE];
+		bool				  changed = false;
+
+		buf  = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
+		raw  = (RoaringPendingEntry *) PageGetContents(page);
+		n    = spc->entry_count;
+		next = spc->next_page;
+
+		nlive = 0;
+		for (i = 0; i < n; i++)
+		{
+			ItemPointerData tid;
+
+			ItemPointerSetBlockNumber(&tid,
+									 (BlockNumber)(raw[i].linear_tid >> 16));
+			ItemPointerSetOffsetNumber(&tid,
+									  (OffsetNumber)(raw[i].linear_tid & 0xFFFF));
+
+			if (callback(&tid, callback_state))
+			{
+				changed = true;
+				stats->tuples_removed++;
+			}
+			else
+				live_buf[nlive++] = raw[i];
+		}
+
+		if (changed)
+		{
+			GenericXLogState	*state = GenericXLogStart(index);
+			Page				 img   = GenericXLogRegisterBuffer(state, buf, 0);
+			RoaringPendingSpecial *ispc = (RoaringPendingSpecial *)
+										  PageGetSpecialPointer(img);
+			RoaringPendingEntry	 *ient  = (RoaringPendingEntry *)
+										  PageGetContents(img);
+
+			memcpy(ient, live_buf, nlive * sizeof(RoaringPendingEntry));
+			ispc->entry_count = (uint16) nlive;
+			((PageHeader) img)->pd_lower =
+				(LocationIndex)(SizeOfPageHeaderData +
+								nlive * sizeof(RoaringPendingEntry));
+
+			GenericXLogFinish(state);
+		}
+
+		UnlockReleaseBuffer(buf);
+		cur = next;
+	}
+}
+
+/* ----------------------------------------------------------------
  * roaring_bulkdelete
  *
- * Phase 1: Walk the pending insert list, purge entries whose xmins are
- * aborted (they will never be visible, so we can discard them now).
- * Dead TIDs from actual heap deletes are handled by vacuumcleanup via
- * the tombstone path — not yet implemented (Phase 1.3).
+ * Walk all leaf pages and the pending insert list.  For each TID found,
+ * call the VACUUM callback; remove dead TIDs from bitmaps / compact them
+ * out of pending pages.
  * ---------------------------------------------------------------- */
 IndexBulkDeleteResult *
 roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				   IndexBulkDeleteCallback callback, void *callback_state)
 {
+	Relation			 index = info->index;
+	Buffer				 metabuf;
+	Page				 metapage;
+	RoaringMetaPageData *meta;
+	BlockNumber			 leftmost;
+	BlockNumber			 pending_head;
+	BlockNumber			 cur;
+
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	/* Read metapage under share lock for page references. */
+	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	metapage = BufferGetPage(metabuf);
+	meta     = RoaringPageGetMeta(metapage);
+	leftmost     = meta->leftmost_leaf_page;
+	pending_head = meta->pending_insert_head;
+	UnlockReleaseBuffer(metabuf);
+
+	/* Walk leaf pages left to right. */
+	cur = leftmost;
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				buf;
+		Page				page;
+		RoaringLeafSpecial *spc;
+		BlockNumber			next;
+
+		buf  = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		spc  = (RoaringLeafSpecial *) PageGetSpecialPointer(page);
+		next = spc->right_page;
+
+		roaring_vacuum_one_leaf(index, buf, stats, callback, callback_state);
+
+		UnlockReleaseBuffer(buf);
+		cur = next;
+	}
+
+	/* Compact dead entries out of the pending insert list. */
+	if (pending_head != InvalidBlockNumber)
+		roaring_vacuum_pending_list(index, pending_head, stats,
+									callback, callback_state);
 
 	return stats;
 }
