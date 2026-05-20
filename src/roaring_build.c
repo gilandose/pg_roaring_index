@@ -4,6 +4,8 @@
 #include "access/xloginsert.h"
 #include "commands/progress.h"
 #include "pgstat.h"
+#include "storage/checksum.h"
+#include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/rel.h"
 
@@ -444,23 +446,82 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 /* ================================================================
  * roaring_buildempty
+ *
+ * Called by PostgreSQL to initialise the INIT fork of an UNLOGGED index.
+ * The INIT fork is copied to the MAIN fork on crash recovery, so it must
+ * contain a complete, valid empty index state.
+ *
+ * We cannot use the normal buffer-manager path (ReadBuffer, etc.) because
+ * that always targets MAIN_FORKNUM.  Instead, write all three pages
+ * directly to INIT_FORKNUM via smgrextend, WAL-log each with log_newpage,
+ * then sync.  Pattern: contrib/bloom/blutils.c:blbuildempty.
  * ================================================================ */
 void
 roaring_buildempty(Relation index)
 {
-	Buffer		buf;
-	BlockNumber pending_insert;
-	BlockNumber pending_delete;
+	SMgrRelation		 smgr				 = RelationGetSmgr(index);
+	char				*buf				 = (char *) palloc(BLCKSZ);
+	Page				 page				 = (Page) buf;
+	RoaringMetaPageData *meta;
+	RoaringPendingSpecial *spc;
+	const BlockNumber	 pending_insert_blkno = 1;
+	const BlockNumber	 pending_delete_blkno = 2;
 
-	buf = roaring_extend_page(index);
-	Assert(BufferGetBlockNumber(buf) == ROARING_METAPAGE_BLKNO);
-	PageInit(BufferGetPage(buf), BLCKSZ, 0);
-	roaring_wal_and_release(index, buf);
+	smgrcreate(smgr, INIT_FORKNUM, false);
 
-	pending_insert = roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
-	pending_delete = roaring_init_pending_page(index, ROARING_PAGE_PENDING_DELETE);
+	/* Page 0: metapage */
+	PageInit(page, BLCKSZ, 0);
+	meta = RoaringPageGetMeta(page);
+	memset(meta, 0, sizeof(*meta));
+	meta->magic					  = ROARING_MAGIC;
+	meta->version				  = ROARING_INDEX_VERSION;
+	meta->flags					  = ROARING_FLAG_EXACT;
+	meta->root_directory_page	  = InvalidBlockNumber;
+	meta->leftmost_leaf_page	  = InvalidBlockNumber;
+	meta->rightmost_leaf_page	  = InvalidBlockNumber;
+	meta->pending_insert_head	  = pending_insert_blkno;
+	meta->pending_insert_tail	  = pending_insert_blkno;
+	meta->pending_insert_count	  = 0;
+	meta->pending_merging_head	  = InvalidBlockNumber;
+	meta->pending_delete_head	  = pending_delete_blkno;
+	meta->pending_delete_tail	  = pending_delete_blkno;
+	meta->pending_delete_count	  = 0;
+	meta->tombstone_root_page	  = InvalidBlockNumber;
+	meta->total_entries			  = 0;
+	meta->pending_merge_threshold = ROARING_PENDING_MERGE_THRESHOLD;
+	((PageHeader) page)->pd_lower =
+		(LocationIndex)(SizeOfPageHeaderData + sizeof(RoaringMetaPageData));
+	PageSetChecksumInplace(page, ROARING_METAPAGE_BLKNO);
+	smgrextend(smgr, INIT_FORKNUM, ROARING_METAPAGE_BLKNO, page, true);
+	log_newpage(&smgr->smgr_rlocator.locator, INIT_FORKNUM,
+				ROARING_METAPAGE_BLKNO, page, true);
 
-	write_metapage(index,
-				   InvalidBlockNumber, InvalidBlockNumber, InvalidBlockNumber,
-				   pending_insert, pending_delete, 0);
+	/* Page 1: pending insert */
+	PageInit(page, BLCKSZ, sizeof(RoaringPendingSpecial));
+	spc			   = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
+	spc->page_type	= ROARING_PAGE_PENDING_INSERT;
+	spc->flags		= 0;
+	spc->entry_count = 0;
+	spc->next_page	= InvalidBlockNumber;
+	spc->xmin_low	= InvalidTransactionId;
+	PageSetChecksumInplace(page, pending_insert_blkno);
+	smgrextend(smgr, INIT_FORKNUM, pending_insert_blkno, page, true);
+	log_newpage(&smgr->smgr_rlocator.locator, INIT_FORKNUM,
+				pending_insert_blkno, page, true);
+
+	/* Page 2: pending delete */
+	PageInit(page, BLCKSZ, sizeof(RoaringPendingSpecial));
+	spc			   = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
+	spc->page_type	= ROARING_PAGE_PENDING_DELETE;
+	spc->flags		= 0;
+	spc->entry_count = 0;
+	spc->next_page	= InvalidBlockNumber;
+	spc->xmin_low	= InvalidTransactionId;
+	PageSetChecksumInplace(page, pending_delete_blkno);
+	smgrextend(smgr, INIT_FORKNUM, pending_delete_blkno, page, true);
+	log_newpage(&smgr->smgr_rlocator.locator, INIT_FORKNUM,
+				pending_delete_blkno, page, true);
+
+	smgrimmedsync(smgr, INIT_FORKNUM);
+	pfree(buf);
 }
