@@ -2,6 +2,7 @@
 
 #include "access/tableam.h"
 #include "access/xloginsert.h"
+#include "catalog/pg_type_d.h"
 #include "commands/progress.h"
 #include "pgstat.h"
 #include "storage/checksum.h"
@@ -43,7 +44,9 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 	if (isnull[0])
 		return;
 
-	value		= DatumGetInt64(values[0]);
+	value = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID)
+			? (int64) DatumGetInt32(values[0])
+			: DatumGetInt64(values[0]);
 
 	entry = (RoaringBuildEntry *) hash_search(bstate->bitmaps, &value,
 											   HASH_ENTER, &found);

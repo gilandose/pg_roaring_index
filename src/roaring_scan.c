@@ -377,14 +377,23 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 	snapshot = scan->xs_snapshot;
 
+	/*
+	 * Determine the indexed column's base type so we extract datums correctly.
+	 * For int4 columns (roaring_int4_tid_ops), use DatumGetInt32 then promote;
+	 * for int8 columns (roaring_int8_tid_ops), use DatumGetInt64 directly.
+	 */
+	{
+		Oid atttypid = TupleDescAttr(index->rd_att, 0)->atttypid;
+
+#define ROARING_DATUM_TO_INT64(d) \
+	((atttypid == INT4OID) ? (int64) DatumGetInt32(d) : DatumGetInt64(d))
+
 	if (key->sk_flags & SK_SEARCHARRAY)
 	{
 		/*
-		 * IN() / = ANY() query: sk_argument is an int8[] array.
-		 * Iterate over each element and union results into tbm.
-		 * Each element gets its own directory lookup + pending scan.
-		 * This is one amgetbitmap call instead of N, saving executor
-		 * TIDBitmap allocation and merge overhead for large IN lists.
+		 * IN() / = ANY() query.  Deconstruct using the array element type
+		 * matching the opclass: int4[] for roaring_int4_tid_ops, int8[] for
+		 * roaring_int8_tid_ops.
 		 */
 		ArrayType  *arr  = DatumGetArrayTypeP(key->sk_argument);
 		Datum	   *elems;
@@ -392,8 +401,12 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		int			nelems;
 		int			i;
 
-		deconstruct_array(arr, INT8OID, 8, true, 'd',
-						  &elems, &nulls, &nelems);
+		if (atttypid == INT4OID)
+			deconstruct_array(arr, INT4OID, 4, true, 'i',
+							  &elems, &nulls, &nelems);
+		else
+			deconstruct_array(arr, INT8OID, 8, true, 'd',
+							  &elems, &nulls, &nelems);
 
 		for (i = 0; i < nelems; i++)
 		{
@@ -402,7 +415,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			if (nulls[i])
 				continue;
 
-			v = DatumGetInt64(elems[i]);
+			v = ROARING_DATUM_TO_INT64(elems[i]);
 
 			if (root_blkno != InvalidBlockNumber)
 				ntids += lookup_value_in_index(index, root_blkno, v,
@@ -424,7 +437,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	else
 	{
 		/* ---- Scalar equality lookup. ---- */
-		int64 scan_value = DatumGetInt64(key->sk_argument);
+		int64 scan_value = ROARING_DATUM_TO_INT64(key->sk_argument);
 
 		if (root_blkno != InvalidBlockNumber)
 			ntids += lookup_value_in_index(index, root_blkno, scan_value,
@@ -443,6 +456,9 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 											tbm, tid_buf, &tid_count);
 		}
 	}
+
+#undef ROARING_DATUM_TO_INT64
+	} /* end atttypid dispatch block */
 
 	/* Flush any remaining TIDs. */
 	if (tid_count > 0)

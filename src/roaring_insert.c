@@ -3,6 +3,7 @@
 #include "access/generic_xlog.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/pg_type_d.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
@@ -159,7 +160,9 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 	if (indexUnchanged)
 		return false;
 
-	entry.value      = DatumGetInt64(values[0]);
+	entry.value = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID)
+				  ? (int64) DatumGetInt32(values[0])
+				  : DatumGetInt64(values[0]);
 	entry.linear_tid = ((uint32) ItemPointerGetBlockNumber(ht_ctid) << 9) |
 					   (uint32)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
 	entry.xmin       = GetCurrentTransactionId();
