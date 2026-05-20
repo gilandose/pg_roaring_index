@@ -895,7 +895,7 @@ roaring_merge_pending(Relation index)
 		if (!found_in_index)
 		{
 			/* ---- 3b: new value — build bitmap and insert into leaves. ---- */
-			roaring_bitmap_t   *bm;
+			roaring_bitmap_t * volatile bm = NULL;
 			size_t				bm_size;
 			Size				entry_size;
 			RoaringLeafEntry   *new_le;
@@ -908,13 +908,26 @@ roaring_merge_pending(Relation index)
 			bm_size    = roaring_bitmap_portable_size_in_bytes(bm);
 			entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bm_size);
 
-			new_le				= (RoaringLeafEntry *)
-								  palloc(sizeof(RoaringLeafEntry) + bm_size);
-			new_le->value		= cur_value;
-			new_le->cardinality	= (uint32) roaring_bitmap_get_cardinality(bm);
-			new_le->flags		= ROARING_ENTRY_INLINE;
-			roaring_bitmap_portable_serialize(bm, (char *)(new_le + 1));
-			roaring_bitmap_free(bm);
+			PG_TRY();
+			{
+				new_le				= (RoaringLeafEntry *)
+									  palloc(sizeof(RoaringLeafEntry) + bm_size);
+				new_le->value		= cur_value;
+				new_le->cardinality	= (uint32) roaring_bitmap_get_cardinality(bm);
+				new_le->flags		= ROARING_ENTRY_INLINE;
+				roaring_bitmap_portable_serialize(bm, (char *)(new_le + 1));
+				roaring_bitmap_free(bm);
+				bm = NULL;
+			}
+			PG_FINALLY();
+			{
+				if (bm != NULL)
+				{
+					roaring_bitmap_free(bm);
+					bm = NULL;
+				}
+			}
+			PG_END_TRY();
 
 			/*
 			 * Find the leaf page to insert into.  We need the page whose
@@ -1176,7 +1189,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 						IndexBulkDeleteCallback callback,
 						void *callback_state)
 {
-	GenericXLogState *state;
+	GenericXLogState * volatile state = NULL;
 	Page			  img;
 	OffsetNumber	  off, maxoff;
 	bool			  changed = false;
@@ -1185,14 +1198,16 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 	img    = GenericXLogRegisterBuffer(state, buf, 0);
 	maxoff = PageGetMaxOffsetNumber(img);
 
+	PG_TRY();
+	{
 	for (off = FirstOffsetNumber; off <= maxoff; off++)
 	{
 		ItemId				iid;
 		RoaringLeafEntry   *le;
 		size_t				bm_bytes;
 		roaring_bitmap_t *bm;
-		roaring_bitmap_t *dead_bm;
-		roaring_uint32_iterator_t *it;
+		roaring_bitmap_t *dead_bm = NULL;
+		roaring_uint32_iterator_t *it = NULL;
 		bool				has_dead;
 		bool				was_overflow;
 
@@ -1251,6 +1266,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 				roaring_uint32_iterator_advance(it);
 			}
 			roaring_uint32_iterator_free(it);
+			it = NULL;
 
 			if (has_dead)
 			{
@@ -1260,6 +1276,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 				/* Remove dead TIDs and reserialize. */
 				roaring_bitmap_andnot_inplace(bm, dead_bm);
 				roaring_bitmap_free(dead_bm);
+				dead_bm = NULL;
 				changed = true;
 
 				new_bm_bytes = roaring_bitmap_portable_size_in_bytes(bm);
@@ -1309,6 +1326,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 			else
 			{
 				roaring_bitmap_free(dead_bm);
+				dead_bm = NULL;
 			}
 
 			roaring_bitmap_free(bm);
@@ -1318,6 +1336,16 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 		{
 			if (bm != NULL)
 				roaring_bitmap_free(bm);
+			if (dead_bm != NULL)
+			{
+				roaring_bitmap_free(dead_bm);
+				dead_bm = NULL;
+			}
+			if (it != NULL)
+			{
+				roaring_uint32_iterator_free(it);
+				it = NULL;
+			}
 		}
 		PG_END_TRY();
 	}
@@ -1326,6 +1354,14 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 		GenericXLogFinish(state);
 	else
 		GenericXLogAbort(state);
+	state = NULL;
+	}
+	PG_FINALLY();
+	{
+		if (state != NULL)
+			GenericXLogAbort(state);
+	}
+	PG_END_TRY();
 
 	return changed;
 }
