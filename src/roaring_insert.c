@@ -155,6 +155,10 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 	if (isnull[0])
 		return false;
 
+	/* HOT update: indexed column unchanged, no new index entry needed. */
+	if (indexUnchanged)
+		return false;
+
 	entry.value      = DatumGetInt64(values[0]);
 	entry.linear_tid = ((uint32) ItemPointerGetBlockNumber(ht_ctid) << 9) |
 					   (uint32)(ItemPointerGetOffsetNumber(ht_ctid) - 1);

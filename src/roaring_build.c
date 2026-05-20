@@ -100,6 +100,7 @@ write_metapage(Relation index,
 	meta->pending_insert_head	 = pending_insert;
 	meta->pending_insert_tail	 = pending_insert;
 	meta->pending_insert_count	 = 0;
+	meta->pending_merging_head	 = InvalidBlockNumber;
 	meta->pending_delete_head	 = pending_delete;
 	meta->pending_delete_tail	 = pending_delete;
 	meta->pending_delete_count	 = 0;

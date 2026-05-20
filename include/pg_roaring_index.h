@@ -83,6 +83,16 @@ typedef struct RoaringMetaPageData
     BlockNumber pending_insert_tail;
     uint32      pending_insert_count;
 
+    /*
+     * Set to the pending_insert_head at the start of a merge; cleared when
+     * the merge commits.  Crash recovery: if non-InvalidBlockNumber, a prior
+     * merge was interrupted; re-merge from this chain on next vacuum.
+     * Concurrent scans: amgetbitmap must walk both pending_insert_head and
+     * pending_merging_head chains to avoid stale-read gaps.
+     * Also acts as a mutex: a second merger that sees this set bails out.
+     */
+    BlockNumber pending_merging_head;
+
     BlockNumber pending_delete_head;    /* exact mode */
     BlockNumber pending_delete_tail;
     uint32      pending_delete_count;

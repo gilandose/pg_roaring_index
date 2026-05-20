@@ -3,6 +3,7 @@
 #include "access/xloginsert.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "utils/memutils.h"
 
 /*
  * roaring_extend_page
@@ -182,10 +183,18 @@ roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
 {
 	size_t		 total_len = oe->total_len;
 	Size		 cap	   = ROARING_OVERFLOW_PAGE_CAP;
-	char		*buf	   = palloc(total_len);
 	size_t		 off;
 	BlockNumber	 cur;
 	roaring_bitmap_t *bm;
+	char		*buf;
+
+	/* Guard against a corrupt total_len that would cause a huge palloc. */
+	if (total_len == 0 || total_len > (size_t) MaxAllocSize)
+		elog(ERROR,
+			 "pg_roaring_index: corrupt overflow entry: invalid total_len %zu",
+			 total_len);
+
+	buf = palloc(total_len);
 
 	/* Inline prefix stored directly in the entry. */
 	off = Min(sizeof(oe->inline_prefix), total_len);

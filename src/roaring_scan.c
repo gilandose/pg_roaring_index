@@ -4,8 +4,11 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "storage/bufmgr.h"
+#include "storage/procarray.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+
+#define ROARING_TID_BATCH 512
 
 /* ----------------------------------------------------------------
  * roaring_dir_lookup
@@ -22,49 +25,59 @@
 BlockNumber
 roaring_dir_lookup(Relation index, BlockNumber dir_blkno, int64 value)
 {
-	Buffer			   buf;
-	Page			   page;
-	RoaringDirSpecial *spc;
-	RoaringDirEntry   *entries;
-	uint32			   count;
-	uint8			   level;
-	BlockNumber		   child;
-	uint32			   lo, hi;
+	BlockNumber cur = dir_blkno;
+	int			depth;
 
-	buf     = ReadBuffer(index, dir_blkno);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page    = BufferGetPage(buf);
-	spc     = (RoaringDirSpecial *) PageGetSpecialPointer(page);
-	entries = (RoaringDirEntry *) PageGetContents(page);
-	count   = spc->entry_count;
-	level   = spc->level;
-
-	/* Binary search: find leftmost entry with high_key >= value. */
-	lo = 0;
-	hi = count;
-	while (lo < hi)
+	/* Two-level directory cap: at most 3 iterations (root + 1 level + leaf). */
+	for (depth = 0; depth < 4; depth++)
 	{
-		uint32 mid = (lo + hi) / 2;
-		if (entries[mid].high_key < value)
-			lo = mid + 1;
-		else
-			hi = mid;
-	}
+		Buffer			   buf;
+		Page			   page;
+		RoaringDirSpecial *spc;
+		RoaringDirEntry   *entries;
+		uint32			   count;
+		uint8			   level;
+		BlockNumber		   child;
+		uint32			   lo, hi;
 
-	if (lo >= count)
-	{
-		/* value exceeds all high_keys in this directory. */
+		buf     = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page    = BufferGetPage(buf);
+		spc     = (RoaringDirSpecial *) PageGetSpecialPointer(page);
+		entries = (RoaringDirEntry *) PageGetContents(page);
+		count   = spc->entry_count;
+		level   = spc->level;
+
+		/* Binary search: find leftmost entry with high_key >= value. */
+		lo = 0;
+		hi = count;
+		while (lo < hi)
+		{
+			uint32 mid = (lo + hi) / 2;
+			if (entries[mid].high_key < value)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+
+		if (lo >= count)
+		{
+			UnlockReleaseBuffer(buf);
+			return InvalidBlockNumber;
+		}
+
+		child = entries[lo].child_page;
 		UnlockReleaseBuffer(buf);
-		return InvalidBlockNumber;
+
+		if (level == 0)
+			return child;	/* child is a leaf page */
+
+		cur = child;		/* descend into sub-directory */
 	}
 
-	child = entries[lo].child_page;
-	UnlockReleaseBuffer(buf);
-
-	if (level == 0)
-		return child;		/* child is a leaf page */
-
-	return roaring_dir_lookup(index, child, value);	/* recurse into sub-dir */
+	elog(ERROR, "pg_roaring_index: directory depth exceeded at block %u "
+				"(possible corruption)", dir_blkno);
+	return InvalidBlockNumber;	/* unreachable */
 }
 
 /* ----------------------------------------------------------------
@@ -93,8 +106,8 @@ roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 
 	so->bitmap_loaded = false;
 
-	if (keys && scan->numberOfKeys > 0)
-		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
+	if (keys && nkeys > 0)
+		memmove(scan->keyData, keys, nkeys * sizeof(ScanKeyData));
 }
 
 void
@@ -107,19 +120,88 @@ roaring_endscan(IndexScanDesc scan)
 /* ----------------------------------------------------------------
  * roaring_pending_visible
  *
- * MVCC visibility check for a pending-list entry's xmin against the
- * current scan snapshot.
+ * GIN-style four-state MVCC visibility check for a pending entry's xmin.
  * ---------------------------------------------------------------- */
 static bool
 roaring_pending_visible(TransactionId xmin, Snapshot snapshot)
 {
 	if (!TransactionIdIsValid(xmin))
 		return false;
+	/* Frozen / bootstrap xids are always visible. */
+	if (!TransactionIdIsNormal(xmin))
+		return true;
 	if (TransactionIdIsCurrentTransactionId(xmin))
-		return true;					/* own insert */
+		return true;
 	if (XidInMVCCSnapshot(xmin, snapshot))
-		return false;					/* was in-progress when snapshot taken */
+		return false;
+	if (TransactionIdDidAbort(xmin))
+		return false;
+	if (TransactionIdIsInProgress(xmin))
+		return false;
 	return TransactionIdDidCommit(xmin);
+}
+
+/* ----------------------------------------------------------------
+ * scan_pending_chain
+ *
+ * Walk one pending list chain from start_blkno, appending any visible
+ * TIDs for scan_value to tbm.  Returns count of TIDs added.
+ * ---------------------------------------------------------------- */
+static int64
+scan_pending_chain(Relation index, BlockNumber start_blkno,
+				   int64 scan_value, Snapshot snapshot,
+				   TIDBitmap *tbm,
+				   ItemPointerData *tid_buf, int *tid_count_p)
+{
+	BlockNumber  cur   = start_blkno;
+	int64		 ntids = 0;
+
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				  buf;
+		Page				  page;
+		RoaringPendingSpecial *spc;
+		RoaringPendingEntry	  *raw;
+		uint16				  k;
+
+		buf  = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
+		raw  = (RoaringPendingEntry *) PageGetContents(page);
+
+		if (spc->entry_count > ROARING_PENDING_PER_PAGE)
+		{
+			UnlockReleaseBuffer(buf);
+			elog(ERROR,
+				 "pg_roaring_index: corrupt pending page %u: entry_count %u > max %d",
+				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
+		}
+
+		for (k = 0; k < spc->entry_count; k++)
+		{
+			if (raw[k].value != scan_value)
+				continue;
+			if (!roaring_pending_visible(raw[k].xmin, snapshot))
+				continue;
+
+			if (*tid_count_p == ROARING_TID_BATCH)
+			{
+				tbm_add_tuples(tbm, tid_buf, *tid_count_p, false);
+				*tid_count_p = 0;
+			}
+			{
+				BlockNumber  block = (BlockNumber)(raw[k].linear_tid >> 9);
+				OffsetNumber off   = (OffsetNumber)((raw[k].linear_tid & 0x1FF) + 1);
+				ItemPointerSet(&tid_buf[(*tid_count_p)++], block, off);
+				ntids++;
+			}
+		}
+
+		cur = spc->next_page;
+		UnlockReleaseBuffer(buf);
+	}
+	return ntids;
 }
 
 /* ----------------------------------------------------------------
@@ -135,7 +217,6 @@ roaring_pending_visible(TransactionId xmin, Snapshot snapshot)
 int64
 roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
-#define ROARING_TID_BATCH 512
 	Relation			index = scan->indexRelation;
 	RoaringScanOpaque  *so    = (RoaringScanOpaque *) scan->opaque;
 	int64				ntids = 0;
@@ -145,6 +226,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	RoaringMetaPageData *meta;
 	BlockNumber			root_blkno;
 	BlockNumber			pending_head;
+	BlockNumber			merging_head;
 	uint32				pending_count;
 
 	ItemPointerData		tid_buf[ROARING_TID_BATCH];
@@ -156,6 +238,9 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	so->bitmap_loaded = true;
 
 	if (scan->numberOfKeys < 1)
+		return 0;
+
+	if (scan->keyData[0].sk_flags & SK_ISNULL)
 		return 0;
 
 	scan_value = DatumGetInt64(scan->keyData[0].sk_argument);
@@ -172,6 +257,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	root_blkno    = meta->root_directory_page;
 	pending_head  = meta->pending_insert_head;
 	pending_count = meta->pending_insert_count;
+	merging_head  = meta->pending_merging_head;	/* set during a concurrent merge */
 	UnlockReleaseBuffer(metabuf);
 
 	/* ---- 2–5. Main index lookup (directory → leaf → bitmap). ---- */
@@ -239,6 +325,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						 "pg_roaring_index: failed to deserialize bitmap "
 						 "for value " INT64_FORMAT, scan_value);
 
+				PG_TRY();
 				{
 					roaring_uint32_iterator_t *it = roaring_iterator_create(bm);
 
@@ -258,56 +345,36 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						roaring_uint32_iterator_advance(it);
 					}
 					roaring_uint32_iterator_free(it);
+				}
+				PG_FINALLY();
+				{
 					roaring_bitmap_free(bm);
 				}
+				PG_END_TRY();
 			}
 			else
 				UnlockReleaseBuffer(leafbuf);
 		}
 	}
 
-	/* ---- 6. Pending insert list scan. ---- */
-	if (pending_count > 0)
+	/*
+	 * ---- 6. Pending insert list scan. ----
+	 *
+	 * Walk both chains: pending_head (current inserts) and merging_head
+	 * (entries being merged into leaves by a concurrent roaring_merge_pending).
+	 * When no merge is active, merging_head == InvalidBlockNumber and only the
+	 * first scan_pending_chain call does any work.
+	 */
 	{
-		BlockNumber		cur      = pending_head;
-		Snapshot		snapshot = scan->xs_snapshot;
+		Snapshot snapshot = scan->xs_snapshot;
 
-		while (cur != InvalidBlockNumber)
+		if (pending_count > 0 || merging_head != InvalidBlockNumber)
 		{
-			Buffer				  buf;
-			Page				  page;
-			RoaringPendingSpecial *spc;
-			RoaringPendingEntry	  *raw;
-			uint16				  k;
-
-			buf  = ReadBuffer(index, cur);
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-			spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
-			raw  = (RoaringPendingEntry *) PageGetContents(page);
-
-			for (k = 0; k < spc->entry_count; k++)
-			{
-				if (raw[k].value != scan_value)
-					continue;
-				if (!roaring_pending_visible(raw[k].xmin, snapshot))
-					continue;
-
-				if (tid_count == ROARING_TID_BATCH)
-				{
-					tbm_add_tuples(tbm, tid_buf, tid_count, false);
-					tid_count = 0;
-				}
-				{
-					BlockNumber  block = (BlockNumber)(raw[k].linear_tid >> 9);
-					OffsetNumber off   = (OffsetNumber)((raw[k].linear_tid & 0x1FF) + 1);
-					ItemPointerSet(&tid_buf[tid_count++], block, off);
-					ntids++;
-				}
-			}
-
-			cur = spc->next_page;
-			UnlockReleaseBuffer(buf);
+			ntids += scan_pending_chain(index, pending_head, scan_value, snapshot,
+										tbm, tid_buf, &tid_count);
+			if (merging_head != InvalidBlockNumber)
+				ntids += scan_pending_chain(index, merging_head, scan_value, snapshot,
+											tbm, tid_buf, &tid_count);
 		}
 	}
 
@@ -316,5 +383,4 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		tbm_add_tuples(tbm, tid_buf, tid_count, false);
 
 	return ntids;
-#undef ROARING_TID_BATCH
 }

@@ -61,6 +61,14 @@ collect_pending(Relation index, BlockNumber head_blkno, int *nout)
 		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
 		raw  = (RoaringPendingEntry *) PageGetContents(page);
 
+		if (spc->entry_count > ROARING_PENDING_PER_PAGE)
+		{
+			UnlockReleaseBuffer(buf);
+			elog(ERROR,
+				 "pg_roaring_index: corrupt pending page %u: entry_count %u > max %d",
+				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
+		}
+
 		for (i = 0; i < spc->entry_count; i++)
 		{
 			TransactionId xmin = raw[i].xmin;
@@ -206,9 +214,16 @@ rebuild_directory(Relation index, BlockNumber leftmost_leaf)
 	else
 	{
 		uint32			 l1_count   = (leaf_count + max_dir - 1) / max_dir;
-		RoaringDirEntry *l1_entries = (RoaringDirEntry *)
-									  palloc(l1_count * sizeof(RoaringDirEntry));
+		RoaringDirEntry *l1_entries;
 		uint32 j;
+
+		if (l1_count > max_dir)
+			elog(ERROR,
+				 "pg_roaring_index: rebuild_directory: index too large for "
+				 "two-level directory (%u leaf pages)", leaf_count);
+
+		l1_entries = (RoaringDirEntry *)
+					 palloc(l1_count * sizeof(RoaringDirEntry));
 
 		for (j = 0; j < l1_count; j++)
 		{
@@ -434,11 +449,39 @@ roaring_merge_pending(Relation index)
 	bool				 leaf_structure_changed = false;
 	uint32				 new_total_entries;
 
-	/* ---- Step 1: atomically swap in a fresh pending page. ---- */
+	/*
+	 * Step 1: crash-safe merge setup.
+	 *
+	 * Ordering (critical for correctness):
+	 *   A. Record pending_merging_head = old pending_insert_head.
+	 *      This acts as both a crash-recovery marker and a concurrent-merger
+	 *      mutex.  A second caller seeing pending_merging_head != Invalid bails.
+	 *      On crash between A and D, next vacuumcleanup re-reads from
+	 *      pending_merging_head and re-merges (OR is idempotent).
+	 *   B. Extend a new empty pending page (no lock held yet — safe).
+	 *   C. Atomically in one WAL record: write new pending page, set
+	 *      pending_insert_head/tail to new page, pending_insert_count = 0.
+	 *      New inserts now go to the fresh chain; the old chain is frozen.
+	 *   D. After ALL leaf writes complete, atomically: clear
+	 *      pending_merging_head, update root_directory_page, total_entries.
+	 *
+	 * NOTE: in-progress xids in the old chain are currently dropped when their
+	 * entries are not collected (collect_pending skips them).  This is a known
+	 * gap (Phase 1.3): those xids' TIDs will be lost if they commit after merge.
+	 * For now this is acceptable during active development; the fix is to
+	 * preserve in-progress entries in a new pending page before step D.
+	 */
 	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 	metapage = BufferGetPage(metabuf);
 	meta     = RoaringPageGetMeta(metapage);
+
+	/* Bail if another merger is already active (pending_merging_head is set). */
+	if (meta->pending_merging_head != InvalidBlockNumber)
+	{
+		UnlockReleaseBuffer(metabuf);
+		return;
+	}
 
 	if (meta->pending_insert_count == 0)
 	{
@@ -452,7 +495,16 @@ roaring_merge_pending(Relation index)
 	rightmost_leaf	  = meta->rightmost_leaf_page;
 	old_total_entries = meta->total_entries;
 
-	/* Extend a new empty pending page. */
+	/* Step A: record pending_merging_head — this is the crash-recovery anchor. */
+	{
+		GenericXLogState *state = GenericXLogStart(index);
+		Page			  meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
+
+		RoaringPageGetMeta(meta_img)->pending_merging_head = old_head;
+		GenericXLogFinish(state);
+	}
+
+	/* Step B: extend new pending page (metapage still locked; serialises inserts). */
 	new_pending_buf   = roaring_extend_page(index);
 	new_pending_blkno = BufferGetBlockNumber(new_pending_buf);
 	new_pending_page  = BufferGetPage(new_pending_buf);
@@ -460,14 +512,14 @@ roaring_merge_pending(Relation index)
 	{
 		RoaringPendingSpecial *spc =
 			(RoaringPendingSpecial *) PageGetSpecialPointer(new_pending_page);
-		spc->page_type	= ROARING_PAGE_PENDING_INSERT;
-		spc->flags		= 0;
+		spc->page_type	 = ROARING_PAGE_PENDING_INSERT;
+		spc->flags		 = 0;
 		spc->entry_count = 0;
-		spc->next_page	= InvalidBlockNumber;
-		spc->xmin_low	= InvalidTransactionId;
+		spc->next_page	 = InvalidBlockNumber;
+		spc->xmin_low	 = InvalidTransactionId;
 	}
 
-	/* Atomically: WAL new pending page + update metapage to point to it. */
+	/* Step C: atomically swap pending_insert_head to the fresh page. */
 	{
 		GenericXLogState *state = GenericXLogStart(index);
 		Page			  np_img, meta_img;
@@ -930,7 +982,13 @@ roaring_merge_pending(Relation index)
 	if (leaf_structure_changed || root_dir == InvalidBlockNumber)
 		root_dir = rebuild_directory(index, leftmost_leaf);
 
-	/* ---- Step 5: update metapage. ---- */
+	/*
+	 * Step D: atomically commit the merge — clear pending_merging_head and
+	 * update the directory pointer and entry count in a single WAL record.
+	 * After this WAL record is durable the merge is complete.  The old chain
+	 * starting at old_head is now unreachable and will be reclaimed on the
+	 * next REINDEX / amvacuumcleanup free-space pass.
+	 */
 	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 	{
@@ -942,6 +1000,7 @@ roaring_merge_pending(Relation index)
 		m->leftmost_leaf_page  = leftmost_leaf;
 		m->rightmost_leaf_page = rightmost_leaf;
 		m->total_entries	   = new_total_entries;
+		m->pending_merging_head = InvalidBlockNumber;	/* merge committed */
 
 		GenericXLogFinish(state);
 	}
@@ -1148,6 +1207,11 @@ roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
 		raw  = (RoaringPendingEntry *) PageGetContents(page);
 		n    = spc->entry_count;
 		next = spc->next_page;
+
+		if (n > ROARING_PENDING_PER_PAGE)
+			elog(ERROR,
+				 "pg_roaring_index: corrupt pending page %u: entry_count %d > max %d",
+				 cur, n, ROARING_PENDING_PER_PAGE);
 
 		nlive = 0;
 		for (i = 0; i < n; i++)
