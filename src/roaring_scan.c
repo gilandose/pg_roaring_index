@@ -7,6 +7,7 @@
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/array.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -360,18 +361,60 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	if (key->sk_flags & SK_ISNULL)
 		return 0;
 
-	/* ---- 1. Read metapage once. ---- */
-	metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
-	meta = RoaringPageGetMeta(BufferGetPage(metabuf));
+	/* ---- 1. Read metapage (or use rd_amcache). ---- */
+	{
+		RoaringAmCache *cache = (RoaringAmCache *) index->rd_amcache;
 
-	roaring_validate_metapage(index, meta);
+		/*
+		 * Fast path: if the cache says pending is empty, check whether the
+		 * metapage LSN is still current via an atomic read (no content lock).
+		 * If so, skip the full metapage read entirely.
+		 */
+		if (cache != NULL &&
+			cache->pending_count == 0 &&
+			cache->merging_head == InvalidBlockNumber)
+		{
+			Buffer     tmp     = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			XLogRecPtr cur_lsn = BufferGetLSNAtomic(tmp);
 
-	root_blkno    = meta->root_directory_page;
-	pending_head  = meta->pending_insert_head;
-	pending_count = meta->pending_insert_count;
-	merging_head  = meta->pending_merging_head;
-	UnlockReleaseBuffer(metabuf);
+			ReleaseBuffer(tmp);
+
+			if (cur_lsn == cache->meta_lsn)
+			{
+				root_blkno    = cache->root_blkno;
+				pending_count = 0;
+				pending_head  = InvalidBlockNumber;
+				merging_head  = InvalidBlockNumber;
+				goto after_meta;
+			}
+		}
+
+		/* Full metapage read. */
+		metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+		meta = RoaringPageGetMeta(BufferGetPage(metabuf));
+		roaring_validate_metapage(index, meta);
+		root_blkno    = meta->root_directory_page;
+		pending_count = meta->pending_insert_count;
+		pending_head  = meta->pending_insert_head;
+		merging_head  = meta->pending_merging_head;
+
+		/* Populate or refresh the cache. */
+		if (cache == NULL)
+		{
+			cache = (RoaringAmCache *)
+				MemoryContextAllocZero(CacheMemoryContext,
+									   sizeof(RoaringAmCache));
+			index->rd_amcache = cache;
+		}
+		cache->root_blkno    = root_blkno;
+		cache->total_entries = meta->total_entries;
+		cache->meta_lsn      = PageGetLSN(BufferGetPage(metabuf));
+		cache->pending_count = pending_count;
+		cache->merging_head  = merging_head;
+		UnlockReleaseBuffer(metabuf);
+	}
+	after_meta:;
 
 	snapshot = scan->xs_snapshot;
 

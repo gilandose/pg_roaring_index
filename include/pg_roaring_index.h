@@ -232,6 +232,23 @@ roaring_cardinality32(const roaring_bitmap_t *bm)
 }
 
 /* ----------
+ * Per-relation AM cache (rd_amcache)
+ *
+ * Cached on first metapage read; stale check via meta_lsn using
+ * BufferGetLSNAtomic (no content lock needed).  Allows costestimate to skip
+ * the buffer read on repeated planning calls, and getbitmap to skip the
+ * metapage read entirely when pending is known empty.
+ * ---------- */
+typedef struct RoaringAmCache
+{
+    BlockNumber root_blkno;
+    uint32      total_entries;
+    XLogRecPtr  meta_lsn;
+    uint32      pending_count;
+    BlockNumber merging_head;
+} RoaringAmCache;
+
+/* ----------
  * Scan state
  * ---------- */
 typedef struct RoaringScanOpaque

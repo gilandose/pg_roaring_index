@@ -4,6 +4,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 /*
@@ -38,18 +39,43 @@ roaring_costestimate(struct PlannerInfo *root,
 	if (path->indexclauses == NIL || heap_tuples <= 0)
 		return;
 
-	/* Read total_entries from the metapage. */
+	/*
+	 * Read total_entries from the metapage — or from rd_amcache if the
+	 * cache was populated by a recent getbitmap call in this session.
+	 * A slightly stale total_entries is fine for selectivity estimation.
+	 */
 	{
-		Relation			indexRel;
-		Buffer				metabuf;
-		RoaringMetaPageData *meta;
+		Relation		indexRel = index_open(index->indexoid, AccessShareLock);
+		RoaringAmCache *cache   = (RoaringAmCache *) indexRel->rd_amcache;
 
-		indexRel = index_open(index->indexoid, AccessShareLock);
-		metabuf  = ReadBuffer(indexRel, ROARING_METAPAGE_BLKNO);
-		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
-		meta	 = RoaringPageGetMeta(BufferGetPage(metabuf));
-		nentries = (double) meta->total_entries;
-		UnlockReleaseBuffer(metabuf);
+		if (cache != NULL && cache->total_entries > 0)
+		{
+			nentries = (double) cache->total_entries;
+		}
+		else
+		{
+			Buffer				metabuf;
+			RoaringMetaPageData *meta;
+
+			metabuf  = ReadBuffer(indexRel, ROARING_METAPAGE_BLKNO);
+			LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+			meta	 = RoaringPageGetMeta(BufferGetPage(metabuf));
+			nentries = (double) meta->total_entries;
+
+			/* Warm the cache for subsequent planning calls. */
+			cache = (RoaringAmCache *)
+				MemoryContextAllocZero(CacheMemoryContext,
+									   sizeof(RoaringAmCache));
+			cache->root_blkno    = meta->root_directory_page;
+			cache->total_entries = meta->total_entries;
+			cache->meta_lsn      = PageGetLSN(BufferGetPage(metabuf));
+			cache->pending_count = meta->pending_insert_count;
+			cache->merging_head  = meta->pending_merging_head;
+			indexRel->rd_amcache = cache;
+
+			UnlockReleaseBuffer(metabuf);
+		}
+
 		index_close(indexRel, AccessShareLock);
 	}
 
