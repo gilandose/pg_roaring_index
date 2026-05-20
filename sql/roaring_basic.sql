@@ -95,6 +95,23 @@ SELECT count(*) AS cnt_int4_3  FROM roaring_int4 WHERE val = 3;   -- 1
 SELECT count(*) AS cnt_int4_10 FROM roaring_int4 WHERE val = 10;  -- 0
 
 -- ----------------------------------------------------------------
+-- 10. REINDEX CONCURRENTLY smoke test
+-- ----------------------------------------------------------------
+CREATE TABLE reindex_test (id int, val bigint);
+INSERT INTO reindex_test SELECT i, (i % 5) + 1 FROM generate_series(1, 20) i;
+CREATE INDEX reindex_test_idx ON reindex_test USING roaring (val);
+VACUUM reindex_test;
+
+SET enable_seqscan = off;
+SELECT count(*) AS before_reindex FROM reindex_test WHERE val = 3;
+
+REINDEX INDEX CONCURRENTLY reindex_test_idx;
+
+SELECT count(*) AS after_reindex FROM reindex_test WHERE val = 3;
+RESET enable_seqscan;
+DROP TABLE reindex_test;
+
+-- ----------------------------------------------------------------
 -- Cleanup
 -- ----------------------------------------------------------------
 RESET enable_seqscan;

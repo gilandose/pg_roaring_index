@@ -1407,132 +1407,18 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 }
 
 /* ----------------------------------------------------------------
- * roaring_vacuum_pending_list
- *
- * Walk a pending list chain (insert or delete) starting at head_blkno.
- * For each entry, call callback; compact out dead entries via GenericXLog.
- * Each page is locked EXCLUSIVE during the update.
- *
- * After processing all pages, subtracts the total number of removed entries
- * from pending_insert_count in the metapage so back-pressure stays accurate.
- * ---------------------------------------------------------------- */
-static void
-roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
-							IndexBulkDeleteResult *stats,
-							IndexBulkDeleteCallback callback,
-							void *callback_state)
-{
-	BlockNumber			cur		   = head_blkno;
-	uint32				total_removed = 0;
-	RoaringPendingEntry *live_buf  =
-		(RoaringPendingEntry *) palloc(ROARING_PENDING_PER_PAGE *
-									   sizeof(RoaringPendingEntry));
-
-	while (cur != InvalidBlockNumber)
-	{
-		Buffer				  buf;
-		Page				  page;
-		RoaringPendingSpecial *spc;
-		RoaringPendingEntry	  *raw;
-		BlockNumber			  next;
-		int					  n, nlive, i;
-		bool				  changed = false;
-
-		buf  = ReadBuffer(index, cur);
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		page = BufferGetPage(buf);
-		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
-		raw  = (RoaringPendingEntry *) PageGetContents(page);
-		n    = spc->entry_count;
-		next = spc->next_page;
-
-		if (n > ROARING_PENDING_PER_PAGE)
-			elog(ERROR,
-				 "pg_roaring_index: corrupt pending page %u: entry_count %d > max %d",
-				 cur, n, ROARING_PENDING_PER_PAGE);
-
-		nlive = 0;
-		for (i = 0; i < n; i++)
-		{
-			ItemPointerData tid;
-			TransactionId	xmin = raw[i].xmin;
-
-			/* Drop entries from aborted transactions — never committed. */
-			if (TransactionIdIsValid(xmin) &&
-				TransactionIdIsNormal(xmin) &&
-				TransactionIdDidAbort(xmin))
-			{
-				changed = true;
-				total_removed++;
-				continue;
-			}
-
-			ItemPointerSetBlockNumber(&tid,
-									 (BlockNumber)(raw[i].linear_tid >> 9));
-			ItemPointerSetOffsetNumber(&tid,
-									  (OffsetNumber)((raw[i].linear_tid & 0x1FF) + 1));
-
-			if (callback(&tid, callback_state))
-			{
-				changed = true;
-				stats->tuples_removed++;
-				total_removed++;
-			}
-			else
-				live_buf[nlive++] = raw[i];
-		}
-
-		if (changed)
-		{
-			GenericXLogState	*state = GenericXLogStart(index);
-			Page				 img   = GenericXLogRegisterBuffer(state, buf, 0);
-			RoaringPendingSpecial *ispc = (RoaringPendingSpecial *)
-										  PageGetSpecialPointer(img);
-			RoaringPendingEntry	 *ient  = (RoaringPendingEntry *)
-										  PageGetContents(img);
-
-			memcpy(ient, live_buf, nlive * sizeof(RoaringPendingEntry));
-			ispc->entry_count = (uint16) nlive;
-			((PageHeader) img)->pd_lower =
-				(LocationIndex)(SizeOfPageHeaderData +
-								nlive * sizeof(RoaringPendingEntry));
-
-			GenericXLogFinish(state);
-		}
-
-		UnlockReleaseBuffer(buf);
-		cur = next;
-	}
-	pfree(live_buf);
-
-	/* Keep pending_insert_count in sync so back-pressure stays accurate. */
-	if (total_removed > 0)
-	{
-		Buffer				 metabuf;
-		GenericXLogState	*state;
-		Page				 img;
-		RoaringMetaPageData *meta;
-
-		metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-		state = GenericXLogStart(index);
-		img   = GenericXLogRegisterBuffer(state, metabuf, 0);
-		meta  = RoaringPageGetMeta(img);
-		meta->pending_insert_count =
-			(meta->pending_insert_count >= total_removed)
-			? meta->pending_insert_count - total_removed
-			: 0;
-		GenericXLogFinish(state);
-		UnlockReleaseBuffer(metabuf);
-	}
-}
-
-/* ----------------------------------------------------------------
  * roaring_bulkdelete
  *
- * Walk all leaf pages and the pending insert list.  For each TID found,
- * call the VACUUM callback; remove dead TIDs from bitmaps / compact them
- * out of pending pages.
+ * Walk all leaf pages; remove dead TIDs from bitmaps via the VACUUM callback.
+ * Safe for parallel vacuum (VACUUM_OPTION_PARALLEL_BULKDEL): workers have
+ * disjoint dead-TID sets (different heap pages), and each leaf page is
+ * modified under an exclusive buffer lock so serialisation is correct.
+ *
+ * Pending list dead entries are NOT compacted here — they are merged into
+ * leaf bitmaps during vacuumcleanup and removed from there on the next
+ * ambulkdelete pass.  This is correct (BitmapHeapScan always rechecks) and
+ * avoids the concurrency hazard of multiple workers writing the same pending
+ * pages simultaneously.
  * ---------------------------------------------------------------- */
 IndexBulkDeleteResult *
 roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
@@ -1543,22 +1429,20 @@ roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	Page				 metapage;
 	RoaringMetaPageData *meta;
 	BlockNumber			 leftmost;
-	BlockNumber			 pending_head;
 	BlockNumber			 cur;
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
-	/* Read metapage under share lock for page references. */
+	/* Read metapage under share lock for leftmost leaf. */
 	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 	metapage = BufferGetPage(metabuf);
 	meta     = RoaringPageGetMeta(metapage);
-	leftmost     = meta->leftmost_leaf_page;
-	pending_head = meta->pending_insert_head;
+	leftmost = meta->leftmost_leaf_page;
 	UnlockReleaseBuffer(metabuf);
 
-	/* Walk leaf pages left to right. */
+	/* Walk leaf pages left to right, removing dead TIDs in-place. */
 	cur = leftmost;
 	while (cur != InvalidBlockNumber)
 	{
@@ -1578,11 +1462,6 @@ roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		UnlockReleaseBuffer(buf);
 		cur = next;
 	}
-
-	/* Compact dead entries out of the pending insert list. */
-	if (pending_head != InvalidBlockNumber)
-		roaring_vacuum_pending_list(index, pending_head, stats,
-									callback, callback_state);
 
 	return stats;
 }
@@ -1643,15 +1522,132 @@ roaring_bulkdelete_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 /* ----------------------------------------------------------------
  * roaring_vacuumcleanup
  *
- * Called after VACUUM completes its heap pass.  Merge the pending insert
- * list into the main index so that subsequent scans don't have to walk
- * the pending list at all.
+ * Called after VACUUM completes its heap pass.  Handles crash recovery
+ * first, then merges the pending insert list into the main index.
+ *
+ * Crash recovery: if a prior merge was interrupted, pending_merging_head
+ * remains set.  roaring_merge_pending treats a set pending_merging_head as
+ * "another merger is active" and bails out immediately — correct for the
+ * concurrent-merger case, but wrong after a crash where no other backend
+ * holds the merge lock.  vacuumcleanup is the authoritative single-writer
+ * merge context (PostgreSQL serializes VACUUM per relation), so any set
+ * pending_merging_head seen here is always crash recovery, never a live
+ * concurrent merger.
+ *
+ * Two crash cases:
+ *   Case 1 — crash before Step C (pending_insert_head == pending_merging_head):
+ *     The old chain is still in place as the active insert head.  Just clear
+ *     the anchor; roaring_merge_pending picks it up on the normal path.
+ *
+ *   Case 2 — crash after Step C (pending_insert_head != pending_merging_head):
+ *     Step C had already swapped in a carry chain as pending_insert_head.
+ *     The old merging chain is stranded at pending_merging_head.  Walk to
+ *     its tail, link the carry chain onto it, re-route pending_insert_head
+ *     to the old chain head, then clear pending_merging_head.  OR-in is
+ *     idempotent, so re-merging entries that were already partially merged
+ *     before the crash is safe.
  * ---------------------------------------------------------------- */
 IndexBulkDeleteResult *
 roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
+	Relation			 index = info->index;
+	Buffer				 metabuf;
+	Page				 metapage;
+	RoaringMetaPageData *meta;
+	BlockNumber			 merging_head;
+	BlockNumber			 insert_head;
+	uint32				 insert_count;
+
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	/* Check for a stuck pending_merging_head left by a prior crash. */
+	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	metapage = BufferGetPage(metabuf);
+	meta     = RoaringPageGetMeta(metapage);
+	merging_head = meta->pending_merging_head;
+	insert_head  = meta->pending_insert_head;
+	insert_count = meta->pending_insert_count;
+	UnlockReleaseBuffer(metabuf);
+
+	if (merging_head != InvalidBlockNumber)
+	{
+		if (insert_head == merging_head)
+		{
+			/* Case 1: pending_insert_head still holds the chain.  Clear anchor. */
+			metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+			{
+				GenericXLogState *state = GenericXLogStart(index);
+				Page img = GenericXLogRegisterBuffer(state, metabuf, 0);
+
+				RoaringPageGetMeta(img)->pending_merging_head = InvalidBlockNumber;
+				GenericXLogFinish(state);
+			}
+			UnlockReleaseBuffer(metabuf);
+		}
+		else
+		{
+			/*
+			 * Case 2: carry chain is at pending_insert_head; old merging chain
+			 * is stranded at merging_head.  Walk old chain to its tail, link
+			 * carry chain onto it, re-route insert_head to old chain head.
+			 */
+			BlockNumber tail_blkno = merging_head;
+			uint32		old_count  = 0;
+
+			for (;;)
+			{
+				Buffer				  pb;
+				RoaringPendingSpecial *pspc;
+				BlockNumber			  next;
+
+				pb   = ReadBuffer(index, tail_blkno);
+				LockBuffer(pb, BUFFER_LOCK_SHARE);
+				pspc = (RoaringPendingSpecial *)
+						   PageGetSpecialPointer(BufferGetPage(pb));
+				next      = pspc->next_page;
+				old_count += pspc->entry_count;
+				UnlockReleaseBuffer(pb);
+
+				if (next == InvalidBlockNumber)
+					break;
+				tail_blkno = next;
+			}
+
+			/* Append carry chain to old chain's tail. */
+			{
+				Buffer pb = ReadBuffer(index, tail_blkno);
+
+				LockBuffer(pb, BUFFER_LOCK_EXCLUSIVE);
+				{
+					GenericXLogState *state = GenericXLogStart(index);
+					Page img = GenericXLogRegisterBuffer(state, pb, 0);
+
+					((RoaringPendingSpecial *)
+					     PageGetSpecialPointer(img))->next_page = insert_head;
+					GenericXLogFinish(state);
+				}
+				UnlockReleaseBuffer(pb);
+			}
+
+			/* Re-route pending_insert_head to old chain; clear anchor. */
+			metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+			{
+				GenericXLogState *state = GenericXLogStart(index);
+				Page img = GenericXLogRegisterBuffer(state, metabuf, 0);
+				RoaringMetaPageData *m = RoaringPageGetMeta(img);
+
+				m->pending_insert_head  = merging_head;
+				m->pending_insert_count = old_count + insert_count;
+				m->pending_merging_head = InvalidBlockNumber;
+				GenericXLogFinish(state);
+			}
+			UnlockReleaseBuffer(metabuf);
+		}
+	}
 
 	roaring_merge_pending(info->index);
 

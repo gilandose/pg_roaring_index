@@ -3,6 +3,7 @@
 #include "access/amapi.h"
 #include "access/reloptions.h"
 #include "catalog/pg_am.h"
+#include "commands/vacuum.h"
 #include "utils/guc.h"
 
 PG_MODULE_MAGIC;
@@ -49,7 +50,7 @@ roaring_handler(PG_FUNCTION_ARGS)
     amroutine->amcanparallel  = false;
     amroutine->amcaninclude   = false;
     amroutine->amusemaintenanceworkmem = false;
-    amroutine->amparallelvacuumoptions = 0;
+    amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
     amroutine->amkeytype      = InvalidOid;
 
     amroutine->ambuild           = roaring_build;
@@ -108,7 +109,7 @@ roaring_page_handler(PG_FUNCTION_ARGS)
     amroutine->amcanparallel  = false;
     amroutine->amcaninclude   = false;
     amroutine->amusemaintenanceworkmem = false;
-    amroutine->amparallelvacuumoptions = 0;
+    amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
     amroutine->amkeytype      = InvalidOid;
 
     amroutine->ambuild           = roaring_build_lossy;
