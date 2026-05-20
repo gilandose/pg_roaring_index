@@ -285,6 +285,8 @@ extern void roaring_merge_pending(Relation index);
 /* roaring_build.c */
 extern IndexBuildResult *roaring_build(Relation heap, Relation index,
                                        struct IndexInfo *indexInfo);
+extern IndexBuildResult *roaring_build_lossy(Relation heap, Relation index,
+                                             struct IndexInfo *indexInfo);
 extern void roaring_buildempty(Relation index);
 
 /* roaring_insert.c */
@@ -293,6 +295,11 @@ extern bool roaring_insert(Relation index, Datum *values, bool *isnull,
                            IndexUniqueCheck checkUnique,
                            bool indexUnchanged,
                            struct IndexInfo *indexInfo);
+extern bool roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
+                                 ItemPointer ht_ctid, Relation heapRel,
+                                 IndexUniqueCheck checkUnique,
+                                 bool indexUnchanged,
+                                 struct IndexInfo *indexInfo);
 
 /* roaring_scan.c */
 extern BlockNumber   roaring_dir_lookup(Relation index, BlockNumber dir_blkno,
@@ -301,6 +308,7 @@ extern IndexScanDesc roaring_beginscan(Relation rel, int nkeys, int norderbys);
 extern void roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
                            ScanKey orderbys, int norderbys);
 extern int64 roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm);
+extern int64 roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm);
 extern void roaring_endscan(IndexScanDesc scan);
 
 /* roaring_vacuum.c */
@@ -308,6 +316,10 @@ extern IndexBulkDeleteResult *roaring_bulkdelete(IndexVacuumInfo *info,
                                                   IndexBulkDeleteResult *stats,
                                                   IndexBulkDeleteCallback callback,
                                                   void *callback_state);
+extern IndexBulkDeleteResult *roaring_bulkdelete_lossy(IndexVacuumInfo *info,
+                                                        IndexBulkDeleteResult *stats,
+                                                        IndexBulkDeleteCallback callback,
+                                                        void *callback_state);
 extern IndexBulkDeleteResult *roaring_vacuumcleanup(IndexVacuumInfo *info,
                                                      IndexBulkDeleteResult *stats);
 

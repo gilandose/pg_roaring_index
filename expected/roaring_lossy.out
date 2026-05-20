@@ -1,0 +1,97 @@
+CREATE EXTENSION
+    amname     
+---------------
+ roaring_lossy
+(1 row)
+
+CREATE TABLE
+INSERT 0 6
+CREATE INDEX
+VACUUM
+SET
+ cnt_val1 
+----------
+        2
+(1 row)
+
+ cnt_val2 
+----------
+        1
+(1 row)
+
+ cnt_val3 
+----------
+        3
+(1 row)
+
+ cnt_val99 
+-----------
+         0
+(1 row)
+
+                QUERY PLAN                 
+-------------------------------------------
+ Bitmap Heap Scan on lossy_test
+   Recheck Cond: (val = 1)
+   ->  Bitmap Index Scan on lossy_test_idx
+         Index Cond: (val = 1)
+(4 rows)
+
+ cnt_in 
+--------
+      5
+(1 row)
+
+INSERT 0 3
+ cnt_val4_pending 
+------------------
+                3
+(1 row)
+
+INSERT 0 1
+ cnt_val1_mixed 
+----------------
+              3
+(1 row)
+
+VACUUM
+ cnt_val1_post_merge 
+---------------------
+                   3
+(1 row)
+
+ cnt_val4_post_merge 
+---------------------
+                   3
+(1 row)
+
+DELETE 1
+INSERT 0 2
+VACUUM
+ cnt_val2_reinserted 
+---------------------
+                   2
+(1 row)
+
+ cnt_val4_stable 
+-----------------
+               3
+(1 row)
+
+CREATE TABLE
+INSERT 0 5
+CREATE INDEX
+VACUUM
+ cnt_int4_3 
+------------
+          1
+(1 row)
+
+ cnt_int4_10 
+-------------
+           0
+(1 row)
+
+RESET
+DROP TABLE
+DROP TABLE

@@ -1588,6 +1588,59 @@ roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 }
 
 /* ----------------------------------------------------------------
+ * roaring_bulkdelete_lossy
+ *
+ * Lossy mode does not store individual TIDs, so we cannot remove dead
+ * TIDs from bitmaps at ambulkdelete time.  Stale block numbers cause
+ * extra rechecks (which find no matching rows) but are not incorrect.
+ * We walk the leaf chain only to populate num_index_tuples for stats.
+ *
+ * Dead block entries are cleaned up implicitly: after vacuumcleanup
+ * merges fresh pending inserts, re-inserted values re-add any live
+ * blocks.  A future pass could rebuild bitmaps from scratch to reclaim
+ * space from fully-dead blocks, but that is not implemented yet.
+ * ---------------------------------------------------------------- */
+IndexBulkDeleteResult *
+roaring_bulkdelete_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+						 IndexBulkDeleteCallback callback, void *callback_state)
+{
+	Relation			 index = info->index;
+	Buffer				 metabuf;
+	RoaringMetaPageData *meta;
+	BlockNumber			 leftmost;
+	BlockNumber			 cur;
+
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	meta     = RoaringPageGetMeta(BufferGetPage(metabuf));
+	leftmost = meta->leftmost_leaf_page;
+	UnlockReleaseBuffer(metabuf);
+
+	/* Walk leaf pages to count distinct values (entries). */
+	cur = leftmost;
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				buf;
+		Page				page;
+		RoaringLeafSpecial *spc;
+
+		buf  = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		spc  = (RoaringLeafSpecial *) PageGetSpecialPointer(page);
+
+		stats->num_index_tuples += PageGetMaxOffsetNumber(page);
+		cur = spc->right_page;
+		UnlockReleaseBuffer(buf);
+	}
+
+	return stats;
+}
+
+/* ----------------------------------------------------------------
  * roaring_vacuumcleanup
  *
  * Called after VACUUM completes its heap pass.  Merge the pending insert

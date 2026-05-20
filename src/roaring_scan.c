@@ -4,6 +4,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
+#include "nodes/tidbitmap.h"
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/array.h"
@@ -512,6 +513,323 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	/* Flush any remaining TIDs. */
 	if (tid_count > 0)
 		tbm_add_tuples(tbm, tid_buf, tid_count, false);
+
+	return ntids;
+}
+
+/* ================================================================
+ * Lossy (page-level) scan helpers
+ * ================================================================ */
+
+/*
+ * lookup_value_in_index_lossy
+ *
+ * Same as lookup_value_in_index but adds matched block numbers to tbm
+ * via tbm_add_page instead of individual TIDs.  Returns the count of
+ * distinct pages added (not TIDs — the executor will recheck all rows).
+ */
+static int64
+lookup_value_in_index_lossy(Relation index, BlockNumber root_blkno,
+							int64 value, TIDBitmap *tbm)
+{
+	BlockNumber		 leaf_blkno;
+	Buffer			 leafbuf;
+	Page			 leafpage;
+	OffsetNumber	 lo, hi;
+	RoaringLeafEntry *le = NULL;
+	OffsetNumber	 found_off = InvalidOffsetNumber;
+	int64			 npages	   = 0;
+
+	leaf_blkno = roaring_dir_lookup(index, root_blkno, value);
+	if (leaf_blkno == InvalidBlockNumber)
+		return 0;
+
+	leafbuf  = ReadBuffer(index, leaf_blkno);
+	LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
+	leafpage = BufferGetPage(leafbuf);
+
+	lo = 1;
+	hi = PageGetMaxOffsetNumber(leafpage);
+	while (lo <= hi)
+	{
+		OffsetNumber	  mid = (lo + hi) / 2;
+		RoaringLeafEntry *e   = (RoaringLeafEntry *)
+								PageGetItem(leafpage,
+											PageGetItemId(leafpage, mid));
+		if (e->value == value)
+		{
+			le        = e;
+			found_off = mid;
+			break;
+		}
+		else if (e->value < value)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+
+	if (le != NULL)
+	{
+		roaring_bitmap_t *bm;
+
+		if (le->flags & ROARING_ENTRY_OVERFLOW)
+		{
+			RoaringOverflowEntry oe_copy;
+
+			memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+			UnlockReleaseBuffer(leafbuf);
+			bm = roaring_read_overflow_bitmap(index, &oe_copy);
+		}
+		else
+		{
+			Size item_len   = ItemIdGetLength(PageGetItemId(leafpage, found_off));
+			Size bitmap_len = item_len - sizeof(RoaringLeafEntry);
+
+			bm = roaring_bitmap_portable_deserialize_safe(
+					(const char *)(le + 1), bitmap_len);
+			UnlockReleaseBuffer(leafbuf);
+		}
+
+		if (bm == NULL)
+			elog(ERROR,
+				 "pg_roaring_index: failed to deserialize bitmap "
+				 "for value " INT64_FORMAT, value);
+
+		PG_TRY();
+		{
+			uint64_t  card = roaring_bitmap_get_cardinality(bm);
+			uint32_t *arr  = (uint32_t *) palloc(card * sizeof(uint32_t));
+			uint64_t  k;
+
+			roaring_bitmap_to_uint32_array(bm, arr);
+
+			for (k = 0; k < card; k++)
+				tbm_add_page(tbm, (BlockNumber) arr[k]);
+
+			npages = (int64) card;
+			pfree(arr);
+		}
+		PG_FINALLY();
+		{
+			roaring_bitmap_free(bm);
+		}
+		PG_END_TRY();
+	}
+	else
+		UnlockReleaseBuffer(leafbuf);
+
+	return npages;
+}
+
+/*
+ * scan_pending_chain_lossy
+ *
+ * Walk one pending chain for lossy mode.  The linear_tid field holds
+ * the block number directly.  Calls tbm_add_page for each visible entry.
+ */
+static int64
+scan_pending_chain_lossy(Relation index, BlockNumber start_blkno,
+						 int64 scan_value, Snapshot snapshot,
+						 TIDBitmap *tbm)
+{
+	BlockNumber  cur    = start_blkno;
+	int64		 npages = 0;
+
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				  buf;
+		Page				  page;
+		RoaringPendingSpecial *spc;
+		RoaringPendingEntry	  *raw;
+		uint16				  k;
+
+		buf  = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
+		raw  = (RoaringPendingEntry *) PageGetContents(page);
+
+		if (spc->entry_count > ROARING_PENDING_PER_PAGE)
+		{
+			UnlockReleaseBuffer(buf);
+			elog(ERROR,
+				 "pg_roaring_index: corrupt pending page %u: entry_count %u > max %d",
+				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
+		}
+
+		if (scan_value < spc->value_min || scan_value > spc->value_max)
+		{
+			cur = spc->next_page;
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
+		for (k = 0; k < spc->entry_count; k++)
+		{
+			if (raw[k].value != scan_value)
+				continue;
+			if (!roaring_pending_visible(raw[k].xmin, snapshot))
+				continue;
+
+			tbm_add_page(tbm, (BlockNumber) raw[k].linear_tid);
+			npages++;
+		}
+
+		cur = spc->next_page;
+		UnlockReleaseBuffer(buf);
+	}
+	return npages;
+}
+
+/* ----------------------------------------------------------------
+ * roaring_getbitmap_lossy
+ *
+ * Lossy bitmap scan.  Adds matched pages (not individual TIDs) to tbm
+ * via tbm_add_page; the executor rechecks all rows on each matched page.
+ * ---------------------------------------------------------------- */
+int64
+roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
+{
+	Relation			index = scan->indexRelation;
+	RoaringScanOpaque  *so    = (RoaringScanOpaque *) scan->opaque;
+	int64				ntids = 0;
+
+	Buffer				metabuf;
+	RoaringMetaPageData *meta;
+	BlockNumber			root_blkno;
+	BlockNumber			pending_head;
+	BlockNumber			merging_head;
+	uint32				pending_count;
+	Snapshot			snapshot;
+	ScanKey				key;
+
+	if (so->bitmap_loaded)
+		return 0;
+	so->bitmap_loaded = true;
+
+	if (scan->numberOfKeys < 1)
+		return 0;
+
+	key = &scan->keyData[0];
+	if (key->sk_flags & SK_ISNULL)
+		return 0;
+
+	/* ---- Read metapage (or use rd_amcache). ---- */
+	{
+		RoaringAmCache *cache = (RoaringAmCache *) index->rd_amcache;
+
+		if (cache != NULL &&
+			cache->pending_count == 0 &&
+			cache->merging_head == InvalidBlockNumber)
+		{
+			Buffer     tmp     = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			XLogRecPtr cur_lsn = BufferGetLSNAtomic(tmp);
+
+			ReleaseBuffer(tmp);
+
+			if (cur_lsn == cache->meta_lsn)
+			{
+				root_blkno    = cache->root_blkno;
+				pending_count = 0;
+				pending_head  = InvalidBlockNumber;
+				merging_head  = InvalidBlockNumber;
+				goto after_meta_lossy;
+			}
+		}
+
+		metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+		meta = RoaringPageGetMeta(BufferGetPage(metabuf));
+		roaring_validate_metapage(index, meta);
+		root_blkno    = meta->root_directory_page;
+		pending_count = meta->pending_insert_count;
+		pending_head  = meta->pending_insert_head;
+		merging_head  = meta->pending_merging_head;
+
+		if (cache == NULL)
+		{
+			cache = (RoaringAmCache *)
+				MemoryContextAllocZero(CacheMemoryContext,
+									   sizeof(RoaringAmCache));
+			index->rd_amcache = cache;
+		}
+		cache->root_blkno    = root_blkno;
+		cache->total_entries = meta->total_entries;
+		cache->meta_lsn      = PageGetLSN(BufferGetPage(metabuf));
+		cache->pending_count = pending_count;
+		cache->merging_head  = merging_head;
+		UnlockReleaseBuffer(metabuf);
+	}
+	after_meta_lossy:;
+
+	snapshot = scan->xs_snapshot;
+
+	{
+		Oid atttypid = TupleDescAttr(index->rd_att, 0)->atttypid;
+
+#define ROARING_DATUM_TO_INT64_LOSSY(d) \
+	((atttypid == INT4OID) ? (int64) DatumGetInt32(d) : DatumGetInt64(d))
+
+	if (key->sk_flags & SK_SEARCHARRAY)
+	{
+		ArrayType  *arr  = DatumGetArrayTypeP(key->sk_argument);
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems;
+		int			i;
+
+		if (atttypid == INT4OID)
+			deconstruct_array(arr, INT4OID, 4, true, 'i',
+							  &elems, &nulls, &nelems);
+		else
+			deconstruct_array(arr, INT8OID, 8, true, 'd',
+							  &elems, &nulls, &nelems);
+
+		for (i = 0; i < nelems; i++)
+		{
+			int64 v;
+
+			if (nulls[i])
+				continue;
+
+			v = ROARING_DATUM_TO_INT64_LOSSY(elems[i]);
+
+			if (root_blkno != InvalidBlockNumber)
+				ntids += lookup_value_in_index_lossy(index, root_blkno, v, tbm);
+
+			if (pending_count > 0 || merging_head != InvalidBlockNumber)
+			{
+				ntids += scan_pending_chain_lossy(index, pending_head, v,
+												  snapshot, tbm);
+				if (merging_head != InvalidBlockNumber)
+					ntids += scan_pending_chain_lossy(index, merging_head, v,
+													  snapshot, tbm);
+			}
+		}
+
+		pfree(elems);
+		pfree(nulls);
+	}
+	else
+	{
+		int64 scan_value = ROARING_DATUM_TO_INT64_LOSSY(key->sk_argument);
+
+		if (root_blkno != InvalidBlockNumber)
+			ntids += lookup_value_in_index_lossy(index, root_blkno,
+												  scan_value, tbm);
+
+		if (pending_count > 0 || merging_head != InvalidBlockNumber)
+		{
+			ntids += scan_pending_chain_lossy(index, pending_head, scan_value,
+											  snapshot, tbm);
+			if (merging_head != InvalidBlockNumber)
+				ntids += scan_pending_chain_lossy(index, merging_head, scan_value,
+												  snapshot, tbm);
+		}
+	}
+
+#undef ROARING_DATUM_TO_INT64_LOSSY
+	}
 
 	return ntids;
 }

@@ -178,3 +178,35 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 	roaring_pending_append(index, &entry);
 	return false;	/* this AM does not support unique indexes */
 }
+
+/* ----------------------------------------------------------------
+ * roaring_insert_lossy
+ *
+ * Lossy variant: stores the heap block number in linear_tid instead of
+ * the (blkno<<9|offset-1) linearization.  The pending list, metapage,
+ * and locking protocol are identical to the exact path.
+ * ---------------------------------------------------------------- */
+bool
+roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
+					 ItemPointer ht_ctid, Relation heapRel,
+					 IndexUniqueCheck checkUnique,
+					 bool indexUnchanged,
+					 struct IndexInfo *indexInfo)
+{
+	RoaringPendingEntry entry;
+
+	if (isnull[0])
+		return false;
+
+	if (indexUnchanged)
+		return false;
+
+	entry.value      = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID)
+					   ? (int64) DatumGetInt32(values[0])
+					   : DatumGetInt64(values[0]);
+	entry.linear_tid = (uint32) ItemPointerGetBlockNumber(ht_ctid);
+	entry.xmin       = GetCurrentTransactionId();
+
+	roaring_pending_append(index, &entry);
+	return false;
+}

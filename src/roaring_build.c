@@ -91,7 +91,8 @@ write_metapage(Relation index,
 			   BlockNumber rightmost_leaf,
 			   BlockNumber pending_insert,
 			   BlockNumber pending_delete,
-			   uint32 total_entries)
+			   uint32 total_entries,
+			   uint16 flags)
 {
 	Buffer				buf;
 	Page				page;
@@ -107,7 +108,7 @@ write_metapage(Relation index,
 
 	meta->magic					   = ROARING_MAGIC;
 	meta->version				   = ROARING_INDEX_VERSION;
-	meta->flags					   = ROARING_FLAG_EXACT;
+	meta->flags					   = flags;
 	meta->croaring_format_version  = ROARING_EXPECTED_FORMAT_VERSION;
 	meta->root_directory_page	 = root_dir;
 	meta->leftmost_leaf_page	 = leftmost_leaf;
@@ -466,7 +467,8 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	/* Write metapage into block 0. */
 	write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
-				   pending_insert, pending_delete, (uint32) nentries);
+				   pending_insert, pending_delete, (uint32) nentries,
+				   ROARING_FLAG_EXACT);
 
 	result->heap_tuples  = reltuples;
 	result->index_tuples = (double) nentries;
@@ -560,4 +562,106 @@ roaring_buildempty(Relation index)
 
 	smgrimmedsync(smgr, INIT_FORKNUM);
 	pfree(buf);
+}
+
+/* ================================================================
+ * roaring_build_lossy
+ *
+ * Lossy (page-level) variant of roaring_build.  The build callback
+ * stores the heap block number instead of the linearized TID, so each
+ * bitmap entry represents a page rather than an individual tuple.
+ * Everything else — leaf/directory page layout, pending list, metapage —
+ * is identical to the exact path.
+ * ================================================================ */
+static void
+roaring_build_callback_lossy(Relation index, ItemPointer tid, Datum *values,
+							  bool *isnull, bool tupleIsAlive, void *state)
+{
+	RoaringBuildState  *bstate = (RoaringBuildState *) state;
+	int64				value;
+
+	bstate->heap_tuples++;
+
+	if (isnull[0])
+		return;
+
+	value = (bstate->atttypid == INT4OID)
+			? (int64) DatumGetInt32(values[0])
+			: DatumGetInt64(values[0]);
+
+	if (bstate->ntuples == bstate->nalloc)
+	{
+		bstate->nalloc *= 2;
+		bstate->tuples  = (RoaringBuildTuple *)
+						  repalloc(bstate->tuples,
+								   bstate->nalloc * sizeof(RoaringBuildTuple));
+	}
+
+	bstate->tuples[bstate->ntuples].value = value;
+	/* Lossy: store block number only — many TIDs map to the same blkno. */
+	bstate->tuples[bstate->ntuples].tid   =
+		(uint32) ItemPointerGetBlockNumber(tid);
+	bstate->ntuples++;
+}
+
+IndexBuildResult *
+roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
+{
+	IndexBuildResult   *result;
+	RoaringBuildState	bstate;
+	double				reltuples;
+	long				nentries    = 0;
+	long				init_nalloc;
+
+	BlockNumber			root_dir		= InvalidBlockNumber;
+	BlockNumber			leftmost_leaf	= InvalidBlockNumber;
+	BlockNumber			rightmost_leaf	= InvalidBlockNumber;
+	BlockNumber			pending_insert;
+	BlockNumber			pending_delete;
+
+	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
+
+	{
+		Buffer buf = roaring_extend_page(index);
+
+		Assert(BufferGetBlockNumber(buf) == ROARING_METAPAGE_BLKNO);
+		PageInit(BufferGetPage(buf), BLCKSZ, 0);
+		roaring_wal_and_release(index, buf);
+	}
+
+	init_nalloc = (long) heap->rd_rel->reltuples;
+	if (init_nalloc < 1024)
+		init_nalloc = 1024;
+
+	bstate.heap_tuples = 0;
+	bstate.atttypid    = TupleDescAttr(index->rd_att, 0)->atttypid;
+	bstate.nalloc      = init_nalloc;
+	bstate.ntuples     = 0;
+	bstate.tuples      = (RoaringBuildTuple *)
+						 palloc(init_nalloc * sizeof(RoaringBuildTuple));
+
+	reltuples = table_index_build_scan(heap, index, indexInfo,
+									   true, true,
+									   roaring_build_callback_lossy,
+									   &bstate, NULL);
+
+	/* Sort by (value, blkno); roaring deduplicates repeated blknos. */
+	qsort(bstate.tuples, bstate.ntuples, sizeof(RoaringBuildTuple),
+		  cmp_build_tuple);
+
+	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples, &nentries,
+							 &root_dir, &leftmost_leaf, &rightmost_leaf);
+
+	pfree(bstate.tuples);
+
+	pending_insert = roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
+	pending_delete = roaring_init_pending_page(index, ROARING_PAGE_PENDING_DELETE);
+
+	write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
+				   pending_insert, pending_delete, (uint32) nentries,
+				   ROARING_FLAG_LOSSY);
+
+	result->heap_tuples  = reltuples;
+	result->index_tuples = (double) nentries;
+	return result;
 }

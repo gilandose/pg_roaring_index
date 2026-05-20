@@ -31,3 +31,35 @@ CREATE OPERATOR CLASS roaring_int4_tid_ops
 -- Cross-type: integer col = bigint literal (e.g. WHERE col_int4 = 42::bigint)
 ALTER OPERATOR FAMILY roaring_int4_tid_ops USING roaring ADD
     OPERATOR 1 =(int4, int8);
+
+-- ----------------------------------------------------------------
+-- Lossy (page-level) opclasses — roaring_page_ops
+--
+-- Stores block numbers instead of TIDs.  amrecheck=true so the executor
+-- rechecks heap tuples on each matched page.  Index is 10-100x smaller
+-- than the exact variant at low cardinality; best for multi-column AND
+-- queries or when index size dominates (e.g. ndistinct < 1000).
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION pg_roaring_page_handler(internal)
+    RETURNS index_am_handler
+    AS 'MODULE_PATHNAME', 'roaring_page_handler'
+    LANGUAGE C;
+
+CREATE ACCESS METHOD roaring_lossy
+    TYPE INDEX
+    HANDLER pg_roaring_page_handler;
+
+CREATE OPERATOR CLASS roaring_int8_page_ops
+    DEFAULT FOR TYPE int8 USING roaring_lossy AS
+    OPERATOR 1 =(int8, int8);
+
+ALTER OPERATOR FAMILY roaring_int8_page_ops USING roaring_lossy ADD
+    OPERATOR 1 =(int8, int4);
+
+CREATE OPERATOR CLASS roaring_int4_page_ops
+    DEFAULT FOR TYPE int4 USING roaring_lossy AS
+    OPERATOR 1 =(int4, int4);
+
+ALTER OPERATOR FAMILY roaring_int4_page_ops USING roaring_lossy ADD
+    OPERATOR 1 =(int4, int8);
