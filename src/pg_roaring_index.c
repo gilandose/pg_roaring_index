@@ -40,7 +40,7 @@ roaring_handler(PG_FUNCTION_ARGS)
     amroutine->amcanunique    = false;
     amroutine->amcanmulticol  = false;
     amroutine->amoptionalkey  = false;
-    amroutine->amsearcharray  = false;
+    amroutine->amsearcharray  = true;
     amroutine->amsearchnulls  = false;
     amroutine->amstorage      = false;
     amroutine->amclusterable  = false;
