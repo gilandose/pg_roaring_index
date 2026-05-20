@@ -1382,8 +1382,11 @@ roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
 							IndexBulkDeleteCallback callback,
 							void *callback_state)
 {
-	BlockNumber cur = head_blkno;
-	uint32		total_removed = 0;
+	BlockNumber			cur		   = head_blkno;
+	uint32				total_removed = 0;
+	RoaringPendingEntry *live_buf  =
+		(RoaringPendingEntry *) palloc(ROARING_PENDING_PER_PAGE *
+									   sizeof(RoaringPendingEntry));
 
 	while (cur != InvalidBlockNumber)
 	{
@@ -1393,7 +1396,6 @@ roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
 		RoaringPendingEntry	  *raw;
 		BlockNumber			  next;
 		int					  n, nlive, i;
-		RoaringPendingEntry	  live_buf[ROARING_PENDING_PER_PAGE];
 		bool				  changed = false;
 
 		buf  = ReadBuffer(index, cur);
@@ -1450,6 +1452,7 @@ roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
 		UnlockReleaseBuffer(buf);
 		cur = next;
 	}
+	pfree(live_buf);
 
 	/* Keep pending_insert_count in sync so back-pressure stays accurate. */
 	if (total_removed > 0)
