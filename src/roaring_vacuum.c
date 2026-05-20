@@ -710,7 +710,7 @@ roaring_merge_pending(Relation index)
 				Size				item_len;
 				Size				bitmap_len;
 				Size				leaf_free;
-				roaring_bitmap_t   *bm;
+				roaring_bitmap_t   *bm = NULL;
 				int					j;
 				size_t				new_size;
 				uint32				bm_card;
@@ -770,11 +770,30 @@ roaring_merge_pending(Relation index)
 				 * Serialize the bitmap.  For overflow, write the chain before
 				 * re-acquiring the leaf lock so overflow WAL precedes leaf WAL.
 				 */
-				bm_data		  = (char *) palloc(new_size);
-				new_ovf_blkno = InvalidBlockNumber;
-				pfx_len		  = 0;
-				roaring_bitmap_portable_serialize(bm, bm_data);
-				roaring_bitmap_free(bm);
+				/*
+				 * palloc can throw OOM; bm uses libc malloc so PG_FINALLY
+				 * ensures it is freed even if palloc (or serialize) throws.
+				 * On the success path, bm = NULL inside the try block so
+				 * PG_FINALLY becomes a no-op.
+				 */
+				PG_TRY();
+				{
+					bm_data		  = (char *) palloc(new_size);
+					new_ovf_blkno = InvalidBlockNumber;
+					pfx_len		  = 0;
+					roaring_bitmap_portable_serialize(bm, bm_data);
+					roaring_bitmap_free(bm);
+					bm = NULL;
+				}
+				PG_FINALLY();
+				{
+					if (bm != NULL)
+					{
+						roaring_bitmap_free(bm);
+						bm = NULL;
+					}
+				}
+				PG_END_TRY();
 
 				if (write_ovf)
 				{
@@ -1183,6 +1202,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 
 		le = (RoaringLeafEntry *) PageGetItem(img, iid);
 		was_overflow = (le->flags == ROARING_ENTRY_OVERFLOW);
+		bm = NULL;
 
 		if (was_overflow)
 		{
@@ -1200,98 +1220,106 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 		if (!bm)
 			continue;					/* corrupted — leave alone */
 
-		dead_bm  = roaring_bitmap_create();
-		has_dead = false;
-
-		it = roaring_iterator_create(bm);
-		while (it->has_value)
+		/*
+		 * bm uses libc malloc, not palloc, so PG error recovery will not free
+		 * it.  PG_FINALLY ensures roaring_bitmap_free runs even if
+		 * PageIndexTupleOverwrite or palloc below throws.
+		 */
+		PG_TRY();
 		{
-			uint32			ltid = it->current_value;
-			ItemPointerData	tid;
+			dead_bm  = roaring_bitmap_create();
+			has_dead = false;
 
-			ItemPointerSetBlockNumber(&tid, (BlockNumber)(ltid >> 9));
-			ItemPointerSetOffsetNumber(&tid, (OffsetNumber)((ltid & 0x1FF) + 1));
-
-			if (callback(&tid, callback_state))
+			it = roaring_iterator_create(bm);
+			while (it->has_value)
 			{
-				roaring_bitmap_add(dead_bm, ltid);
-				has_dead = true;
-				stats->tuples_removed++;
+				uint32			ltid = it->current_value;
+				ItemPointerData	tid;
+
+				ItemPointerSetBlockNumber(&tid, (BlockNumber)(ltid >> 9));
+				ItemPointerSetOffsetNumber(&tid, (OffsetNumber)((ltid & 0x1FF) + 1));
+
+				if (callback(&tid, callback_state))
+				{
+					roaring_bitmap_add(dead_bm, ltid);
+					has_dead = true;
+					stats->tuples_removed++;
+				}
+				else
+					stats->num_index_tuples++;
+
+				roaring_uint32_iterator_advance(it);
+			}
+			roaring_uint32_iterator_free(it);
+
+			if (has_dead)
+			{
+				int64  value	   = le->value;
+				size_t new_bm_bytes;
+
+				/* Remove dead TIDs and reserialize. */
+				roaring_bitmap_andnot_inplace(bm, dead_bm);
+				roaring_bitmap_free(dead_bm);
+				changed = true;
+
+				new_bm_bytes = roaring_bitmap_portable_size_in_bytes(bm);
+
+				if (was_overflow)
+				{
+					char				 *bm_data  = (char *) palloc(new_bm_bytes);
+					size_t				  pfx_len  = Min(ROARING_OVERFLOW_INLINE_BYTES,
+														 new_bm_bytes);
+					RoaringOverflowEntry  new_oe;
+
+					roaring_bitmap_portable_serialize(bm, bm_data);
+					new_oe.value		  = value;
+					new_oe.cardinality	  = (uint32) roaring_bitmap_get_cardinality(bm);
+					new_oe.flags		  = ROARING_ENTRY_OVERFLOW;
+					new_oe.total_len	  = (uint32) new_bm_bytes;
+					new_oe.overflow_blkno = roaring_write_overflow_chain(index,
+																		  bm_data,
+																		  new_bm_bytes,
+																		  pfx_len);
+					memcpy(new_oe.inline_prefix, bm_data, pfx_len);
+					pfree(bm_data);
+
+					if (!PageIndexTupleOverwrite(img, off, (Item) &new_oe,
+												 sizeof(RoaringOverflowEntry)))
+						elog(ERROR,
+							 "pg_roaring_index: vacuum: PageIndexTupleOverwrite failed "
+							 "for value " INT64_FORMAT, value);
+				}
+				else
+				{
+					Size			  new_size = sizeof(RoaringLeafEntry) + new_bm_bytes;
+					RoaringLeafEntry *new_le   = (RoaringLeafEntry *) palloc(new_size);
+
+					new_le->value		= value;
+					new_le->cardinality	= (uint32) roaring_bitmap_get_cardinality(bm);
+					new_le->flags		= ROARING_ENTRY_INLINE;
+					roaring_bitmap_portable_serialize(bm, (char *)(new_le + 1));
+
+					if (!PageIndexTupleOverwrite(img, off, (Item) new_le, new_size))
+						elog(ERROR,
+							 "pg_roaring_index: vacuum: PageIndexTupleOverwrite failed "
+							 "for value " INT64_FORMAT, value);
+					pfree(new_le);
+				}
 			}
 			else
-				stats->num_index_tuples++;
+			{
+				roaring_bitmap_free(dead_bm);
+			}
 
-			roaring_uint32_iterator_advance(it);
-		}
-		roaring_uint32_iterator_free(it);
-
-		if (!has_dead)
-		{
 			roaring_bitmap_free(bm);
-			roaring_bitmap_free(dead_bm);
-			continue;
+			bm = NULL;
 		}
-
-		/* Remove dead TIDs and reserialize (possibly to an empty bitmap). */
-		roaring_bitmap_andnot_inplace(bm, dead_bm);
-		roaring_bitmap_free(dead_bm);
-		changed = true;
-
+		PG_FINALLY();
 		{
-			int64  value	   = le->value;
-			size_t new_bm_bytes;
-
-			new_bm_bytes = roaring_bitmap_portable_size_in_bytes(bm);
-
-			if (was_overflow)
-			{
-				/*
-				 * Entry was overflow: write a new overflow chain and update
-				 * the in-page entry in-place.  Old overflow pages are orphaned
-				 * (space leak acceptable for Phase 1; REINDEX reclaims them).
-				 */
-				char				 *bm_data  = (char *) palloc(new_bm_bytes);
-				size_t				  pfx_len  = Min(ROARING_OVERFLOW_INLINE_BYTES,
-													 new_bm_bytes);
-				RoaringOverflowEntry  new_oe;
-
-				roaring_bitmap_portable_serialize(bm, bm_data);
-				new_oe.value		 = value;
-				new_oe.cardinality	 = (uint32) roaring_bitmap_get_cardinality(bm);
-				new_oe.flags		 = ROARING_ENTRY_OVERFLOW;
-				new_oe.total_len	 = (uint32) new_bm_bytes;
-				new_oe.overflow_blkno = roaring_write_overflow_chain(index,
-																	  bm_data,
-																	  new_bm_bytes,
-																	  pfx_len);
-				memcpy(new_oe.inline_prefix, bm_data, pfx_len);
-				pfree(bm_data);
-
-				if (!PageIndexTupleOverwrite(img, off, (Item) &new_oe,
-											 sizeof(RoaringOverflowEntry)))
-					elog(ERROR,
-						 "pg_roaring_index: vacuum: PageIndexTupleOverwrite failed "
-						 "for value " INT64_FORMAT, value);
-			}
-			else
-			{
-				Size			  new_size = sizeof(RoaringLeafEntry) + new_bm_bytes;
-				RoaringLeafEntry *new_le   = (RoaringLeafEntry *) palloc(new_size);
-
-				new_le->value		= value;
-				new_le->cardinality	= (uint32) roaring_bitmap_get_cardinality(bm);
-				new_le->flags		= ROARING_ENTRY_INLINE;
-				roaring_bitmap_portable_serialize(bm, (char *)(new_le + 1));
-
-				if (!PageIndexTupleOverwrite(img, off, (Item) new_le, new_size))
-					elog(ERROR,
-						 "pg_roaring_index: vacuum: PageIndexTupleOverwrite failed "
-						 "for value " INT64_FORMAT, value);
-				pfree(new_le);
-			}
+			if (bm != NULL)
+				roaring_bitmap_free(bm);
 		}
-
-		roaring_bitmap_free(bm);
+		PG_END_TRY();
 	}
 
 	if (changed)
