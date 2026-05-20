@@ -680,13 +680,31 @@ roaring_merge_pending(Relation index)
 	i = 0;
 	while (i < nentries)
 	{
-		int64		 cur_value = entries[i].value;
-		int			 group_end = i + 1;
+		int64		 cur_value  = entries[i].value;
+		int			 group_end  = i + 1;
+		int			 group_count = 0;
+		uint32		*group_tids  = NULL;
 		BlockNumber	 leaf_blkno;
 		bool		 found_in_index;
 
 		while (group_end < nentries && entries[group_end].value == cur_value)
 			group_end++;
+
+		/*
+		 * Extract linear_tids for this group into a flat array so we can
+		 * call roaring_bitmap_add_many (fast path for sorted input) instead
+		 * of looping roaring_bitmap_add.
+		 */
+		{
+			int		 gc  = group_end - i;
+			uint32	*gtp = (uint32 *) palloc(gc * sizeof(uint32));
+			int		 gi;
+
+			for (gi = 0; gi < gc; gi++)
+				gtp[gi] = entries[i + gi].linear_tid;
+			group_count = gc;
+			group_tids  = gtp;
+		}
 
 		/* Find the leaf page for this value. */
 		found_in_index = false;
@@ -717,7 +735,6 @@ roaring_merge_pending(Relation index)
 				Size				bitmap_len;
 				Size				leaf_free;
 				roaring_bitmap_t   *bm = NULL;
-				int					j;
 				size_t				new_size;
 				uint32				bm_card;
 				bool				was_overflow;
@@ -756,8 +773,7 @@ roaring_merge_pending(Relation index)
 						 "pg_roaring_index: merge: failed to deserialise bitmap "
 						 "for value " INT64_FORMAT, cur_value);
 
-				for (j = i; j < group_end; j++)
-					roaring_bitmap_add(bm, entries[j].linear_tid);
+				roaring_bitmap_add_many(bm, group_count, group_tids);
 
 				new_size  = roaring_bitmap_portable_size_in_bytes(bm);
 				bm_card   = roaring_cardinality32(bm);
@@ -905,12 +921,10 @@ roaring_merge_pending(Relation index)
 			size_t				bm_size;
 			Size				entry_size;
 			RoaringLeafEntry   *new_le;
-			int					j;
 			bool				inserted = false;
 
 			bm = roaring_bitmap_create();
-			for (j = i; j < group_end; j++)
-				roaring_bitmap_add(bm, entries[j].linear_tid);
+			roaring_bitmap_add_many(bm, group_count, group_tids);
 			bm_size    = roaring_bitmap_portable_size_in_bytes(bm);
 			entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bm_size);
 
@@ -1143,6 +1157,7 @@ roaring_merge_pending(Relation index)
 			pfree(new_le);
 		}
 
+		pfree(group_tids);
 		i = group_end;
 	}
 
