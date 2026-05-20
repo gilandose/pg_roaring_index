@@ -259,7 +259,14 @@ roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
 	off = Min(sizeof(oe->inline_prefix), total_len);
 	memcpy(buf, oe->inline_prefix, off);
 
-	/* Walk overflow chain. */
+	/*
+	 * Walk overflow chain.
+	 *
+	 * TODO(3.8): issue PrefetchBuffer(index, next_page) one iteration ahead so
+	 * the kernel can pipeline I/O for long chains (bitmaps > ~7KB, i.e. values
+	 * with > ~7000 TIDs).  Only relevant at ndistinct < ~100; the roaring32
+	 * linearisation keeps most bitmaps inline for the target workload.
+	 */
 	cur = oe->overflow_blkno;
 	while (cur != InvalidBlockNumber && off < total_len)
 	{
