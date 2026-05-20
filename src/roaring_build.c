@@ -187,7 +187,6 @@ write_leaf_and_dir_pages(Relation index,
 		Size			   entry_size;
 		RoaringLeafEntry  *le;
 
-		roaring_bitmap_run_optimize(be->bitmap);
 		bitmap_size = roaring_bitmap_portable_size_in_bytes(be->bitmap);
 
 		if (bitmap_size > (size_t) max_inline)
