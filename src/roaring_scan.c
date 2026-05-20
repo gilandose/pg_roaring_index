@@ -129,7 +129,7 @@ roaring_pending_visible(TransactionId xmin, Snapshot snapshot)
  * populate the TIDBitmap with matching TIDs.
  *
  * Two sources are consulted:
- *   (a) Main index: metapage → directory → leaf → roaring64 bitmap.
+ *   (a) Main index: metapage → directory → leaf → roaring32 bitmap.
  *   (b) Pending insert list: linear scan for matching value/xmin.
  * ---------------------------------------------------------------- */
 int64
@@ -214,7 +214,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 			if (le != NULL)
 			{
-				roaring64_bitmap_t *bm;
+				roaring_bitmap_t *bm;
 
 				if (le->flags == ROARING_ENTRY_OVERFLOW)
 				{
@@ -229,7 +229,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					Size item_len   = ItemIdGetLength(PageGetItemId(leafpage, found_off));
 					Size bitmap_len = item_len - sizeof(RoaringLeafEntry);
 
-					bm = roaring64_bitmap_portable_deserialize_safe(
+					bm = roaring_bitmap_portable_deserialize_safe(
 							(const char *)(le + 1), bitmap_len);
 					UnlockReleaseBuffer(leafbuf);
 				}
@@ -240,13 +240,13 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						 "for value " INT64_FORMAT, scan_value);
 
 				{
-					roaring64_iterator_t *it = roaring64_iterator_create(bm);
+					roaring_uint32_iterator_t *it = roaring_iterator_create(bm);
 
-					while (roaring64_iterator_has_value(it))
+					while (it->has_value)
 					{
-						uint64		 linear = roaring64_iterator_value(it);
-						BlockNumber  block  = (BlockNumber)(linear >> 16);
-						OffsetNumber off    = (OffsetNumber)(linear & 0xFFFF);
+						uint32		 linear = it->current_value;
+						BlockNumber  block  = (BlockNumber)(linear >> 9);
+						OffsetNumber off    = (OffsetNumber)((linear & 0x1FF) + 1);
 
 						if (tid_count == ROARING_TID_BATCH)
 						{
@@ -255,10 +255,10 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						}
 						ItemPointerSet(&tid_buf[tid_count++], block, off);
 						ntids++;
-						roaring64_iterator_advance(it);
+						roaring_uint32_iterator_advance(it);
 					}
-					roaring64_iterator_free(it);
-					roaring64_bitmap_free(bm);
+					roaring_uint32_iterator_free(it);
+					roaring_bitmap_free(bm);
 				}
 			}
 			else
@@ -299,8 +299,8 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					tid_count = 0;
 				}
 				{
-					BlockNumber  block = (BlockNumber)(raw[k].linear_tid >> 16);
-					OffsetNumber off   = (OffsetNumber)(raw[k].linear_tid & 0xFFFF);
+					BlockNumber  block = (BlockNumber)(raw[k].linear_tid >> 9);
+					OffsetNumber off   = (OffsetNumber)((raw[k].linear_tid & 0x1FF) + 1);
 					ItemPointerSet(&tid_buf[tid_count++], block, off);
 					ntids++;
 				}

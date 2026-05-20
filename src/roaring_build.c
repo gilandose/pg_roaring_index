@@ -14,7 +14,7 @@
 typedef struct RoaringBuildEntry
 {
 	int64				value;		/* hash key — must be first */
-	roaring64_bitmap_t *bitmap;
+	roaring_bitmap_t   *bitmap;
 } RoaringBuildEntry;
 
 typedef struct RoaringBuildState
@@ -33,7 +33,6 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 {
 	RoaringBuildState  *bstate = (RoaringBuildState *) state;
 	int64				value;
-	uint64				linear_tid;
 	RoaringBuildEntry  *entry;
 	bool				found;
 
@@ -43,18 +42,18 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 		return;
 
 	value		= DatumGetInt64(values[0]);
-	linear_tid	= ((uint64) ItemPointerGetBlockNumber(tid) << 16) |
-				  (uint64) ItemPointerGetOffsetNumber(tid);
 
 	entry = (RoaringBuildEntry *) hash_search(bstate->bitmaps, &value,
 											   HASH_ENTER, &found);
 	if (!found)
 	{
-		entry->bitmap = roaring64_bitmap_create();
+		entry->bitmap = roaring_bitmap_create();
 		bstate->index_tuples++;
 	}
 
-	roaring64_bitmap_add(entry->bitmap, linear_tid);
+	roaring_bitmap_add(entry->bitmap,
+					   ((uint32) ItemPointerGetBlockNumber(tid) << 9) |
+					   (uint32)(ItemPointerGetOffsetNumber(tid) - 1));
 }
 
 static int
@@ -181,8 +180,8 @@ write_leaf_and_dir_pages(Relation index,
 		Size			   entry_size;
 		RoaringLeafEntry  *le;
 
-		roaring64_bitmap_run_optimize(be->bitmap);
-		bitmap_size = roaring64_bitmap_portable_size_in_bytes(be->bitmap);
+		roaring_bitmap_run_optimize(be->bitmap);
+		bitmap_size = roaring_bitmap_portable_size_in_bytes(be->bitmap);
 
 		if ((int) bitmap_size > max_inline)
 			entry_size = MAXALIGN(sizeof(RoaringOverflowEntry));
@@ -251,11 +250,11 @@ write_leaf_and_dir_pages(Relation index,
 			RoaringOverflowEntry *oe;
 
 			bm_data	   = (char *) palloc(bitmap_size);
-			roaring64_bitmap_portable_serialize(be->bitmap, bm_data);
+			roaring_bitmap_portable_serialize(be->bitmap, bm_data);
 			pfx_len	   = Min(ROARING_OVERFLOW_INLINE_BYTES, bitmap_size);
 			oe		   = (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
 			oe->value		   = be->value;
-			oe->cardinality	   = (uint32) roaring64_bitmap_get_cardinality(be->bitmap);
+			oe->cardinality	   = (uint32) roaring_bitmap_get_cardinality(be->bitmap);
 			oe->flags		   = ROARING_ENTRY_OVERFLOW;
 			oe->total_len	   = (uint32) bitmap_size;
 			oe->overflow_blkno = roaring_write_overflow_chain(index, bm_data,
@@ -273,9 +272,9 @@ write_leaf_and_dir_pages(Relation index,
 		{
 			le = (RoaringLeafEntry *) palloc(sizeof(RoaringLeafEntry) + bitmap_size);
 			le->value		= be->value;
-			le->cardinality = (uint32) roaring64_bitmap_get_cardinality(be->bitmap);
+			le->cardinality = (uint32) roaring_bitmap_get_cardinality(be->bitmap);
 			le->flags		= ROARING_ENTRY_INLINE;
-			roaring64_bitmap_portable_serialize(be->bitmap, (char *)(le + 1));
+			roaring_bitmap_portable_serialize(be->bitmap, (char *)(le + 1));
 
 			if (PageAddItem(leaf_page, (Item) le,
 							sizeof(RoaringLeafEntry) + bitmap_size,
@@ -286,7 +285,7 @@ write_leaf_and_dir_pages(Relation index,
 
 		leaf_spc->entry_count++;
 
-		roaring64_bitmap_free(be->bitmap);
+		roaring_bitmap_free(be->bitmap);
 		be->bitmap = NULL;
 	}
 

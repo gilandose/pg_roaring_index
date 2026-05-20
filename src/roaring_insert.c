@@ -156,10 +156,9 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 		return false;
 
 	entry.value      = DatumGetInt64(values[0]);
-	entry.linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 16) |
-					   (uint64) ItemPointerGetOffsetNumber(ht_ctid);
+	entry.linear_tid = ((uint32) ItemPointerGetBlockNumber(ht_ctid) << 9) |
+					   (uint32)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
 	entry.xmin       = GetCurrentTransactionId();
-	entry.reserved   = 0;
 
 	roaring_pending_append(index, &entry);
 	return false;	/* this AM does not support unique indexes */

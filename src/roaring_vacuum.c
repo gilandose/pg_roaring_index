@@ -14,7 +14,7 @@
 typedef struct CollectedEntry
 {
 	int64  value;
-	uint64 linear_tid;
+	uint32 linear_tid;
 } CollectedEntry;
 
 static int
@@ -538,7 +538,7 @@ roaring_merge_pending(Relation index)
 				Size				item_len;
 				Size				bitmap_len;
 				Size				leaf_free;
-				roaring64_bitmap_t *bm;
+				roaring_bitmap_t   *bm;
 				int					j;
 				size_t				new_size;
 				uint32				bm_card;
@@ -568,7 +568,7 @@ roaring_merge_pending(Relation index)
 				else
 				{
 					bitmap_len = item_len - sizeof(RoaringLeafEntry);
-					bm = roaring64_bitmap_portable_deserialize_safe(
+					bm = roaring_bitmap_portable_deserialize_safe(
 							(const char *)(le + 1), bitmap_len);
 					UnlockReleaseBuffer(leafbuf);
 				}
@@ -579,11 +579,10 @@ roaring_merge_pending(Relation index)
 						 "for value " INT64_FORMAT, cur_value);
 
 				for (j = i; j < group_end; j++)
-					roaring64_bitmap_add(bm, entries[j].linear_tid);
+					roaring_bitmap_add(bm, entries[j].linear_tid);
 
-				roaring64_bitmap_run_optimize(bm);
-				new_size  = roaring64_bitmap_portable_size_in_bytes(bm);
-				bm_card   = (uint32) roaring64_bitmap_get_cardinality(bm);
+				new_size  = roaring_bitmap_portable_size_in_bytes(bm);
+				bm_card   = (uint32) roaring_bitmap_get_cardinality(bm);
 				write_ovf = ((int) new_size > max_inline);
 
 				/*
@@ -602,8 +601,8 @@ roaring_merge_pending(Relation index)
 				bm_data		  = (char *) palloc(new_size);
 				new_ovf_blkno = InvalidBlockNumber;
 				pfx_len		  = 0;
-				roaring64_bitmap_portable_serialize(bm, bm_data);
-				roaring64_bitmap_free(bm);
+				roaring_bitmap_portable_serialize(bm, bm_data);
+				roaring_bitmap_free(bm);
 
 				if (write_ovf)
 				{
@@ -705,27 +704,26 @@ roaring_merge_pending(Relation index)
 		if (!found_in_index)
 		{
 			/* ---- 3b: new value — build bitmap and insert into leaves. ---- */
-			roaring64_bitmap_t *bm;
+			roaring_bitmap_t   *bm;
 			size_t				bm_size;
 			Size				entry_size;
 			RoaringLeafEntry   *new_le;
 			int					j;
 			bool				inserted = false;
 
-			bm = roaring64_bitmap_create();
+			bm = roaring_bitmap_create();
 			for (j = i; j < group_end; j++)
-				roaring64_bitmap_add(bm, entries[j].linear_tid);
-			roaring64_bitmap_run_optimize(bm);
-			bm_size    = roaring64_bitmap_portable_size_in_bytes(bm);
+				roaring_bitmap_add(bm, entries[j].linear_tid);
+			bm_size    = roaring_bitmap_portable_size_in_bytes(bm);
 			entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bm_size);
 
 			new_le				= (RoaringLeafEntry *)
 								  palloc(sizeof(RoaringLeafEntry) + bm_size);
 			new_le->value		= cur_value;
-			new_le->cardinality	= (uint32) roaring64_bitmap_get_cardinality(bm);
+			new_le->cardinality	= (uint32) roaring_bitmap_get_cardinality(bm);
 			new_le->flags		= ROARING_ENTRY_INLINE;
-			roaring64_bitmap_portable_serialize(bm, (char *)(new_le + 1));
-			roaring64_bitmap_free(bm);
+			roaring_bitmap_portable_serialize(bm, (char *)(new_le + 1));
+			roaring_bitmap_free(bm);
 
 			/*
 			 * Find the leaf page to insert into.  We need the page whose
@@ -982,9 +980,9 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 		ItemId				iid;
 		RoaringLeafEntry   *le;
 		size_t				bm_bytes;
-		roaring64_bitmap_t *bm;
-		roaring64_bitmap_t *dead_bm;
-		roaring64_iterator_t *it;
+		roaring_bitmap_t *bm;
+		roaring_bitmap_t *dead_bm;
+		roaring_uint32_iterator_t *it;
 		bool				has_dead;
 		bool				was_overflow;
 
@@ -1005,55 +1003,54 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 		else
 		{
 			bm_bytes = ItemIdGetLength(iid) - sizeof(RoaringLeafEntry);
-			bm = roaring64_bitmap_portable_deserialize_safe((char *)(le + 1),
-															bm_bytes);
+			bm = roaring_bitmap_portable_deserialize_safe((char *)(le + 1),
+														  bm_bytes);
 		}
 		if (!bm)
 			continue;					/* corrupted — leave alone */
 
-		dead_bm  = roaring64_bitmap_create();
+		dead_bm  = roaring_bitmap_create();
 		has_dead = false;
 
-		it = roaring64_iterator_create(bm);
-		while (roaring64_iterator_has_value(it))
+		it = roaring_iterator_create(bm);
+		while (it->has_value)
 		{
-			uint64			ltid = roaring64_iterator_value(it);
+			uint32			ltid = it->current_value;
 			ItemPointerData	tid;
 
-			ItemPointerSetBlockNumber(&tid, (BlockNumber)(ltid >> 16));
-			ItemPointerSetOffsetNumber(&tid, (OffsetNumber)(ltid & 0xFFFF));
+			ItemPointerSetBlockNumber(&tid, (BlockNumber)(ltid >> 9));
+			ItemPointerSetOffsetNumber(&tid, (OffsetNumber)((ltid & 0x1FF) + 1));
 
 			if (callback(&tid, callback_state))
 			{
-				roaring64_bitmap_add(dead_bm, ltid);
+				roaring_bitmap_add(dead_bm, ltid);
 				has_dead = true;
 				stats->tuples_removed++;
 			}
 			else
 				stats->num_index_tuples++;
 
-			roaring64_iterator_advance(it);
+			roaring_uint32_iterator_advance(it);
 		}
-		roaring64_iterator_free(it);
+		roaring_uint32_iterator_free(it);
 
 		if (!has_dead)
 		{
-			roaring64_bitmap_free(bm);
-			roaring64_bitmap_free(dead_bm);
+			roaring_bitmap_free(bm);
+			roaring_bitmap_free(dead_bm);
 			continue;
 		}
 
 		/* Remove dead TIDs and reserialize (possibly to an empty bitmap). */
-		roaring64_bitmap_andnot_inplace(bm, dead_bm);
-		roaring64_bitmap_free(dead_bm);
+		roaring_bitmap_andnot_inplace(bm, dead_bm);
+		roaring_bitmap_free(dead_bm);
 		changed = true;
 
 		{
 			int64  value	   = le->value;
 			size_t new_bm_bytes;
 
-			roaring64_bitmap_run_optimize(bm);
-			new_bm_bytes = roaring64_bitmap_portable_size_in_bytes(bm);
+			new_bm_bytes = roaring_bitmap_portable_size_in_bytes(bm);
 
 			if (was_overflow)
 			{
@@ -1067,9 +1064,9 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 													 new_bm_bytes);
 				RoaringOverflowEntry  new_oe;
 
-				roaring64_bitmap_portable_serialize(bm, bm_data);
+				roaring_bitmap_portable_serialize(bm, bm_data);
 				new_oe.value		 = value;
-				new_oe.cardinality	 = (uint32) roaring64_bitmap_get_cardinality(bm);
+				new_oe.cardinality	 = (uint32) roaring_bitmap_get_cardinality(bm);
 				new_oe.flags		 = ROARING_ENTRY_OVERFLOW;
 				new_oe.total_len	 = (uint32) new_bm_bytes;
 				new_oe.overflow_blkno = roaring_write_overflow_chain(index,
@@ -1091,9 +1088,9 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 				RoaringLeafEntry *new_le   = (RoaringLeafEntry *) palloc(new_size);
 
 				new_le->value		= value;
-				new_le->cardinality	= (uint32) roaring64_bitmap_get_cardinality(bm);
+				new_le->cardinality	= (uint32) roaring_bitmap_get_cardinality(bm);
 				new_le->flags		= ROARING_ENTRY_INLINE;
-				roaring64_bitmap_portable_serialize(bm, (char *)(new_le + 1));
+				roaring_bitmap_portable_serialize(bm, (char *)(new_le + 1));
 
 				if (!PageIndexTupleOverwrite(img, off, (Item) new_le, new_size))
 					elog(ERROR,
@@ -1103,7 +1100,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 			}
 		}
 
-		roaring64_bitmap_free(bm);
+		roaring_bitmap_free(bm);
 	}
 
 	if (changed)
@@ -1158,9 +1155,9 @@ roaring_vacuum_pending_list(Relation index, BlockNumber head_blkno,
 			ItemPointerData tid;
 
 			ItemPointerSetBlockNumber(&tid,
-									 (BlockNumber)(raw[i].linear_tid >> 16));
+									 (BlockNumber)(raw[i].linear_tid >> 9));
 			ItemPointerSetOffsetNumber(&tid,
-									  (OffsetNumber)(raw[i].linear_tid & 0xFFFF));
+									  (OffsetNumber)((raw[i].linear_tid & 0x1FF) + 1));
 
 			if (callback(&tid, callback_state))
 			{

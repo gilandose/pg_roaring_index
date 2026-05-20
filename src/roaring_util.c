@@ -177,7 +177,7 @@ roaring_write_overflow_chain(Relation index,
  * Reassemble and deserialize the bitmap for a leaf entry that uses overflow
  * pages.  Concatenates the inline_prefix bytes with data from the chain.
  */
-roaring64_bitmap_t *
+roaring_bitmap_t *
 roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
 {
 	size_t		 total_len = oe->total_len;
@@ -185,7 +185,7 @@ roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
 	char		*buf	   = palloc(total_len);
 	size_t		 off;
 	BlockNumber	 cur;
-	roaring64_bitmap_t *bm;
+	roaring_bitmap_t *bm;
 
 	/* Inline prefix stored directly in the entry. */
 	off = Min(sizeof(oe->inline_prefix), total_len);
@@ -212,7 +212,7 @@ roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
 		UnlockReleaseBuffer(ovbuf);
 	}
 
-	bm = roaring64_bitmap_portable_deserialize_safe(buf, total_len);
+	bm = roaring_bitmap_portable_deserialize_safe(buf, total_len);
 	pfree(buf);
 	return bm;
 }

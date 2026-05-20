@@ -44,8 +44,8 @@
 /* Capacities derived from 8KB page size */
 #define ROARING_PAGE_SIZE           BLCKSZ
 #define ROARING_DIR_ENTRY_SIZE      12      /* int64 high_key + BlockNumber */
-#define ROARING_PENDING_ENTRY_SIZE  24      /* int64 + uint64 + TransactionId + pad */
-#define ROARING_PENDING_PER_PAGE    339     /* (8192-24-16)/24 */
+#define ROARING_PENDING_ENTRY_SIZE  16      /* int64 + uint32 + TransactionId */
+#define ROARING_PENDING_PER_PAGE    510     /* (8192-24-16)/16 */
 
 /*
  * Overflow pages: bitmap bytes that don't fit on a single leaf page are
@@ -155,20 +155,22 @@ typedef struct RoaringLeafSpecial
 } RoaringLeafSpecial;   /* 16 bytes */
 
 /*
- * Fixed-size pending entry — 24 bytes, 339 per page.
- * linear_tid = (BlockNumber << 16) | OffsetNumber; needs uint64 since
- * BlockNumber alone can be up to 2^32-1 (doesn't fit with offset in uint32).
+ * Fixed-size pending entry — 16 bytes, 510 per page.
+ * Linearization: (blkno << 9) | (offset - 1)
+ *   9 bits for offset: up to 511 tuples/page (MaxHeapTuplesPerPage ≈ 255)
+ *   23 bits for blkno: up to 2^23 blocks = 64 TB table
+ *   Container key = linear_tid >> 16 = blkno >> 7: 128 blocks per container
+ * Reverse: blkno = linear_tid >> 9; offset = (linear_tid & 0x1FF) + 1
  */
 typedef struct RoaringPendingEntry
 {
     int64           value;
-    uint64          linear_tid;     /* (block << 16) | offset */
+    uint32          linear_tid;     /* (blkno << 9) | (offset - 1) */
     TransactionId   xmin;
-    uint32          reserved;       /* explicit padding */
 } RoaringPendingEntry;
 
 StaticAssertDecl(sizeof(RoaringPendingEntry) == ROARING_PENDING_ENTRY_SIZE,
-                 "RoaringPendingEntry must be 24 bytes");
+                 "RoaringPendingEntry must be 16 bytes");
 
 typedef struct RoaringPendingSpecial
 {
@@ -211,7 +213,7 @@ extern BlockNumber roaring_write_overflow_chain(Relation index,
                                                 const char *data,
                                                 size_t total_len,
                                                 size_t prefix_len);
-extern roaring64_bitmap_t *roaring_read_overflow_bitmap(
+extern roaring_bitmap_t *roaring_read_overflow_bitmap(
     Relation index, const RoaringOverflowEntry *oe);
 
 /* roaring_vacuum.c — also called from roaring_insert for back-pressure */
