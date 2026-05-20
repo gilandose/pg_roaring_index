@@ -86,6 +86,9 @@ roaring_init_pending_page(Relation index, uint8 page_type)
 	spc->entry_count = 0;
 	spc->next_page	 = InvalidBlockNumber;
 	spc->xmin_low	 = InvalidTransactionId;
+	spc->_pad		 = 0;
+	spc->value_min	 = PG_INT64_MAX;
+	spc->value_max	 = PG_INT64_MIN;
 
 	roaring_wal_and_release(index, buf);
 	return blkno;

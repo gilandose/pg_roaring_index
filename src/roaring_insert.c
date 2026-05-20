@@ -80,6 +80,9 @@ retry:
 		newspc->entry_count	= 1;
 		newspc->next_page	= InvalidBlockNumber;
 		newspc->xmin_low	= newentry->xmin;
+		newspc->_pad		= 0;
+		newspc->value_min	= newentry->value;
+		newspc->value_max	= newentry->value;
 
 		/* Write the new entry directly into the new page's data area. */
 		{
@@ -129,6 +132,10 @@ retry:
 		if (!TransactionIdIsValid(tailspc->xmin_low) ||
 			TransactionIdPrecedes(newentry->xmin, tailspc->xmin_low))
 			tailspc->xmin_low = newentry->xmin;
+		if (newentry->value < tailspc->value_min)
+			tailspc->value_min = newentry->value;
+		if (newentry->value > tailspc->value_max)
+			tailspc->value_max = newentry->value;
 		tailspc->entry_count++;
 		((PageHeader) tailimg)->pd_lower += sizeof(RoaringPendingEntry);
 

@@ -588,6 +588,9 @@ roaring_merge_pending(Relation index)
 				cspc->next_page   = (p + 1 < npages)
 									? cblknos[p + 1] : InvalidBlockNumber;
 				cspc->xmin_low	  = carry[pstart].xmin;
+				cspc->_pad		  = 0;
+				cspc->value_min	  = carry[pstart].value;
+				cspc->value_max	  = carry[pstart + pcount - 1].value;
 
 				cslots = (RoaringPendingEntry *) PageGetContents(cp);
 				memcpy(cslots, carry + pstart, pcount * sizeof(RoaringPendingEntry));
@@ -643,6 +646,9 @@ roaring_merge_pending(Relation index)
 			spc->entry_count = 0;
 			spc->next_page	 = InvalidBlockNumber;
 			spc->xmin_low	 = InvalidTransactionId;
+			spc->_pad		 = 0;
+			spc->value_min	 = PG_INT64_MAX;
+			spc->value_max	 = PG_INT64_MIN;
 		}
 
 		np_img = GenericXLogRegisterBuffer(state, new_pending_buf,

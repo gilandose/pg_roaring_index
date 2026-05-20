@@ -181,6 +181,14 @@ scan_pending_chain(Relation index, BlockNumber start_blkno,
 				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
 		}
 
+		/* Skip page if scan_value is outside this page's value range. */
+		if (scan_value < spc->value_min || scan_value > spc->value_max)
+		{
+			cur = spc->next_page;
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
 		for (k = 0; k < spc->entry_count; k++)
 		{
 			if (raw[k].value != scan_value)

@@ -200,7 +200,10 @@ typedef struct RoaringPendingSpecial
     uint16          entry_count;
     BlockNumber     next_page;
     TransactionId   xmin_low;   /* earliest xmin on this page */
-} RoaringPendingSpecial; /* 16 bytes */
+    uint32          _pad;       /* align int64 fields */
+    int64           value_min;  /* PG_INT64_MAX when empty */
+    int64           value_max;  /* PG_INT64_MIN when empty */
+} RoaringPendingSpecial; /* 32 bytes */
 
 typedef struct RoaringOverflowSpecial
 {
