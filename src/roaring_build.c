@@ -189,7 +189,7 @@ write_leaf_and_dir_pages(Relation index,
 		roaring_bitmap_run_optimize(be->bitmap);
 		bitmap_size = roaring_bitmap_portable_size_in_bytes(be->bitmap);
 
-		if ((int) bitmap_size > max_inline)
+		if (bitmap_size > (size_t) max_inline)
 			entry_size = MAXALIGN(sizeof(RoaringOverflowEntry));
 		else
 			entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bitmap_size);
@@ -249,7 +249,7 @@ write_leaf_and_dir_pages(Relation index,
 			}
 		}
 
-		if ((int) bitmap_size > max_inline)
+		if (bitmap_size > (size_t) max_inline)
 		{
 			char				 *bm_data;
 			size_t				  pfx_len;
@@ -260,7 +260,7 @@ write_leaf_and_dir_pages(Relation index,
 			pfx_len	   = Min(ROARING_OVERFLOW_INLINE_BYTES, bitmap_size);
 			oe		   = (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
 			oe->value		   = be->value;
-			oe->cardinality	   = (uint32) roaring_bitmap_get_cardinality(be->bitmap);
+			oe->cardinality	   = roaring_cardinality32(be->bitmap);
 			oe->flags		   = ROARING_ENTRY_OVERFLOW;
 			oe->total_len	   = (uint32) bitmap_size;
 			oe->overflow_blkno = roaring_write_overflow_chain(index, bm_data,
@@ -278,7 +278,7 @@ write_leaf_and_dir_pages(Relation index,
 		{
 			le = (RoaringLeafEntry *) palloc(sizeof(RoaringLeafEntry) + bitmap_size);
 			le->value		= be->value;
-			le->cardinality = (uint32) roaring_bitmap_get_cardinality(be->bitmap);
+			le->cardinality = roaring_cardinality32(be->bitmap);
 			le->flags		= ROARING_ENTRY_INLINE;
 			roaring_bitmap_portable_serialize(be->bitmap, (char *)(le + 1));
 

@@ -42,7 +42,7 @@ collect_pending(Relation index, BlockNumber head_blkno, int *nout)
 {
 	CollectedEntry *entries;
 	int				n		 = 0;
-	int				capacity = 256;
+	Size			capacity = 256;
 	BlockNumber		cur		 = head_blkno;
 
 	entries = (CollectedEntry *) palloc(capacity * sizeof(CollectedEntry));
@@ -79,7 +79,7 @@ collect_pending(Relation index, BlockNumber head_blkno, int *nout)
 				!TransactionIdDidCommit(xmin))
 				continue;	/* in-progress (carried forward) or aborted (discarded) */
 
-			if (n == capacity)
+			if ((Size) n == capacity)
 			{
 				capacity *= 2;
 				entries = (CollectedEntry *)
@@ -754,8 +754,8 @@ roaring_merge_pending(Relation index)
 					roaring_bitmap_add(bm, entries[j].linear_tid);
 
 				new_size  = roaring_bitmap_portable_size_in_bytes(bm);
-				bm_card   = (uint32) roaring_bitmap_get_cardinality(bm);
-				write_ovf = ((int) new_size > max_inline);
+				bm_card   = roaring_cardinality32(bm);
+				write_ovf = (new_size > (size_t) max_inline);
 
 				/*
 				 * Does the grown inline entry still fit on the current page?
@@ -913,7 +913,7 @@ roaring_merge_pending(Relation index)
 				new_le				= (RoaringLeafEntry *)
 									  palloc(sizeof(RoaringLeafEntry) + bm_size);
 				new_le->value		= cur_value;
-				new_le->cardinality	= (uint32) roaring_bitmap_get_cardinality(bm);
+				new_le->cardinality	= roaring_cardinality32(bm);
 				new_le->flags		= ROARING_ENTRY_INLINE;
 				roaring_bitmap_portable_serialize(bm, (char *)(new_le + 1));
 				roaring_bitmap_free(bm);
@@ -1290,7 +1290,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 
 					roaring_bitmap_portable_serialize(bm, bm_data);
 					new_oe.value		  = value;
-					new_oe.cardinality	  = (uint32) roaring_bitmap_get_cardinality(bm);
+					new_oe.cardinality	  = roaring_cardinality32(bm);
 					new_oe.flags		  = ROARING_ENTRY_OVERFLOW;
 					new_oe.total_len	  = (uint32) new_bm_bytes;
 					new_oe.overflow_blkno = roaring_write_overflow_chain(index,
@@ -1312,7 +1312,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 					RoaringLeafEntry *new_le   = (RoaringLeafEntry *) palloc(new_size);
 
 					new_le->value		= value;
-					new_le->cardinality	= (uint32) roaring_bitmap_get_cardinality(bm);
+					new_le->cardinality	= roaring_cardinality32(bm);
 					new_le->flags		= ROARING_ENTRY_INLINE;
 					roaring_bitmap_portable_serialize(bm, (char *)(new_le + 1));
 

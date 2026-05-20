@@ -43,7 +43,7 @@
 
 /* Capacities derived from 8KB page size */
 #define ROARING_PAGE_SIZE           BLCKSZ
-#define ROARING_DIR_ENTRY_SIZE      12      /* int64 high_key + BlockNumber */
+#define ROARING_DIR_ENTRY_SIZE      16      /* int64 high_key + BlockNumber + 4-byte pad */
 #define ROARING_PENDING_ENTRY_SIZE  16      /* int64 + uint32 + TransactionId */
 #define ROARING_PENDING_PER_PAGE    510     /* (8192-24-16)/16 */
 
@@ -116,6 +116,8 @@ typedef struct RoaringDirEntry
     int64       high_key;
     BlockNumber child_page;
 } RoaringDirEntry;  /* must be ROARING_DIR_ENTRY_SIZE bytes */
+StaticAssertDecl(sizeof(RoaringDirEntry) == ROARING_DIR_ENTRY_SIZE,
+				 "RoaringDirEntry size mismatch — update ROARING_DIR_ENTRY_SIZE");
 
 typedef struct RoaringDirSpecial
 {
@@ -199,6 +201,26 @@ typedef struct RoaringOverflowSpecial
     BlockNumber next_page;
     BlockNumber owner_page;
 } RoaringOverflowSpecial;   /* 16 bytes */
+
+/* ----------
+ * Inline helpers
+ * ---------- */
+
+/*
+ * roaring_cardinality32 — return bitmap cardinality as uint32.
+ * Assert it fits: a roaring32 bitmap can theoretically hold all 2^32 values,
+ * which is UINT32_MAX+1 and would silently truncate.  In practice our TID
+ * encoding limits cardinality well below 2^32, so this fires only on
+ * corruption.
+ */
+static inline uint32
+roaring_cardinality32(const roaring_bitmap_t *bm)
+{
+	uint64_t card = roaring_bitmap_get_cardinality(bm);
+
+	Assert(card <= (uint64_t) UINT32_MAX);
+	return (uint32) card;
+}
 
 /* ----------
  * Scan state
