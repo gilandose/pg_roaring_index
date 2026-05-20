@@ -365,9 +365,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 	meta = RoaringPageGetMeta(BufferGetPage(metabuf));
 
-	if (meta->magic != ROARING_MAGIC)
-		elog(ERROR, "pg_roaring_index: bad magic in metapage of index \"%s\"",
-			 RelationGetRelationName(index));
+	roaring_validate_metapage(index, meta);
 
 	root_blkno    = meta->root_directory_page;
 	pending_head  = meta->pending_insert_head;

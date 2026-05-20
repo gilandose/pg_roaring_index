@@ -21,7 +21,14 @@
  * On-disk constants
  * ---------- */
 #define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
-#define ROARING_INDEX_VERSION       1   /* not ROARING_VERSION — clashes with CRoaring */
+#define ROARING_INDEX_VERSION       2   /* bumped when on-disk metapage layout changes */
+
+/*
+ * Expected CRoaring major version stored in the metapage.  If the index was
+ * built with a different major version — which may have a different portable
+ * serialisation format — the index must be rebuilt with REINDEX.
+ */
+#define ROARING_EXPECTED_FORMAT_VERSION  ((uint16) ROARING_VERSION_MAJOR)
 
 /* Page type tags (stored in special->page_type) */
 #define ROARING_PAGE_META           0x01
@@ -74,6 +81,8 @@ typedef struct RoaringMetaPageData
     uint32      magic;
     uint16      version;
     uint16      flags;
+    uint16      croaring_format_version;  /* ROARING_EXPECTED_FORMAT_VERSION */
+    uint16      _reserved;               /* explicit pad; keep next field 4-byte aligned */
 
     BlockNumber root_directory_page;
     BlockNumber leftmost_leaf_page;
@@ -235,6 +244,8 @@ typedef struct RoaringScanOpaque
  * ---------- */
 
 /* roaring_util.c */
+extern void   roaring_validate_metapage(Relation index,
+										const RoaringMetaPageData *meta);
 extern Buffer roaring_extend_page(Relation index);
 extern void   roaring_wal_and_release(Relation index, Buffer buf);
 extern BlockNumber roaring_init_pending_page(Relation index, uint8 page_type);

@@ -44,6 +44,7 @@ retry:
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 	metapage = BufferGetPage(metabuf);
 	meta	 = RoaringPageGetMeta(metapage);
+	roaring_validate_metapage(index, meta);
 	tail_blkno = meta->pending_insert_tail;
 
 	if (meta->pending_insert_count >= meta->pending_merge_threshold)

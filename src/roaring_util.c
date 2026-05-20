@@ -6,6 +6,33 @@
 #include "utils/memutils.h"
 
 /*
+ * roaring_validate_metapage
+ *
+ * Check magic and CRoaring format version.  Called from every AM entry point
+ * that reads the metapage so a struct-layout mismatch produces an immediate
+ * error rather than silent corruption or an infinite retry loop.
+ *
+ * Caller must hold the metapage buffer locked (share or exclusive).
+ */
+void
+roaring_validate_metapage(Relation index, const RoaringMetaPageData *meta)
+{
+	if (meta->magic != ROARING_MAGIC)
+		elog(ERROR,
+			 "pg_roaring_index: bad magic 0x%08X in metapage of index \"%s\" "
+			 "(expected 0x%08X) — index may be corrupt",
+			 meta->magic, RelationGetRelationName(index), ROARING_MAGIC);
+
+	if (meta->croaring_format_version != ROARING_EXPECTED_FORMAT_VERSION)
+		elog(ERROR,
+			 "pg_roaring_index: index \"%s\" was built with CRoaring format "
+			 "version %u, but this build expects version %u — REINDEX required",
+			 RelationGetRelationName(index),
+			 (unsigned) meta->croaring_format_version,
+			 (unsigned) ROARING_EXPECTED_FORMAT_VERSION);
+}
+
+/*
  * roaring_extend_page
  *
  * Extend the index relation by one page and return the buffer,

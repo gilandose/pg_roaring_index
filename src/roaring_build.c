@@ -96,9 +96,10 @@ write_metapage(Relation index,
 	meta = RoaringPageGetMeta(page);
 	memset(meta, 0, sizeof(*meta));
 
-	meta->magic					 = ROARING_MAGIC;
-	meta->version				 = ROARING_INDEX_VERSION;
-	meta->flags					 = ROARING_FLAG_EXACT;
+	meta->magic					   = ROARING_MAGIC;
+	meta->version				   = ROARING_INDEX_VERSION;
+	meta->flags					   = ROARING_FLAG_EXACT;
+	meta->croaring_format_version  = ROARING_EXPECTED_FORMAT_VERSION;
 	meta->root_directory_page	 = root_dir;
 	meta->leftmost_leaf_page	 = leftmost_leaf;
 	meta->rightmost_leaf_page	 = rightmost_leaf;
@@ -476,9 +477,10 @@ roaring_buildempty(Relation index)
 	PageInit(page, BLCKSZ, 0);
 	meta = RoaringPageGetMeta(page);
 	memset(meta, 0, sizeof(*meta));
-	meta->magic					  = ROARING_MAGIC;
-	meta->version				  = ROARING_INDEX_VERSION;
-	meta->flags					  = ROARING_FLAG_EXACT;
+	meta->magic					   = ROARING_MAGIC;
+	meta->version				   = ROARING_INDEX_VERSION;
+	meta->flags					   = ROARING_FLAG_EXACT;
+	meta->croaring_format_version  = ROARING_EXPECTED_FORMAT_VERSION;
 	meta->root_directory_page	  = InvalidBlockNumber;
 	meta->leftmost_leaf_page	  = InvalidBlockNumber;
 	meta->rightmost_leaf_page	  = InvalidBlockNumber;
