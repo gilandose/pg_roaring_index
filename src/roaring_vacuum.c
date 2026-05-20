@@ -1049,36 +1049,48 @@ roaring_merge_pending(Relation index)
 					ns->right_page	= InvalidBlockNumber;
 				}
 
-				state   = GenericXLogStart(index);
-				new_img = GenericXLogRegisterBuffer(state, newleaf_buf,
-													GENERIC_XLOG_FULL_IMAGE);
-				memcpy(new_img, BufferGetPage(newleaf_buf), BLCKSZ);
-				if (PageAddItem(new_img, (Item) new_le,
-								sizeof(RoaringLeafEntry) + bm_size,
-								1, false, false)
-					== InvalidOffsetNumber)
-					elog(ERROR, "pg_roaring_index: merge: PageAddItem on appended leaf failed");
-				((RoaringLeafSpecial *)
-				 PageGetSpecialPointer(new_img))->entry_count = 1;
-
-				/* Link previous rightmost to new page. */
-				if (rightmost_leaf != InvalidBlockNumber)
+				/*
+				 * Lock ordering: acquire prev (lower block) before newleaf_buf
+				 * (just extended, always a higher block number).  This matches
+				 * the convention used everywhere else in the leaf chain and
+				 * prevents deadlocks with left-to-right chain walkers.
+				 */
 				{
-					Buffer prev = ReadBuffer(index, rightmost_leaf);
-					LockBuffer(prev, BUFFER_LOCK_EXCLUSIVE);
+					Buffer prev = InvalidBuffer;
+
+					if (rightmost_leaf != InvalidBlockNumber)
+					{
+						prev = ReadBuffer(index, rightmost_leaf);
+						LockBuffer(prev, BUFFER_LOCK_EXCLUSIVE);
+					}
+
+					state   = GenericXLogStart(index);
+					new_img = GenericXLogRegisterBuffer(state, newleaf_buf,
+														GENERIC_XLOG_FULL_IMAGE);
+					memcpy(new_img, BufferGetPage(newleaf_buf), BLCKSZ);
+					if (PageAddItem(new_img, (Item) new_le,
+									sizeof(RoaringLeafEntry) + bm_size,
+									1, false, false)
+						== InvalidOffsetNumber)
+						elog(ERROR,
+							 "pg_roaring_index: merge: PageAddItem on appended leaf failed");
+					((RoaringLeafSpecial *)
+					 PageGetSpecialPointer(new_img))->entry_count = 1;
+
+					if (prev != InvalidBuffer)
 					{
 						Page prev_img = GenericXLogRegisterBuffer(state, prev, 0);
+
 						((RoaringLeafSpecial *)
-						 PageGetSpecialPointer(prev_img))->right_page =
-							newleaf_blkno;
+						 PageGetSpecialPointer(prev_img))->right_page = newleaf_blkno;
+						GenericXLogFinish(state);
+						UnlockReleaseBuffer(prev);
 					}
-					GenericXLogFinish(state);
-					UnlockReleaseBuffer(prev);
-				}
-				else
-				{
-					GenericXLogFinish(state);
-					leftmost_leaf = newleaf_blkno;
+					else
+					{
+						GenericXLogFinish(state);
+						leftmost_leaf = newleaf_blkno;
+					}
 				}
 
 				UnlockReleaseBuffer(newleaf_buf);
