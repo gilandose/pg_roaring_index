@@ -172,6 +172,7 @@ roaring_write_overflow_chain(Relation index,
 		blknos[i] = BufferGetBlockNumber(bufs[i]);
 	}
 
+	/* Initialise all overflow pages (no WAL yet). */
 	for (i = 0; i < npages; i++)
 	{
 		Page					p   = BufferGetPage(bufs[i]);
@@ -193,8 +194,28 @@ roaring_write_overflow_chain(Relation index,
 		((PageHeader) p)->pd_lower =
 			(LocationIndex)(SizeOfPageHeaderData + cl);
 
-		roaring_wal_and_release(index, bufs[i]);
+		MarkBufferDirty(bufs[i]);
 	}
+
+	/*
+	 * WAL-log the entire chain as one record instead of one record per page.
+	 * For a 50-page overflow chain this collapses 50 log_newpage_buffer calls
+	 * into a single log_newpages call.
+	 */
+	if (RelationNeedsWAL(index))
+	{
+		Page *pages = (Page *) palloc(npages * sizeof(Page));
+
+		for (i = 0; i < npages; i++)
+			pages[i] = BufferGetPage(bufs[i]);
+
+		log_newpages(&index->rd_locator, MAIN_FORKNUM,
+					 npages, blknos, pages, true);
+		pfree(pages);
+	}
+
+	for (i = 0; i < npages; i++)
+		UnlockReleaseBuffer(bufs[i]);
 
 	first = blknos[0];
 	pfree(bufs);
