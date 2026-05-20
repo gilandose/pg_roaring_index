@@ -7,24 +7,30 @@
 #include "pgstat.h"
 #include "storage/checksum.h"
 #include "storage/smgr.h"
-#include "utils/hsearch.h"
 #include "utils/rel.h"
 
 /* ----------------------------------------------------------------
  * Internal types
  * ---------------------------------------------------------------- */
 
-typedef struct RoaringBuildEntry
+/*
+ * One (value, linearized_tid) pair collected during the heap scan.
+ * After the scan the array is sorted by (value, tid) so value groups
+ * are contiguous; each group's tids are in ascending order.
+ */
+typedef struct RoaringBuildTuple
 {
-	int64				value;		/* hash key — must be first */
-	roaring_bitmap_t   *bitmap;
-} RoaringBuildEntry;
+	int64	value;
+	uint32	tid;
+} RoaringBuildTuple;
 
 typedef struct RoaringBuildState
 {
-	double	heap_tuples;
-	double	index_tuples;
-	HTAB   *bitmaps;
+	double				heap_tuples;
+	Oid					atttypid;   /* indexed column type, for datum extraction */
+	long				nalloc;
+	long				ntuples;
+	RoaringBuildTuple  *tuples;
 } RoaringBuildState;
 
 /* ----------------------------------------------------------------
@@ -36,37 +42,40 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 {
 	RoaringBuildState  *bstate = (RoaringBuildState *) state;
 	int64				value;
-	RoaringBuildEntry  *entry;
-	bool				found;
 
 	bstate->heap_tuples++;
 
 	if (isnull[0])
 		return;
 
-	value = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID)
+	value = (bstate->atttypid == INT4OID)
 			? (int64) DatumGetInt32(values[0])
 			: DatumGetInt64(values[0]);
 
-	entry = (RoaringBuildEntry *) hash_search(bstate->bitmaps, &value,
-											   HASH_ENTER, &found);
-	if (!found)
+	if (bstate->ntuples == bstate->nalloc)
 	{
-		entry->bitmap = roaring_bitmap_create();
-		bstate->index_tuples++;
+		bstate->nalloc *= 2;
+		bstate->tuples  = (RoaringBuildTuple *)
+						  repalloc(bstate->tuples,
+								   bstate->nalloc * sizeof(RoaringBuildTuple));
 	}
 
-	roaring_bitmap_add(entry->bitmap,
-					   ((uint32) ItemPointerGetBlockNumber(tid) << 9) |
-					   (uint32)(ItemPointerGetOffsetNumber(tid) - 1));
+	bstate->tuples[bstate->ntuples].value = value;
+	bstate->tuples[bstate->ntuples].tid   =
+		((uint32) ItemPointerGetBlockNumber(tid) << 9) |
+		(uint32)(ItemPointerGetOffsetNumber(tid) - 1);
+	bstate->ntuples++;
 }
 
 static int
-cmp_build_entry(const void *a, const void *b)
+cmp_build_tuple(const void *a, const void *b)
 {
-	int64 va = (*(const RoaringBuildEntry *const *) a)->value;
-	int64 vb = (*(const RoaringBuildEntry *const *) b)->value;
-	return (va > vb) - (va < vb);
+	const RoaringBuildTuple *ta = (const RoaringBuildTuple *) a;
+	const RoaringBuildTuple *tb = (const RoaringBuildTuple *) b;
+
+	if (ta->value != tb->value)
+		return (ta->value > tb->value) - (ta->value < tb->value);
+	return (ta->tid > tb->tid) - (ta->tid < tb->tid);
 }
 
 
@@ -134,7 +143,8 @@ write_metapage(Relation index,
  * ---------------------------------------------------------------- */
 static void
 write_leaf_and_dir_pages(Relation index,
-						  RoaringBuildEntry **sorted, long nentries,
+						  RoaringBuildTuple *tuples, long ntuples,
+						  long *nentries_out,
 						  BlockNumber *root_dir_out,
 						  BlockNumber *leftmost_out,
 						  BlockNumber *rightmost_out)
@@ -159,6 +169,7 @@ write_leaf_and_dir_pages(Relation index,
 	/* leaf_entries: one entry per leaf page written */
 	RoaringDirEntry	   *leaf_entries;
 	uint32				leaf_count = 0;
+	long				nentries   = 0;
 
 	Buffer				leaf_buf  = InvalidBuffer;
 	Page				leaf_page = NULL;
@@ -168,26 +179,45 @@ write_leaf_and_dir_pages(Relation index,
 
 	long i;
 
-	if (nentries == 0)
+	if (ntuples == 0)
 	{
+		*nentries_out  = 0;
 		*root_dir_out  = InvalidBlockNumber;
 		*leftmost_out  = InvalidBlockNumber;
 		*rightmost_out = InvalidBlockNumber;
 		return;
 	}
 
-	/* Worst case: one leaf page per value. */
-	leaf_entries = palloc(nentries * sizeof(RoaringDirEntry));
+	/* Worst case: one leaf page per distinct value (≤ ntuples). */
+	leaf_entries = palloc(ntuples * sizeof(RoaringDirEntry));
 
 	/* ---- Phase A: write leaf pages ---- */
-	for (i = 0; i < nentries; i++)
+	i = 0;
+	while (i < ntuples)
 	{
-		RoaringBuildEntry *be = sorted[i];
+		int64			   cur_value  = tuples[i].value;
+		long			   group_end  = i + 1;
+		long			   gc;
+		uint32			  *gtids;
+		roaring_bitmap_t  *bm;
+		long			   gi;
 		size_t			   bitmap_size;
 		Size			   entry_size;
 		RoaringLeafEntry  *le;
 
-		bitmap_size = roaring_bitmap_portable_size_in_bytes(be->bitmap);
+		while (group_end < ntuples && tuples[group_end].value == cur_value)
+			group_end++;
+
+		/* Build bitmap from sorted tids in one call. */
+		gc    = group_end - i;
+		gtids = (uint32 *) palloc(gc * sizeof(uint32));
+		for (gi = 0; gi < gc; gi++)
+			gtids[gi] = tuples[i + gi].tid;
+		bm = roaring_bitmap_of_ptr((size_t) gc, gtids);
+		pfree(gtids);
+
+		nentries++;
+		bitmap_size = roaring_bitmap_portable_size_in_bytes(bm);
 
 		if (bitmap_size > (size_t) max_inline)
 			entry_size = MAXALIGN(sizeof(RoaringOverflowEntry));
@@ -256,11 +286,11 @@ write_leaf_and_dir_pages(Relation index,
 			RoaringOverflowEntry *oe;
 
 			bm_data	   = (char *) palloc(bitmap_size);
-			roaring_bitmap_portable_serialize(be->bitmap, bm_data);
+			roaring_bitmap_portable_serialize(bm, bm_data);
 			pfx_len	   = Min(ROARING_OVERFLOW_INLINE_BYTES, bitmap_size);
 			oe		   = (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
-			oe->value		   = be->value;
-			oe->cardinality	   = roaring_cardinality32(be->bitmap);
+			oe->value		   = cur_value;
+			oe->cardinality	   = roaring_cardinality32(bm);
 			oe->flags		   = ROARING_ENTRY_OVERFLOW;
 			oe->total_len	   = (uint32) bitmap_size;
 			oe->overflow_blkno = roaring_write_overflow_chain(index, bm_data,
@@ -277,10 +307,10 @@ write_leaf_and_dir_pages(Relation index,
 		else
 		{
 			le = (RoaringLeafEntry *) palloc(sizeof(RoaringLeafEntry) + bitmap_size);
-			le->value		= be->value;
-			le->cardinality = roaring_cardinality32(be->bitmap);
+			le->value		= cur_value;
+			le->cardinality = roaring_cardinality32(bm);
 			le->flags		= ROARING_ENTRY_INLINE;
-			roaring_bitmap_portable_serialize(be->bitmap, (char *)(le + 1));
+			roaring_bitmap_portable_serialize(bm, (char *)(le + 1));
 
 			if (PageAddItem(leaf_page, (Item) le,
 							sizeof(RoaringLeafEntry) + bitmap_size,
@@ -290,9 +320,9 @@ write_leaf_and_dir_pages(Relation index,
 		}
 
 		leaf_spc->entry_count++;
+		roaring_bitmap_free(bm);
 
-		roaring_bitmap_free(be->bitmap);
-		be->bitmap = NULL;
+		i = group_end;
 	}
 
 	/* Finalize last leaf page. */
@@ -365,6 +395,7 @@ write_leaf_and_dir_pages(Relation index,
 	}
 
 	pfree(leaf_entries);
+	*nentries_out  = nentries;
 	*leftmost_out  = leftmost;
 	*rightmost_out = rightmost;
 }
@@ -377,14 +408,9 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 {
 	IndexBuildResult   *result;
 	RoaringBuildState	bstate;
-	HASHCTL				hashctl;
 	double				reltuples;
-
-	RoaringBuildEntry **sorted;
-	long				nentries;
-	HASH_SEQ_STATUS		seq;
-	RoaringBuildEntry  *entry;
-	long				i;
+	long				nentries    = 0;
+	long				init_nalloc;
 
 	BlockNumber			root_dir		= InvalidBlockNumber;
 	BlockNumber			leftmost_leaf	= InvalidBlockNumber;
@@ -403,36 +429,36 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 		roaring_wal_and_release(index, buf);
 	}
 
-	/* Heap scan. */
-	memset(&hashctl, 0, sizeof(hashctl));
-	hashctl.keysize   = sizeof(int64);
-	hashctl.entrysize = sizeof(RoaringBuildEntry);
-	bstate.bitmaps		= hash_create("roaring build bitmaps", 1024,
-									  &hashctl, HASH_ELEM | HASH_BLOBS);
-	bstate.heap_tuples  = 0;
-	bstate.index_tuples = 0;
+	/*
+	 * Size the initial tuple array from pg_class.reltuples so the array
+	 * doesn't have to be repalloc'd on most builds.  Fall back to 1024 for
+	 * empty/unanalyzed tables.
+	 */
+	init_nalloc = (long) heap->rd_rel->reltuples;
+	if (init_nalloc < 1024)
+		init_nalloc = 1024;
+
+	bstate.heap_tuples = 0;
+	bstate.atttypid    = TupleDescAttr(index->rd_att, 0)->atttypid;
+	bstate.nalloc      = init_nalloc;
+	bstate.ntuples     = 0;
+	bstate.tuples      = (RoaringBuildTuple *)
+						 palloc(init_nalloc * sizeof(RoaringBuildTuple));
 
 	reltuples = table_index_build_scan(heap, index, indexInfo,
 									   true, true,
 									   roaring_build_callback,
 									   &bstate, NULL);
 
-	/* Sort by value. */
-	nentries = hash_get_num_entries(bstate.bitmaps);
-	sorted   = (RoaringBuildEntry **)
-			   palloc(nentries * sizeof(RoaringBuildEntry *));
-	i = 0;
-	hash_seq_init(&seq, bstate.bitmaps);
-	while ((entry = (RoaringBuildEntry *) hash_seq_search(&seq)) != NULL)
-		sorted[i++] = entry;
-	qsort(sorted, nentries, sizeof(RoaringBuildEntry *), cmp_build_entry);
+	/* Sort flat array by (value, tid). */
+	qsort(bstate.tuples, bstate.ntuples, sizeof(RoaringBuildTuple),
+		  cmp_build_tuple);
 
-	/* Write leaf pages + directory. */
-	write_leaf_and_dir_pages(index, sorted, nentries,
+	/* Write leaf pages + directory; counts distinct values into nentries. */
+	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples, &nentries,
 							 &root_dir, &leftmost_leaf, &rightmost_leaf);
 
-	pfree(sorted);
-	hash_destroy(bstate.bitmaps);
+	pfree(bstate.tuples);
 
 	/* Pending-list pages. */
 	pending_insert = roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
@@ -443,7 +469,7 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 				   pending_insert, pending_delete, (uint32) nentries);
 
 	result->heap_tuples  = reltuples;
-	result->index_tuples = bstate.index_tuples;
+	result->index_tuples = (double) nentries;
 	return result;
 }
 
