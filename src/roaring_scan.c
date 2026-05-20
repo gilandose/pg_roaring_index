@@ -266,7 +266,7 @@ lookup_value_in_index(Relation index, BlockNumber root_blkno, int64 value,
 	{
 		roaring_bitmap_t *bm;
 
-		if (le->flags == ROARING_ENTRY_OVERFLOW)
+		if (le->flags & ROARING_ENTRY_OVERFLOW)
 		{
 			RoaringOverflowEntry oe_copy;
 

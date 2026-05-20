@@ -23,6 +23,14 @@ roaring_validate_metapage(Relation index, const RoaringMetaPageData *meta)
 			 "(expected 0x%08X) — index may be corrupt",
 			 meta->magic, RelationGetRelationName(index), ROARING_MAGIC);
 
+	if (meta->version != ROARING_INDEX_VERSION)
+		elog(ERROR,
+			 "pg_roaring_index: index \"%s\" was built with on-disk version %u, "
+			 "but this build expects version %u — REINDEX required",
+			 RelationGetRelationName(index),
+			 (unsigned) meta->version,
+			 (unsigned) ROARING_INDEX_VERSION);
+
 	if (meta->croaring_format_version != ROARING_EXPECTED_FORMAT_VERSION)
 		elog(ERROR,
 			 "pg_roaring_index: index \"%s\" was built with CRoaring format "
