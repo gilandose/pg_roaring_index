@@ -77,7 +77,7 @@ collect_pending(Relation index, BlockNumber head_blkno, int *nout)
 				continue;
 			if (!TransactionIdIsCurrentTransactionId(xmin) &&
 				!TransactionIdDidCommit(xmin))
-				continue;	/* in-progress or aborted */
+				continue;	/* in-progress (carried forward) or aborted (discarded) */
 
 			if (n == capacity)
 			{
@@ -443,6 +443,9 @@ roaring_merge_pending(Relation index)
 	BlockNumber			 new_pending_blkno;
 	Buffer				 new_pending_buf;
 	Page				 new_pending_page;
+	int					 ncarry			 = 0;
+	BlockNumber			 carry_head		 = InvalidBlockNumber;
+	BlockNumber			 carry_tail_blkno = InvalidBlockNumber;
 	CollectedEntry		*entries;
 	int					 nentries;
 	int					 i;
@@ -453,23 +456,18 @@ roaring_merge_pending(Relation index)
 	 * Step 1: crash-safe merge setup.
 	 *
 	 * Ordering (critical for correctness):
-	 *   A. Record pending_merging_head = old pending_insert_head.
-	 *      This acts as both a crash-recovery marker and a concurrent-merger
-	 *      mutex.  A second caller seeing pending_merging_head != Invalid bails.
-	 *      On crash between A and D, next vacuumcleanup re-reads from
-	 *      pending_merging_head and re-merges (OR is idempotent).
-	 *   B. Extend a new empty pending page (no lock held yet — safe).
-	 *   C. Atomically in one WAL record: write new pending page, set
-	 *      pending_insert_head/tail to new page, pending_insert_count = 0.
-	 *      New inserts now go to the fresh chain; the old chain is frozen.
-	 *   D. After ALL leaf writes complete, atomically: clear
-	 *      pending_merging_head, update root_directory_page, total_entries.
-	 *
-	 * NOTE: in-progress xids in the old chain are currently dropped when their
-	 * entries are not collected (collect_pending skips them).  This is a known
-	 * gap (Phase 1.3): those xids' TIDs will be lost if they commit after merge.
-	 * For now this is acceptable during active development; the fix is to
-	 * preserve in-progress entries in a new pending page before step D.
+	 *   A. WAL: set pending_merging_head = old pending_insert_head.
+	 *      Crash-recovery anchor and concurrent-merger mutex.
+	 *   B. While still holding metapage exclusive, scan the frozen old chain
+	 *      for in-progress-xid entries; write them to new carry pages.
+	 *      These entries are not ready to merge (their transactions may commit
+	 *      or abort later) but must not be discarded — if dropped here and the
+	 *      owning transaction later commits, those TIDs would be permanently lost.
+	 *   C. WAL: swap pending_insert_head/tail to carry chain (or a fresh empty
+	 *      page if no in-progress entries).  New inserts now land here.
+	 *      pending_insert_count = ncarry.
+	 *   D. After ALL leaf writes, WAL: clear pending_merging_head, update
+	 *      root_directory_page and total_entries atomically.
 	 */
 	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
@@ -504,25 +502,148 @@ roaring_merge_pending(Relation index)
 		GenericXLogFinish(state);
 	}
 
-	/* Step B: extend new pending page (metapage still locked; serialises inserts). */
-	new_pending_buf   = roaring_extend_page(index);
-	new_pending_blkno = BufferGetBlockNumber(new_pending_buf);
-	new_pending_page  = BufferGetPage(new_pending_buf);
-	PageInit(new_pending_page, BLCKSZ, sizeof(RoaringPendingSpecial));
+	/*
+	 * Step B: scan the frozen old chain for in-progress entries and carry them
+	 * forward.  We hold the metapage exclusive throughout, so no new inserts
+	 * can reach the old chain and it is effectively frozen.
+	 *
+	 * Reading pending pages with a share lock while holding the metapage
+	 * exclusive is safe: no other backend holds pending-page locks while
+	 * acquiring the metapage (roaring_pending_append takes metapage first,
+	 * then pending page).
+	 */
 	{
-		RoaringPendingSpecial *spc =
-			(RoaringPendingSpecial *) PageGetSpecialPointer(new_pending_page);
-		spc->page_type	 = ROARING_PAGE_PENDING_INSERT;
-		spc->flags		 = 0;
-		spc->entry_count = 0;
-		spc->next_page	 = InvalidBlockNumber;
-		spc->xmin_low	 = InvalidTransactionId;
+		RoaringPendingEntry *carry     = NULL;
+		int					 carry_cap = 0;
+		BlockNumber			 cscan	   = old_head;
+
+		while (cscan != InvalidBlockNumber)
+		{
+			Buffer				  pb;
+			Page				  pp;
+			RoaringPendingSpecial *pspc;
+			RoaringPendingEntry   *praw;
+			uint16				  k;
+
+			pb   = ReadBuffer(index, cscan);
+			LockBuffer(pb, BUFFER_LOCK_SHARE);
+			pp   = BufferGetPage(pb);
+			pspc = (RoaringPendingSpecial *) PageGetSpecialPointer(pp);
+			praw = (RoaringPendingEntry *)   PageGetContents(pp);
+
+			for (k = 0; k < pspc->entry_count; k++)
+			{
+				TransactionId xmin = praw[k].xmin;
+
+				if (!TransactionIdIsValid(xmin))					continue;
+				if (TransactionIdDidAbort(xmin))					continue;
+				if (TransactionIdIsCurrentTransactionId(xmin) ||
+					TransactionIdDidCommit(xmin))					continue;
+
+				/* In-progress: carry forward to new pending chain. */
+				if (ncarry == carry_cap)
+				{
+					carry_cap = (carry_cap == 0) ? 64 : carry_cap * 2;
+					carry	  = (RoaringPendingEntry *)
+								(carry == NULL
+								 ? palloc(carry_cap * sizeof(RoaringPendingEntry))
+								 : repalloc(carry,
+											carry_cap * sizeof(RoaringPendingEntry)));
+				}
+				carry[ncarry++] = praw[k];
+			}
+
+			cscan = pspc->next_page;
+			UnlockReleaseBuffer(pb);
+		}
+
+		if (ncarry > 0)
+		{
+			int			 npages  = (ncarry + ROARING_PENDING_PER_PAGE - 1)
+								   / ROARING_PENDING_PER_PAGE;
+			Buffer		*cbufs   = (Buffer *)      palloc(npages * sizeof(Buffer));
+			BlockNumber *cblknos = (BlockNumber *) palloc(npages * sizeof(BlockNumber));
+			int			 p;
+
+			for (p = 0; p < npages; p++)
+			{
+				cbufs[p]   = roaring_extend_page(index);
+				cblknos[p] = BufferGetBlockNumber(cbufs[p]);
+			}
+
+			for (p = 0; p < npages; p++)
+			{
+				Page				   cp	   = BufferGetPage(cbufs[p]);
+				RoaringPendingSpecial *cspc;
+				RoaringPendingEntry	  *cslots;
+				int					   pstart  = p * ROARING_PENDING_PER_PAGE;
+				int					   pcount  = Min(ROARING_PENDING_PER_PAGE,
+													 ncarry - pstart);
+
+				PageInit(cp, BLCKSZ, sizeof(RoaringPendingSpecial));
+				cspc			  = (RoaringPendingSpecial *) PageGetSpecialPointer(cp);
+				cspc->page_type   = ROARING_PAGE_PENDING_INSERT;
+				cspc->flags		  = 0;
+				cspc->entry_count = (uint16) pcount;
+				cspc->next_page   = (p + 1 < npages)
+									? cblknos[p + 1] : InvalidBlockNumber;
+				cspc->xmin_low	  = carry[pstart].xmin;
+
+				cslots = (RoaringPendingEntry *) PageGetContents(cp);
+				memcpy(cslots, carry + pstart, pcount * sizeof(RoaringPendingEntry));
+				((PageHeader) cp)->pd_lower =
+					(LocationIndex)(SizeOfPageHeaderData +
+									pcount * sizeof(RoaringPendingEntry));
+
+				roaring_wal_and_release(index, cbufs[p]);
+			}
+
+			carry_head		= cblknos[0];
+			carry_tail_blkno = cblknos[npages - 1];
+
+			pfree(cblknos);
+			pfree(cbufs);
+			pfree(carry);
+		}
 	}
 
-	/* Step C: atomically swap pending_insert_head to the fresh page. */
+	/*
+	 * Step C: atomically swap pending_insert_head to the carry chain (if any
+	 * in-progress entries were found) or to a fresh empty page otherwise.
+	 */
+	if (ncarry > 0)
 	{
+		/* Carry pages are already WAL'd; only the metapage needs updating. */
+		GenericXLogState *state	   = GenericXLogStart(index);
+		Page			  meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
+
+		meta					  = RoaringPageGetMeta(meta_img);
+		meta->pending_insert_head  = carry_head;
+		meta->pending_insert_tail  = carry_tail_blkno;
+		meta->pending_insert_count = (uint32) ncarry;
+
+		GenericXLogFinish(state);
+		UnlockReleaseBuffer(metabuf);
+	}
+	else
+	{
+		/* No in-progress entries: extend a fresh empty pending page. */
 		GenericXLogState *state = GenericXLogStart(index);
 		Page			  np_img, meta_img;
+
+		new_pending_buf   = roaring_extend_page(index);
+		new_pending_blkno = BufferGetBlockNumber(new_pending_buf);
+		new_pending_page  = BufferGetPage(new_pending_buf);
+		PageInit(new_pending_page, BLCKSZ, sizeof(RoaringPendingSpecial));
+		{
+			RoaringPendingSpecial *spc =
+				(RoaringPendingSpecial *) PageGetSpecialPointer(new_pending_page);
+			spc->page_type	 = ROARING_PAGE_PENDING_INSERT;
+			spc->flags		 = 0;
+			spc->entry_count = 0;
+			spc->next_page	 = InvalidBlockNumber;
+			spc->xmin_low	 = InvalidTransactionId;
+		}
 
 		np_img = GenericXLogRegisterBuffer(state, new_pending_buf,
 										   GENERIC_XLOG_FULL_IMAGE);
@@ -535,10 +656,9 @@ roaring_merge_pending(Relation index)
 		meta->pending_insert_count = 0;
 
 		GenericXLogFinish(state);
+		UnlockReleaseBuffer(new_pending_buf);
+		UnlockReleaseBuffer(metabuf);
 	}
-
-	UnlockReleaseBuffer(new_pending_buf);
-	UnlockReleaseBuffer(metabuf);
 
 	/* ---- Step 2: collect and sort the old pending chain. ---- */
 	entries = collect_pending(index, old_head, &nentries);
