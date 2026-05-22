@@ -11,7 +11,7 @@ OBJS = \
 
 EXTENSION = pg_roaring_index
 DATA      = pg_roaring_index--1.0.sql
-REGRESS   = roaring_basic
+REGRESS   = roaring_basic roaring_lossy roaring_multicolumn
 
 PG_CPPFLAGS = -Iinclude -Isrc/vendor/croaring -DUSE_CROARING
 
@@ -30,5 +30,9 @@ CROARING_H = src/vendor/croaring/roaring.h
 ifeq (,$(wildcard $(CROARING_H)))
 $(error CRoaring not found. Run: bash scripts/fetch-croaring.sh)
 endif
+
+# Recompile all objects when the shared header changes.
+PG_ROARING_H = include/pg_roaring_index.h
+$(filter-out src/vendor/%, $(OBJS)): $(PG_ROARING_H)
 
 include $(PGXS)

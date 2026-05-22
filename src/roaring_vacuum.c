@@ -1,8 +1,10 @@
 #include "pg_roaring_index.h"
 
 #include "access/generic_xlog.h"
+#include "access/htup_details.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/pg_type_d.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "utils/rel.h"
@@ -274,7 +276,6 @@ leaf_split_and_update(Relation index,
 	int					 nentries, i, split_at;
 	char			   **items;
 	Size			    *item_sizes;
-	GenericXLogState	*state;
 	Page				 cur_img, new_img;
 	Buffer				 newleaf_buf;
 	BlockNumber			 newleaf_blkno;
@@ -331,43 +332,57 @@ leaf_split_and_update(Relation index,
 		ns->right_page	= next_blkno;
 	}
 
-	state   = GenericXLogStart(index);
-	cur_img = GenericXLogRegisterBuffer(state, leafbuf, 0);
-	new_img = GenericXLogRegisterBuffer(state, newleaf_buf, GENERIC_XLOG_FULL_IMAGE);
-	memcpy(new_img, BufferGetPage(newleaf_buf), BLCKSZ);
-
-	/*
-	 * Rewrite the current page with the left half.  PageInit clears it;
-	 * GenericXLog records the full delta from the registered snapshot.
-	 */
-	PageInit(cur_img, BLCKSZ, sizeof(RoaringLeafSpecial));
 	{
-		RoaringLeafSpecial *cs = (RoaringLeafSpecial *) PageGetSpecialPointer(cur_img);
-
-		cs->page_type	= ROARING_PAGE_LEAF;
-		cs->flags		= lspc->flags;
-		cs->entry_count = 0;
-		cs->left_page	= lspc->left_page;
-		cs->right_page	= newleaf_blkno;
-	}
-	for (i = 0; i < split_at; i++)
+	GenericXLogState * volatile xstate = GenericXLogStart(index);
+	PG_TRY();
 	{
-		if (PageAddItem(cur_img, (Item) items[i], item_sizes[i],
-						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-			elog(ERROR, "pg_roaring_index: split: PageAddItem left-half failed");
-		((RoaringLeafSpecial *) PageGetSpecialPointer(cur_img))->entry_count++;
-	}
+		cur_img = GenericXLogRegisterBuffer((GenericXLogState *) xstate, leafbuf, 0);
+		new_img = GenericXLogRegisterBuffer((GenericXLogState *) xstate, newleaf_buf,
+											GENERIC_XLOG_FULL_IMAGE);
+		memcpy(new_img, BufferGetPage(newleaf_buf), BLCKSZ);
 
-	/* Write right half to new page. */
-	for (i = split_at; i < nentries; i++)
+		/*
+		 * Rewrite the current page with the left half.  PageInit clears it;
+		 * GenericXLog records the full delta from the registered snapshot.
+		 */
+		PageInit(cur_img, BLCKSZ, sizeof(RoaringLeafSpecial));
+		{
+			RoaringLeafSpecial *cs = (RoaringLeafSpecial *) PageGetSpecialPointer(cur_img);
+
+			cs->page_type	= ROARING_PAGE_LEAF;
+			cs->flags		= lspc->flags;
+			cs->entry_count = 0;
+			cs->left_page	= lspc->left_page;
+			cs->right_page	= newleaf_blkno;
+		}
+		for (i = 0; i < split_at; i++)
+		{
+			if (PageAddItem(cur_img, (Item) items[i], item_sizes[i],
+							InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+				elog(ERROR, "pg_roaring_index: split: PageAddItem left-half failed");
+			((RoaringLeafSpecial *) PageGetSpecialPointer(cur_img))->entry_count++;
+		}
+
+		/* Write right half to new page. */
+		for (i = split_at; i < nentries; i++)
+		{
+			if (PageAddItem(new_img, (Item) items[i], item_sizes[i],
+							InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+				elog(ERROR, "pg_roaring_index: split: PageAddItem right-half failed");
+			((RoaringLeafSpecial *) PageGetSpecialPointer(new_img))->entry_count++;
+		}
+
+		GenericXLogFinish((GenericXLogState *) xstate);
+		xstate = NULL;
+	}
+	PG_CATCH();
 	{
-		if (PageAddItem(new_img, (Item) items[i], item_sizes[i],
-						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-			elog(ERROR, "pg_roaring_index: split: PageAddItem right-half failed");
-		((RoaringLeafSpecial *) PageGetSpecialPointer(new_img))->entry_count++;
+		if (xstate)
+			GenericXLogAbort((GenericXLogState *) xstate);
+		PG_RE_THROW();
 	}
-
-	GenericXLogFinish(state);
+	PG_END_TRY();
+	} /* xstate scope */
 	UnlockReleaseBuffer(leafbuf);
 	UnlockReleaseBuffer(newleaf_buf);
 
@@ -598,7 +613,29 @@ roaring_merge_pending(Relation index)
 					(LocationIndex)(SizeOfPageHeaderData +
 									pcount * sizeof(RoaringPendingEntry));
 
-				roaring_wal_and_release(index, cbufs[p]);
+				if (p == 0)
+				{
+					/*
+					 * Atomically record pending_carry_head in the metapage
+					 * within the same WAL record as the first carry page.
+					 * This ensures Case 1 crash recovery can locate orphaned
+					 * carry pages if we crash before Step C's metapage swap.
+					 */
+					GenericXLogState *cstate = GenericXLogStart(index);
+					Page carry_img = GenericXLogRegisterBuffer(cstate, cbufs[0],
+															   GENERIC_XLOG_FULL_IMAGE);
+					Page meta_img  = GenericXLogRegisterBuffer(cstate, metabuf, 0);
+
+					memcpy(carry_img, cp, BLCKSZ);
+					RoaringPageGetMeta(meta_img)->pending_carry_head = cblknos[0];
+
+					GenericXLogFinish(cstate);
+					UnlockReleaseBuffer(cbufs[0]);
+				}
+				else
+				{
+					roaring_wal_and_release(index, cbufs[p]);
+				}
 			}
 
 			carry_head		= cblknos[0];
@@ -620,10 +657,11 @@ roaring_merge_pending(Relation index)
 		GenericXLogState *state	   = GenericXLogStart(index);
 		Page			  meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
 
-		meta					  = RoaringPageGetMeta(meta_img);
+		meta					   = RoaringPageGetMeta(meta_img);
 		meta->pending_insert_head  = carry_head;
 		meta->pending_insert_tail  = carry_tail_blkno;
 		meta->pending_insert_count = (uint32) ncarry;
+		meta->pending_carry_head   = InvalidBlockNumber; /* carry chain is now live */
 
 		GenericXLogFinish(state);
 		UnlockReleaseBuffer(metabuf);
@@ -853,57 +891,68 @@ roaring_merge_pending(Relation index)
 					leafbuf = ReadBuffer(index, leaf_blkno);
 					LockBuffer(leafbuf, BUFFER_LOCK_EXCLUSIVE);
 					{
-						GenericXLogState *state = GenericXLogStart(index);
-						Page			  img   = GenericXLogRegisterBuffer(state,
-																	 leafbuf, 0);
-
-						/*
-						 * Compacting delete so no LP_UNUSED hole breaks binary search.
-						 */
-						PageIndexTupleDelete(img, found_off);
-
-						if (write_ovf)
+						GenericXLogState * volatile xstate = GenericXLogStart(index);
+						PG_TRY();
 						{
-							RoaringOverflowEntry new_oe;
+							Page img = GenericXLogRegisterBuffer(
+								(GenericXLogState *) xstate, leafbuf, 0);
 
-							new_oe.value		  = cur_value;
-							new_oe.cardinality	  = bm_card;
-							new_oe.flags		  = ROARING_ENTRY_OVERFLOW;
-							new_oe.total_len	  = (uint32) new_size;
-							new_oe.overflow_blkno = new_ovf_blkno;
-							memcpy(new_oe.inline_prefix, pfx_buf, pfx_len);
+							/*
+							 * Compacting delete so no LP_UNUSED hole breaks binary search.
+							 */
+							PageIndexTupleDelete(img, found_off);
 
-							if (PageAddItem(img, (Item) &new_oe,
-											sizeof(RoaringOverflowEntry),
-											found_off, false, false)
-								== InvalidOffsetNumber)
-								elog(ERROR,
-									 "pg_roaring_index: merge: PageAddItem failed "
-									 "for value " INT64_FORMAT, cur_value);
+							if (write_ovf)
+							{
+								RoaringOverflowEntry new_oe;
+
+								new_oe.value		  = cur_value;
+								new_oe.cardinality	  = bm_card;
+								new_oe.flags		  = ROARING_ENTRY_OVERFLOW;
+								new_oe.total_len	  = (uint32) new_size;
+								new_oe.overflow_blkno = new_ovf_blkno;
+								memcpy(new_oe.inline_prefix, pfx_buf, pfx_len);
+
+								if (PageAddItem(img, (Item) &new_oe,
+												sizeof(RoaringOverflowEntry),
+												found_off, false, false)
+									== InvalidOffsetNumber)
+									elog(ERROR,
+										 "pg_roaring_index: merge: PageAddItem failed "
+										 "for value " INT64_FORMAT, cur_value);
+							}
+							else
+							{
+								RoaringLeafEntry *new_le =
+									(RoaringLeafEntry *)
+									palloc(sizeof(RoaringLeafEntry) + new_size);
+
+								new_le->value		= cur_value;
+								new_le->cardinality	= bm_card;
+								new_le->flags		= ROARING_ENTRY_INLINE;
+								memcpy((char *)(new_le + 1), bm_data, new_size);
+
+								if (PageAddItem(img, (Item) new_le,
+												sizeof(RoaringLeafEntry) + new_size,
+												found_off, false, false)
+									== InvalidOffsetNumber)
+									elog(ERROR,
+										 "pg_roaring_index: merge: PageAddItem failed "
+										 "for value " INT64_FORMAT, cur_value);
+								pfree(new_le);
+							}
+
+							GenericXLogFinish((GenericXLogState *) xstate);
+							xstate = NULL;
 						}
-						else
+						PG_CATCH();
 						{
-							RoaringLeafEntry *new_le =
-								(RoaringLeafEntry *)
-								palloc(sizeof(RoaringLeafEntry) + new_size);
-
-							new_le->value		= cur_value;
-							new_le->cardinality	= bm_card;
-							new_le->flags		= ROARING_ENTRY_INLINE;
-							memcpy((char *)(new_le + 1), bm_data, new_size);
-
-							if (PageAddItem(img, (Item) new_le,
-											sizeof(RoaringLeafEntry) + new_size,
-											found_off, false, false)
-								== InvalidOffsetNumber)
-								elog(ERROR,
-									 "pg_roaring_index: merge: PageAddItem failed "
-									 "for value " INT64_FORMAT, cur_value);
-							pfree(new_le);
+							if (xstate)
+								GenericXLogAbort((GenericXLogState *) xstate);
+							PG_RE_THROW();
 						}
-
-						GenericXLogFinish(state);
-					}
+						PG_END_TRY();
+					} /* xstate scope */
 					UnlockReleaseBuffer(leafbuf);
 				}
 
@@ -974,23 +1023,34 @@ roaring_merge_pending(Relation index)
 
 				if (PageGetFreeSpace(leafpage) >= entry_size)
 				{
-					GenericXLogState *state = GenericXLogStart(index);
-					Page			  img   = GenericXLogRegisterBuffer(state,
-																 leafbuf, 0);
+					GenericXLogState * volatile xstate = GenericXLogStart(index);
+					PG_TRY();
+					{
+						Page img = GenericXLogRegisterBuffer(
+							(GenericXLogState *) xstate, leafbuf, 0);
 
-					if (PageAddItem(img, (Item) new_le,
-									sizeof(RoaringLeafEntry) + bm_size,
-									ins_off, false, false)
-						== InvalidOffsetNumber)
-						elog(ERROR,
-							 "pg_roaring_index: merge: PageAddItem (new) "
-							 "failed for value " INT64_FORMAT, cur_value);
+						if (PageAddItem(img, (Item) new_le,
+										sizeof(RoaringLeafEntry) + bm_size,
+										ins_off, false, false)
+							== InvalidOffsetNumber)
+							elog(ERROR,
+								 "pg_roaring_index: merge: PageAddItem (new) "
+								 "failed for value " INT64_FORMAT, cur_value);
 
-					/* Update leaf special entry count. */
-					((RoaringLeafSpecial *) PageGetSpecialPointer(img))
-						->entry_count++;
+						/* Update leaf special entry count. */
+						((RoaringLeafSpecial *) PageGetSpecialPointer(img))
+							->entry_count++;
 
-					GenericXLogFinish(state);
+						GenericXLogFinish((GenericXLogState *) xstate);
+						xstate = NULL;
+					}
+					PG_CATCH();
+					{
+						if (xstate)
+							GenericXLogAbort((GenericXLogState *) xstate);
+						PG_RE_THROW();
+					}
+					PG_END_TRY();
 					UnlockReleaseBuffer(leafbuf);
 					inserted = true;
 				}
@@ -1005,7 +1065,6 @@ roaring_merge_pending(Relation index)
 					BlockNumber			 newleaf_blkno;
 					BlockNumber			 next_blkno;
 					RoaringLeafSpecial	*cur_spc;
-					GenericXLogState	*state;
 					Page				 cur_img, new_img;
 
 					cur_spc    = (RoaringLeafSpecial *)
@@ -1027,26 +1086,41 @@ roaring_merge_pending(Relation index)
 						ns->right_page	= next_blkno;
 					}
 
-					state   = GenericXLogStart(index);
-					cur_img = GenericXLogRegisterBuffer(state, leafbuf, 0);
-					new_img = GenericXLogRegisterBuffer(state, newleaf_buf,
-														GENERIC_XLOG_FULL_IMAGE);
-					memcpy(new_img, BufferGetPage(newleaf_buf), BLCKSZ);
+					{
+					GenericXLogState * volatile xstate = GenericXLogStart(index);
+					PG_TRY();
+					{
+						cur_img = GenericXLogRegisterBuffer(
+							(GenericXLogState *) xstate, leafbuf, 0);
+						new_img = GenericXLogRegisterBuffer(
+							(GenericXLogState *) xstate, newleaf_buf,
+							GENERIC_XLOG_FULL_IMAGE);
+						memcpy(new_img, BufferGetPage(newleaf_buf), BLCKSZ);
 
-					/* Insert entry into new page. */
-					if (PageAddItem(new_img, (Item) new_le,
-									sizeof(RoaringLeafEntry) + bm_size,
-									1, false, false)
-						== InvalidOffsetNumber)
-						elog(ERROR, "pg_roaring_index: merge: PageAddItem on new leaf failed");
-					((RoaringLeafSpecial *)
-					 PageGetSpecialPointer(new_img))->entry_count = 1;
+						/* Insert entry into new page. */
+						if (PageAddItem(new_img, (Item) new_le,
+										sizeof(RoaringLeafEntry) + bm_size,
+										1, false, false)
+							== InvalidOffsetNumber)
+							elog(ERROR, "pg_roaring_index: merge: PageAddItem on new leaf failed");
+						((RoaringLeafSpecial *)
+						 PageGetSpecialPointer(new_img))->entry_count = 1;
 
-					/* Update old leaf: right_page → new page. */
-					((RoaringLeafSpecial *)
-					 PageGetSpecialPointer(cur_img))->right_page = newleaf_blkno;
+						/* Update old leaf: right_page → new page. */
+						((RoaringLeafSpecial *)
+						 PageGetSpecialPointer(cur_img))->right_page = newleaf_blkno;
 
-					GenericXLogFinish(state);
+						GenericXLogFinish((GenericXLogState *) xstate);
+						xstate = NULL;
+					}
+					PG_CATCH();
+					{
+						if (xstate)
+							GenericXLogAbort((GenericXLogState *) xstate);
+						PG_RE_THROW();
+					}
+					PG_END_TRY();
+					} /* xstate scope */
 					UnlockReleaseBuffer(leafbuf);
 					UnlockReleaseBuffer(newleaf_buf);
 
@@ -1081,74 +1155,87 @@ roaring_merge_pending(Relation index)
 				 * value is beyond all existing leaf high_keys (or index is
 				 * empty).  Append a new leaf page at the rightmost position.
 				 */
-				Buffer				 newleaf_buf;
-				BlockNumber			 newleaf_blkno;
-				GenericXLogState	*state;
-				Page				 new_img;
-
-				newleaf_buf   = roaring_extend_page(index);
-				newleaf_blkno = BufferGetBlockNumber(newleaf_buf);
 				{
-					Page				np = BufferGetPage(newleaf_buf);
-					RoaringLeafSpecial *ns;
-					PageInit(np, BLCKSZ, sizeof(RoaringLeafSpecial));
-					ns				= (RoaringLeafSpecial *)
-									  PageGetSpecialPointer(np);
-					ns->page_type	= ROARING_PAGE_LEAF;
-					ns->flags		= 0;
-					ns->entry_count = 0;
-					ns->left_page	= rightmost_leaf;
-					ns->right_page	= InvalidBlockNumber;
-				}
+					Buffer				 newleaf_buf;
+					BlockNumber			 newleaf_blkno;
+					GenericXLogState	* volatile xstate;
+					Page				 new_img;
+					Buffer				 prev = InvalidBuffer;
 
-				/*
-				 * Lock ordering: acquire prev (lower block) before newleaf_buf
-				 * (just extended, always a higher block number).  This matches
-				 * the convention used everywhere else in the leaf chain and
-				 * prevents deadlocks with left-to-right chain walkers.
-				 */
-				{
-					Buffer prev = InvalidBuffer;
-
+					/*
+					 * Lock ordering: acquire prev (lower block) before extending
+					 * the relation (new page always has a higher block number).
+					 * This matches the nbtree convention and prevents deadlock
+					 * with concurrent left-to-right leaf chain walkers.
+					 */
 					if (rightmost_leaf != InvalidBlockNumber)
 					{
 						prev = ReadBuffer(index, rightmost_leaf);
 						LockBuffer(prev, BUFFER_LOCK_EXCLUSIVE);
 					}
 
-					state   = GenericXLogStart(index);
-					new_img = GenericXLogRegisterBuffer(state, newleaf_buf,
-														GENERIC_XLOG_FULL_IMAGE);
-					memcpy(new_img, BufferGetPage(newleaf_buf), BLCKSZ);
-					if (PageAddItem(new_img, (Item) new_le,
-									sizeof(RoaringLeafEntry) + bm_size,
-									1, false, false)
-						== InvalidOffsetNumber)
-						elog(ERROR,
-							 "pg_roaring_index: merge: PageAddItem on appended leaf failed");
-					((RoaringLeafSpecial *)
-					 PageGetSpecialPointer(new_img))->entry_count = 1;
-
-					if (prev != InvalidBuffer)
+					newleaf_buf   = roaring_extend_page(index);
+					newleaf_blkno = BufferGetBlockNumber(newleaf_buf);
 					{
-						Page prev_img = GenericXLogRegisterBuffer(state, prev, 0);
+						Page				np = BufferGetPage(newleaf_buf);
+						RoaringLeafSpecial *ns;
+						PageInit(np, BLCKSZ, sizeof(RoaringLeafSpecial));
+						ns				= (RoaringLeafSpecial *)
+										  PageGetSpecialPointer(np);
+						ns->page_type	= ROARING_PAGE_LEAF;
+						ns->flags		= 0;
+						ns->entry_count = 0;
+						ns->left_page	= rightmost_leaf;
+						ns->right_page	= InvalidBlockNumber;
+					}
 
+					xstate = GenericXLogStart(index);
+					PG_TRY();
+					{
+						new_img = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
+															newleaf_buf,
+															GENERIC_XLOG_FULL_IMAGE);
+						memcpy(new_img, BufferGetPage(newleaf_buf), BLCKSZ);
+						if (PageAddItem(new_img, (Item) new_le,
+										sizeof(RoaringLeafEntry) + bm_size,
+										1, false, false)
+							== InvalidOffsetNumber)
+							elog(ERROR,
+								 "pg_roaring_index: merge: PageAddItem on appended leaf failed");
 						((RoaringLeafSpecial *)
-						 PageGetSpecialPointer(prev_img))->right_page = newleaf_blkno;
-						GenericXLogFinish(state);
-						UnlockReleaseBuffer(prev);
-					}
-					else
-					{
-						GenericXLogFinish(state);
-						leftmost_leaf = newleaf_blkno;
-					}
-				}
+						 PageGetSpecialPointer(new_img))->entry_count = 1;
 
-				UnlockReleaseBuffer(newleaf_buf);
-				rightmost_leaf	 = newleaf_blkno;
-				inserted		 = true;
-				leaf_structure_changed = true;
+						if (prev != InvalidBuffer)
+						{
+							Page prev_img = GenericXLogRegisterBuffer(
+								(GenericXLogState *) xstate, prev, 0);
+
+							((RoaringLeafSpecial *)
+							 PageGetSpecialPointer(prev_img))->right_page = newleaf_blkno;
+							GenericXLogFinish((GenericXLogState *) xstate);
+							xstate = NULL;
+							UnlockReleaseBuffer(prev);
+						}
+						else
+						{
+							GenericXLogFinish((GenericXLogState *) xstate);
+							xstate = NULL;
+							leftmost_leaf = newleaf_blkno;
+						}
+					}
+					PG_CATCH();
+					{
+						if (xstate)
+							GenericXLogAbort((GenericXLogState *) xstate);
+						PG_RE_THROW();
+					}
+					PG_END_TRY();
+
+					UnlockReleaseBuffer(newleaf_buf);
+					rightmost_leaf	 = newleaf_blkno;
+					inserted		 = true;
+					leaf_structure_changed = true;
+				}
 			}
 
 			if (inserted)
@@ -1177,17 +1264,29 @@ roaring_merge_pending(Relation index)
 	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 	{
-		GenericXLogState *state = GenericXLogStart(index);
-		Page			  img   = GenericXLogRegisterBuffer(state, metabuf, 0);
-		RoaringMetaPageData *m  = RoaringPageGetMeta(img);
+		GenericXLogState * volatile xstate = GenericXLogStart(index);
+		PG_TRY();
+		{
+			Page			  img = GenericXLogRegisterBuffer(
+				(GenericXLogState *) xstate, metabuf, 0);
+			RoaringMetaPageData *m  = RoaringPageGetMeta(img);
 
-		m->root_directory_page = root_dir;
-		m->leftmost_leaf_page  = leftmost_leaf;
-		m->rightmost_leaf_page = rightmost_leaf;
-		m->total_entries	   = new_total_entries;
-		m->pending_merging_head = InvalidBlockNumber;	/* merge committed */
+			m->root_directory_page  = root_dir;
+			m->leftmost_leaf_page   = leftmost_leaf;
+			m->rightmost_leaf_page  = rightmost_leaf;
+			m->total_entries	    = new_total_entries;
+			m->pending_merging_head = InvalidBlockNumber; /* merge committed */
 
-		GenericXLogFinish(state);
+			GenericXLogFinish((GenericXLogState *) xstate);
+			xstate = NULL;
+		}
+		PG_CATCH();
+		{
+			if (xstate)
+				GenericXLogAbort((GenericXLogState *) xstate);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
 	UnlockReleaseBuffer(metabuf);
 }
@@ -1520,6 +1619,298 @@ roaring_bulkdelete_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 }
 
 /* ----------------------------------------------------------------
+ * roaring_resummarize_lossy
+ *
+ * Remove stale block numbers from lossy bitmaps.  For each value V, read
+ * only the heap pages listed in V's bitmap and check for live tuples with
+ * the indexed value.  Block numbers with no live V-tuples are removed.
+ *
+ * This is the BRIN-style dead-block cleanup: O(bitmap_pages) not O(heap).
+ *
+ * Holding index leaf EXCLUSIVE while reading heap pages is safe: amgetbitmap
+ * releases all index locks before touching heap, so no deadlock is possible
+ * with concurrent index scans.
+ *
+ * Liveness check: any LP_NORMAL heap tuple with a valid xmin and the indexed
+ * value counts as "live enough" to retain the block.  Conservative (we may
+ * keep blocks where the only V-tuple has a committed xmax), but never drops
+ * a block that could still be needed.  A subsequent VACUUM round will prune
+ * such tuples to LP_DEAD and the next vacuumcleanup will drop the block.
+ * ---------------------------------------------------------------- */
+static void
+roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+{
+	const int			 max_inline = (int)(BLCKSZ
+										   - MAXALIGN(sizeof(RoaringLeafSpecial))
+										   - SizeOfPageHeaderData
+										   - sizeof(ItemIdData)
+										   - MAXALIGN(sizeof(RoaringLeafEntry)));
+	Relation			 index        = info->index;
+	Relation			 heap         = info->heaprel;
+	TupleDesc			 tupdesc;
+	bool				 is_int4;
+	BlockNumber			 heap_nblocks;
+	BlockNumber			 leftmost, cur;
+	Buffer				 metabuf;
+
+	if (!heap)
+		return;
+
+	tupdesc      = RelationGetDescr(heap);
+	is_int4      = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID);
+	heap_nblocks = RelationGetNumberOfBlocks(heap);
+
+	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	leftmost = RoaringPageGetMeta(BufferGetPage(metabuf))->leftmost_leaf_page;
+	UnlockReleaseBuffer(metabuf);
+
+	for (cur = leftmost; cur != InvalidBlockNumber; )
+	{
+		Buffer				 leafbuf;
+		Page				 leafpage;
+		RoaringLeafSpecial	*lspc;
+		OffsetNumber		 off, maxoff;
+		BlockNumber			 next;
+		GenericXLogState	* volatile xstate;
+		Page				 img;
+		bool				 page_changed = false;
+
+		leafbuf  = ReadBuffer(index, cur);
+		LockBuffer(leafbuf, BUFFER_LOCK_EXCLUSIVE);
+		leafpage = BufferGetPage(leafbuf);
+		lspc     = (RoaringLeafSpecial *) PageGetSpecialPointer(leafpage);
+		maxoff   = PageGetMaxOffsetNumber(leafpage);
+		next     = lspc->right_page;
+
+		xstate = GenericXLogStart(index);
+		img    = GenericXLogRegisterBuffer((GenericXLogState *) xstate, leafbuf, 0);
+
+		PG_TRY();
+		{
+			for (off = FirstOffsetNumber; off <= maxoff; off++)
+			{
+				ItemId            iid;
+				RoaringLeafEntry *le;
+				int64             value;
+				bool              was_overflow;
+				roaring_bitmap_t * volatile bm    = NULL;
+				roaring_bitmap_t * volatile new_bm = NULL;
+				uint32            old_card, new_card;
+
+				iid = PageGetItemId(img, off);
+				if (!ItemIdIsUsed(iid))
+					continue;
+
+				le           = (RoaringLeafEntry *) PageGetItem(img, iid);
+				value        = le->value;
+				was_overflow = (le->flags & ROARING_ENTRY_OVERFLOW) != 0;
+
+				PG_TRY();
+				{
+					if (was_overflow)
+					{
+						RoaringOverflowEntry oe_copy;
+
+						memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+						/*
+						 * roaring_read_overflow_bitmap takes share locks on
+						 * overflow pages.  We hold leafbuf exclusive — safe
+						 * because overflow pages are always higher-numbered
+						 * than the leaf and no other process holds overflow
+						 * exclusive while we own this leaf.
+						 */
+						bm = roaring_read_overflow_bitmap(index, &oe_copy);
+					}
+					else
+					{
+						size_t bm_bytes = ItemIdGetLength(iid)
+										  - sizeof(RoaringLeafEntry);
+						bm = roaring_bitmap_portable_deserialize_safe(
+								(const char *)(le + 1), bm_bytes);
+					}
+
+					if (bm != NULL)
+					{
+						roaring_uint32_iterator_t it;
+
+						old_card = roaring_cardinality32(bm);
+						new_bm   = roaring_bitmap_create();
+
+						roaring_iterator_init(bm, &it);
+						while (it.has_value)
+						{
+							BlockNumber hblkno  = (BlockNumber) it.current_value;
+							bool        has_live = false;
+
+							if (hblkno < heap_nblocks)
+							{
+								Buffer       hbuf;
+								Page         hpage;
+								OffsetNumber ho, hmaxoff;
+
+								hbuf = ReadBufferExtended(heap, MAIN_FORKNUM,
+														  hblkno, RBM_NORMAL,
+														  info->strategy);
+								LockBuffer(hbuf, BUFFER_LOCK_SHARE);
+								hpage   = BufferGetPage(hbuf);
+								hmaxoff = PageGetMaxOffsetNumber(hpage);
+
+								for (ho = FirstOffsetNumber;
+									 ho <= hmaxoff && !has_live;
+									 ho++)
+								{
+									ItemId        hiid = PageGetItemId(hpage, ho);
+									HeapTupleData htup;
+									bool          isnull;
+									Datum         val;
+									int64         col_val;
+
+									if (!ItemIdIsNormal(hiid))
+										continue;
+
+									htup.t_data     = (HeapTupleHeader)
+													  PageGetItem(hpage, hiid);
+									htup.t_len      = ItemIdGetLength(hiid);
+									htup.t_tableOid = RelationGetRelid(heap);
+									ItemPointerSet(&htup.t_self, hblkno, ho);
+
+									/*
+									 * Skip tuples whose xmin was never committed
+									 * (aborted insert).  Tuples with valid xmin
+									 * but committed xmax are conservatively kept;
+									 * they will be pruned on a future VACUUM.
+									 */
+									if (HeapTupleHeaderXminInvalid(htup.t_data))
+										continue;
+
+									val = heap_getattr(&htup, 1, tupdesc, &isnull);
+									if (isnull)
+										continue;
+
+									col_val = is_int4
+											  ? (int64) DatumGetInt32(val)
+											  : DatumGetInt64(val);
+									if (col_val == value)
+										has_live = true;
+								}
+
+								UnlockReleaseBuffer(hbuf);
+							}
+							/* hblkno >= heap_nblocks: truncated — omit from new_bm */
+
+							if (has_live)
+								roaring_bitmap_add(new_bm, (uint32) hblkno);
+
+							roaring_uint32_iterator_advance(&it);
+						}
+
+						new_card = roaring_cardinality32(new_bm);
+
+						if (new_card != old_card)
+						{
+							page_changed = true;
+
+							if (new_card == 0)
+							{
+								PageIndexTupleDelete(img, off);
+								((RoaringLeafSpecial *)
+								 PageGetSpecialPointer(img))->entry_count--;
+								off--;
+								maxoff--;
+							}
+							else
+							{
+								size_t new_bytes =
+									roaring_bitmap_portable_size_in_bytes(new_bm);
+
+								if (was_overflow &&
+									new_bytes > (size_t) max_inline)
+								{
+									/* Still overflow: write a new chain. */
+									size_t pfx_len = Min(
+										ROARING_OVERFLOW_INLINE_BYTES, new_bytes);
+									char  *bm_data = (char *) palloc(new_bytes);
+									RoaringOverflowEntry new_oe;
+
+									roaring_bitmap_portable_serialize(new_bm,
+																	  bm_data);
+									new_oe.value        = value;
+									new_oe.cardinality  = new_card;
+									new_oe.flags        = ROARING_ENTRY_OVERFLOW;
+									new_oe.total_len    = (uint32) new_bytes;
+									new_oe.overflow_blkno =
+										roaring_write_overflow_chain(
+											index, bm_data, new_bytes, pfx_len);
+									memcpy(new_oe.inline_prefix, bm_data, pfx_len);
+									pfree(bm_data);
+
+									if (!PageIndexTupleOverwrite(
+											img, off,
+											(Item) &new_oe,
+											sizeof(RoaringOverflowEntry)))
+										elog(ERROR,
+											 "pg_roaring_index: resummarize: "
+											 "PageIndexTupleOverwrite (overflow) "
+											 "failed for value " INT64_FORMAT,
+											 value);
+								}
+								else
+								{
+									/* Inline (or overflow shrunk to inline). */
+									Size new_sz = sizeof(RoaringLeafEntry)
+												  + new_bytes;
+									RoaringLeafEntry *new_le =
+										(RoaringLeafEntry *) palloc(new_sz);
+
+									new_le->value       = value;
+									new_le->cardinality = new_card;
+									new_le->flags       = ROARING_ENTRY_INLINE;
+									roaring_bitmap_portable_serialize(
+										new_bm, (char *)(new_le + 1));
+
+									if (!PageIndexTupleOverwrite(img, off,
+																  (Item) new_le,
+																  new_sz))
+										elog(ERROR,
+											 "pg_roaring_index: resummarize: "
+											 "PageIndexTupleOverwrite (inline) "
+											 "failed for value " INT64_FORMAT,
+											 value);
+									pfree(new_le);
+								}
+							}
+						}
+					} /* bm != NULL */
+				}
+				PG_FINALLY();
+				{
+					if (bm)    { roaring_bitmap_free(bm);    bm    = NULL; }
+					if (new_bm){ roaring_bitmap_free(new_bm);new_bm = NULL; }
+				}
+				PG_END_TRY();
+			} /* for off */
+
+			if (page_changed)
+				GenericXLogFinish((GenericXLogState *) xstate);
+			else
+				GenericXLogAbort((GenericXLogState *) xstate);
+			xstate = NULL;
+		}
+		PG_CATCH();
+		{
+			if (xstate)
+				GenericXLogAbort((GenericXLogState *) xstate);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		UnlockReleaseBuffer(leafbuf);
+		cur = next;
+	}
+}
+
+/* ----------------------------------------------------------------
  * roaring_vacuumcleanup
  *
  * Called after VACUUM completes its heap pass.  Handles crash recovery
@@ -1557,6 +1948,7 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	BlockNumber			 merging_head;
 	BlockNumber			 insert_head;
 	uint32				 insert_count;
+	uint16				 flags;
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
@@ -1569,20 +1961,29 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	merging_head = meta->pending_merging_head;
 	insert_head  = meta->pending_insert_head;
 	insert_count = meta->pending_insert_count;
+	flags        = meta->flags;
 	UnlockReleaseBuffer(metabuf);
 
 	if (merging_head != InvalidBlockNumber)
 	{
 		if (insert_head == merging_head)
 		{
-			/* Case 1: pending_insert_head still holds the chain.  Clear anchor. */
+			/*
+			 * Case 1: crash before Step C — pending_insert_head still holds
+			 * the old chain.  Clear both anchors.  Any carry pages recorded in
+			 * pending_carry_head are orphaned and will leak until REINDEX (no
+			 * FSM integration yet); clearing the field prevents repeated
+			 * spurious warnings on future vacuumcleanup calls.
+			 */
 			metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 			{
 				GenericXLogState *state = GenericXLogStart(index);
-				Page img = GenericXLogRegisterBuffer(state, metabuf, 0);
+				Page			  img   = GenericXLogRegisterBuffer(state, metabuf, 0);
+				RoaringMetaPageData *m  = RoaringPageGetMeta(img);
 
-				RoaringPageGetMeta(img)->pending_merging_head = InvalidBlockNumber;
+				m->pending_merging_head = InvalidBlockNumber;
+				m->pending_carry_head   = InvalidBlockNumber;
 				GenericXLogFinish(state);
 			}
 			UnlockReleaseBuffer(metabuf);
@@ -1650,6 +2051,13 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	}
 
 	roaring_merge_pending(info->index);
+
+	/* Dead-block cleanup only implemented for single-column lossy indexes.
+	 * For composite (natts==2) indexes the leaf value is a packed key that
+	 * doesn't match any single heap column — skip until that's implemented. */
+	if ((flags & ROARING_FLAG_LOSSY) &&
+		info->index->rd_att->natts == 1)
+		roaring_resummarize_lossy(info, stats);
 
 	return stats;
 }

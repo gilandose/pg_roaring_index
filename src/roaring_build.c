@@ -27,7 +27,7 @@ typedef struct RoaringBuildTuple
 typedef struct RoaringBuildState
 {
 	double				heap_tuples;
-	Oid					atttypid;   /* indexed column type, for datum extraction */
+	Oid					atttypid;   /* column 0 type: used only for single-column indexes */
 	long				nalloc;
 	long				ntuples;
 	RoaringBuildTuple  *tuples;
@@ -41,30 +41,70 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 					   bool *isnull, bool tupleIsAlive, void *state)
 {
 	RoaringBuildState  *bstate = (RoaringBuildState *) state;
-	int64				value;
+	int					natts   = index->rd_att->natts;
 
 	bstate->heap_tuples++;
 
-	if (isnull[0])
-		return;
-
-	value = (bstate->atttypid == INT4OID)
-			? (int64) DatumGetInt32(values[0])
-			: DatumGetInt64(values[0]);
-
-	if (bstate->ntuples == bstate->nalloc)
+	if (natts > 1)
 	{
-		bstate->nalloc *= 2;
-		bstate->tuples  = (RoaringBuildTuple *)
-						  repalloc(bstate->tuples,
-								   bstate->nalloc * sizeof(RoaringBuildTuple));
+		/* Multi-column: emit one (attno-namespaced key, tid) entry per column. */
+		int i;
+
+		for (i = 0; i < natts; i++)
+		{
+			int64 value;
+
+			if (isnull[i])
+				continue;
+
+			if (TupleDescAttr(index->rd_att, i)->atttypid != INT4OID)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("roaring multi-column indexes require all columns to be integer (int4)")));
+
+			value = ROARING_COL_KEY(i + 1, DatumGetInt32(values[i]));
+
+			if (bstate->ntuples == bstate->nalloc)
+			{
+				bstate->nalloc *= 2;
+				bstate->tuples  = (RoaringBuildTuple *)
+								  repalloc(bstate->tuples,
+										   bstate->nalloc * sizeof(RoaringBuildTuple));
+			}
+
+			bstate->tuples[bstate->ntuples].value = value;
+			bstate->tuples[bstate->ntuples].tid   =
+				((uint32) ItemPointerGetBlockNumber(tid) << 9) |
+				(uint32)(ItemPointerGetOffsetNumber(tid) - 1);
+			bstate->ntuples++;
+		}
+		return;
 	}
 
-	bstate->tuples[bstate->ntuples].value = value;
-	bstate->tuples[bstate->ntuples].tid   =
-		((uint32) ItemPointerGetBlockNumber(tid) << 9) |
-		(uint32)(ItemPointerGetOffsetNumber(tid) - 1);
-	bstate->ntuples++;
+	/* Single-column path. */
+	{
+		int64 value;
+
+		if (isnull[0])
+			return;
+		value = (bstate->atttypid == INT4OID)
+				? (int64) DatumGetInt32(values[0])
+				: DatumGetInt64(values[0]);
+
+		if (bstate->ntuples == bstate->nalloc)
+		{
+			bstate->nalloc *= 2;
+			bstate->tuples  = (RoaringBuildTuple *)
+							  repalloc(bstate->tuples,
+									   bstate->nalloc * sizeof(RoaringBuildTuple));
+		}
+
+		bstate->tuples[bstate->ntuples].value = value;
+		bstate->tuples[bstate->ntuples].tid   =
+			((uint32) ItemPointerGetBlockNumber(tid) << 9) |
+			(uint32)(ItemPointerGetOffsetNumber(tid) - 1);
+		bstate->ntuples++;
+	}
 }
 
 static int
@@ -117,6 +157,7 @@ write_metapage(Relation index,
 	meta->pending_insert_tail	 = pending_insert;
 	meta->pending_insert_count	 = 0;
 	meta->pending_merging_head	 = InvalidBlockNumber;
+	meta->pending_carry_head	 = InvalidBlockNumber;
 	meta->pending_delete_head	 = pending_delete;
 	meta->pending_delete_tail	 = pending_delete;
 	meta->pending_delete_count	 = 0;
@@ -200,7 +241,7 @@ write_leaf_and_dir_pages(Relation index,
 		long			   group_end  = i + 1;
 		long			   gc;
 		uint32			  *gtids;
-		roaring_bitmap_t  *bm;
+		roaring_bitmap_t * volatile bm = NULL;
 		long			   gi;
 		size_t			   bitmap_size;
 		Size			   entry_size;
@@ -217,6 +258,8 @@ write_leaf_and_dir_pages(Relation index,
 		bm = roaring_bitmap_of_ptr((size_t) gc, gtids);
 		pfree(gtids);
 
+		PG_TRY();
+		{
 		nentries++;
 		bitmap_size = roaring_bitmap_portable_size_in_bytes(bm);
 
@@ -322,6 +365,17 @@ write_leaf_and_dir_pages(Relation index,
 
 		leaf_spc->entry_count++;
 		roaring_bitmap_free(bm);
+		bm = NULL;
+		}
+		PG_FINALLY();
+		{
+			if (bm)
+			{
+				roaring_bitmap_free(bm);
+				bm = NULL;
+			}
+		}
+		PG_END_TRY();
 
 		i = group_end;
 	}
@@ -441,10 +495,10 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	bstate.heap_tuples = 0;
 	bstate.atttypid    = TupleDescAttr(index->rd_att, 0)->atttypid;
-	bstate.nalloc      = init_nalloc;
+	bstate.nalloc      = init_nalloc * index->rd_att->natts; /* natts entries per row */
 	bstate.ntuples     = 0;
 	bstate.tuples      = (RoaringBuildTuple *)
-						 palloc(init_nalloc * sizeof(RoaringBuildTuple));
+						 palloc(bstate.nalloc * sizeof(RoaringBuildTuple));
 
 	reltuples = table_index_build_scan(heap, index, indexInfo,
 									   true, true,
@@ -515,6 +569,7 @@ roaring_buildempty(Relation index)
 	meta->pending_insert_tail	  = pending_insert_blkno;
 	meta->pending_insert_count	  = 0;
 	meta->pending_merging_head	  = InvalidBlockNumber;
+	meta->pending_carry_head	  = InvalidBlockNumber;
 	meta->pending_delete_head	  = pending_delete_blkno;
 	meta->pending_delete_tail	  = pending_delete_blkno;
 	meta->pending_delete_count	  = 0;
@@ -578,30 +633,68 @@ roaring_build_callback_lossy(Relation index, ItemPointer tid, Datum *values,
 							  bool *isnull, bool tupleIsAlive, void *state)
 {
 	RoaringBuildState  *bstate = (RoaringBuildState *) state;
-	int64				value;
+	int					natts   = index->rd_att->natts;
 
 	bstate->heap_tuples++;
 
-	if (isnull[0])
-		return;
-
-	value = (bstate->atttypid == INT4OID)
-			? (int64) DatumGetInt32(values[0])
-			: DatumGetInt64(values[0]);
-
-	if (bstate->ntuples == bstate->nalloc)
+	if (natts > 1)
 	{
-		bstate->nalloc *= 2;
-		bstate->tuples  = (RoaringBuildTuple *)
-						  repalloc(bstate->tuples,
-								   bstate->nalloc * sizeof(RoaringBuildTuple));
+		int i;
+
+		for (i = 0; i < natts; i++)
+		{
+			int64 value;
+
+			if (isnull[i])
+				continue;
+
+			if (TupleDescAttr(index->rd_att, i)->atttypid != INT4OID)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("roaring multi-column indexes require all columns to be integer (int4)")));
+
+			value = ROARING_COL_KEY(i + 1, DatumGetInt32(values[i]));
+
+			if (bstate->ntuples == bstate->nalloc)
+			{
+				bstate->nalloc *= 2;
+				bstate->tuples  = (RoaringBuildTuple *)
+								  repalloc(bstate->tuples,
+										   bstate->nalloc * sizeof(RoaringBuildTuple));
+			}
+
+			bstate->tuples[bstate->ntuples].value = value;
+			bstate->tuples[bstate->ntuples].tid   =
+				(uint32) ItemPointerGetBlockNumber(tid);
+			bstate->ntuples++;
+		}
+		return;
 	}
 
-	bstate->tuples[bstate->ntuples].value = value;
-	/* Lossy: store block number only — many TIDs map to the same blkno. */
-	bstate->tuples[bstate->ntuples].tid   =
-		(uint32) ItemPointerGetBlockNumber(tid);
-	bstate->ntuples++;
+	/* Single-column path. */
+	{
+		int64 value;
+
+		if (isnull[0])
+			return;
+		value = (bstate->atttypid == INT4OID)
+				? (int64) DatumGetInt32(values[0])
+				: DatumGetInt64(values[0]);
+
+		if (bstate->ntuples == bstate->nalloc)
+		{
+			bstate->nalloc *= 2;
+			bstate->tuples  = (RoaringBuildTuple *)
+							  repalloc(bstate->tuples,
+									   bstate->nalloc * sizeof(RoaringBuildTuple));
+		}
+
+		bstate->tuples[bstate->ntuples].value = value;
+		/* Lossy: store block number only — many TIDs map to the same blkno. */
+		bstate->tuples[bstate->ntuples].tid   =
+			(uint32) ItemPointerGetBlockNumber(tid);
+		bstate->ntuples++;
+	}
 }
 
 IndexBuildResult *
@@ -635,10 +728,10 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	bstate.heap_tuples = 0;
 	bstate.atttypid    = TupleDescAttr(index->rd_att, 0)->atttypid;
-	bstate.nalloc      = init_nalloc;
+	bstate.nalloc      = init_nalloc * index->rd_att->natts;
 	bstate.ntuples     = 0;
 	bstate.tuples      = (RoaringBuildTuple *)
-						 palloc(init_nalloc * sizeof(RoaringBuildTuple));
+						 palloc(bstate.nalloc * sizeof(RoaringBuildTuple));
 
 	reltuples = table_index_build_scan(heap, index, indexInfo,
 									   true, true,

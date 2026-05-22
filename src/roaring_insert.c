@@ -36,7 +36,7 @@ roaring_pending_append(Relation index, RoaringPendingEntry *newentry)
 	Buffer				 tailbuf;
 	Page				 tailimg;
 	RoaringPendingSpecial *tailspc;
-	GenericXLogState	*state;
+	bool				 merged_unproductively = false;
 
 retry:
 	/* Step 1: lock metapage exclusively — held throughout. */
@@ -47,11 +47,29 @@ retry:
 	roaring_validate_metapage(index, meta);
 	tail_blkno = meta->pending_insert_tail;
 
-	if (meta->pending_insert_count >= meta->pending_merge_threshold)
+	if (!merged_unproductively &&
+		meta->pending_insert_count >= meta->pending_merge_threshold)
 	{
-		/* Release metapage before merge (merge also acquires it). */
+		uint32 count_before = meta->pending_insert_count;
+
 		UnlockReleaseBuffer(metabuf);
 		roaring_merge_pending(index);
+
+		/*
+		 * Re-read to detect an unproductive merge (all pending entries
+		 * belonged to in-progress transactions; none were flushed).  If so,
+		 * skip the threshold check on the next attempt to avoid an infinite
+		 * retry loop.
+		 */
+		{
+			Buffer tmp = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+
+			LockBuffer(tmp, BUFFER_LOCK_SHARE);
+			if (RoaringPageGetMeta(BufferGetPage(tmp))->pending_insert_count
+				>= count_before)
+				merged_unproductively = true;
+			UnlockReleaseBuffer(tmp);
+		}
 		goto retry;
 	}
 
@@ -94,22 +112,36 @@ retry:
 								sizeof(RoaringPendingEntry));
 		}
 
-		state   = GenericXLogStart(index);
+		{
+		GenericXLogState * volatile xstate = GenericXLogStart(index);
+		PG_TRY();
+		{
+			old_img = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
+												tailbuf, 0);
+			((RoaringPendingSpecial *)
+			 PageGetSpecialPointer(old_img))->next_page = newblkno;
 
-		old_img = GenericXLogRegisterBuffer(state, tailbuf, 0);
-		((RoaringPendingSpecial *)
-		 PageGetSpecialPointer(old_img))->next_page = newblkno;
+			new_img = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
+												newbuf, GENERIC_XLOG_FULL_IMAGE);
+			memcpy(new_img, newpage, BLCKSZ);
 
-		new_img = GenericXLogRegisterBuffer(state, newbuf,
-											GENERIC_XLOG_FULL_IMAGE);
-		memcpy(new_img, newpage, BLCKSZ);
+			meta_img = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
+												 metabuf, 0);
+			meta	 = RoaringPageGetMeta(meta_img);
+			meta->pending_insert_tail  = newblkno;
+			meta->pending_insert_count++;
 
-		meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
-		meta	 = RoaringPageGetMeta(meta_img);
-		meta->pending_insert_tail  = newblkno;
-		meta->pending_insert_count++;
-
-		GenericXLogFinish(state);
+			GenericXLogFinish((GenericXLogState *) xstate);
+			xstate = NULL;
+		}
+		PG_CATCH();
+		{
+			if (xstate)
+				GenericXLogAbort((GenericXLogState *) xstate);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		}
 
 		UnlockReleaseBuffer(newbuf);
 		UnlockReleaseBuffer(tailbuf);
@@ -119,30 +151,42 @@ retry:
 
 	/* Step 4: append entry to existing tail page and bump meta count. */
 	{
+		GenericXLogState * volatile xstate = GenericXLogStart(index);
 		Page				 meta_img;
 		RoaringPendingEntry *slot;
 
-		state	 = GenericXLogStart(index);
+		PG_TRY();
+		{
+			tailimg  = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
+												 tailbuf, 0);
+			tailspc  = (RoaringPendingSpecial *) PageGetSpecialPointer(tailimg);
+			slot	 = (RoaringPendingEntry *) PageGetContents(tailimg)
+					   + tailspc->entry_count;
+			*slot = *newentry;
+			if (!TransactionIdIsValid(tailspc->xmin_low) ||
+				TransactionIdPrecedes(newentry->xmin, tailspc->xmin_low))
+				tailspc->xmin_low = newentry->xmin;
+			if (newentry->value < tailspc->value_min)
+				tailspc->value_min = newentry->value;
+			if (newentry->value > tailspc->value_max)
+				tailspc->value_max = newentry->value;
+			tailspc->entry_count++;
+			((PageHeader) tailimg)->pd_lower += sizeof(RoaringPendingEntry);
 
-		tailimg  = GenericXLogRegisterBuffer(state, tailbuf, 0);
-		tailspc  = (RoaringPendingSpecial *) PageGetSpecialPointer(tailimg);
-		slot	 = (RoaringPendingEntry *) PageGetContents(tailimg)
-				   + tailspc->entry_count;
-		*slot = *newentry;
-		if (!TransactionIdIsValid(tailspc->xmin_low) ||
-			TransactionIdPrecedes(newentry->xmin, tailspc->xmin_low))
-			tailspc->xmin_low = newentry->xmin;
-		if (newentry->value < tailspc->value_min)
-			tailspc->value_min = newentry->value;
-		if (newentry->value > tailspc->value_max)
-			tailspc->value_max = newentry->value;
-		tailspc->entry_count++;
-		((PageHeader) tailimg)->pd_lower += sizeof(RoaringPendingEntry);
+			meta_img = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
+												 metabuf, 0);
+			RoaringPageGetMeta(meta_img)->pending_insert_count++;
 
-		meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
-		RoaringPageGetMeta(meta_img)->pending_insert_count++;
-
-		GenericXLogFinish(state);
+			GenericXLogFinish((GenericXLogState *) xstate);
+			xstate = NULL;
+		}
+		PG_CATCH();
+		{
+			if (xstate)
+				GenericXLogAbort((GenericXLogState *) xstate);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
 
 	UnlockReleaseBuffer(tailbuf);
@@ -167,6 +211,26 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 	/* HOT update: indexed column unchanged, no new index entry needed. */
 	if (indexUnchanged)
 		return false;
+
+	if (index->rd_att->natts > 1)
+	{
+		/* Multi-column: one pending entry per non-null column. */
+		uint32		linear_tid = ((uint32) ItemPointerGetBlockNumber(ht_ctid) << 9) |
+							   (uint32)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
+		TransactionId xmin = GetCurrentTransactionId();
+		int			  i;
+
+		for (i = 0; i < index->rd_att->natts; i++)
+		{
+			if (isnull[i])
+				continue;
+			entry.value      = ROARING_COL_KEY(i + 1, DatumGetInt32(values[i]));
+			entry.linear_tid = linear_tid;
+			entry.xmin       = xmin;
+			roaring_pending_append(index, &entry);
+		}
+		return false;
+	}
 
 	entry.value = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID)
 				  ? (int64) DatumGetInt32(values[0])
@@ -201,9 +265,28 @@ roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
 	if (indexUnchanged)
 		return false;
 
-	entry.value      = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID)
-					   ? (int64) DatumGetInt32(values[0])
-					   : DatumGetInt64(values[0]);
+	if (index->rd_att->natts > 1)
+	{
+		/* Multi-column lossy: one pending entry per non-null column. */
+		uint32		  blkno = (uint32) ItemPointerGetBlockNumber(ht_ctid);
+		TransactionId xmin  = GetCurrentTransactionId();
+		int			  i;
+
+		for (i = 0; i < index->rd_att->natts; i++)
+		{
+			if (isnull[i])
+				continue;
+			entry.value      = ROARING_COL_KEY(i + 1, DatumGetInt32(values[i]));
+			entry.linear_tid = blkno;
+			entry.xmin       = xmin;
+			roaring_pending_append(index, &entry);
+		}
+		return false;
+	}
+
+	entry.value = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID)
+				  ? (int64) DatumGetInt32(values[0])
+				  : DatumGetInt64(values[0]);
 	entry.linear_tid = (uint32) ItemPointerGetBlockNumber(ht_ctid);
 	entry.xmin       = GetCurrentTransactionId();
 

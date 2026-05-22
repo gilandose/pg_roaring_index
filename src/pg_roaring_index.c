@@ -3,8 +3,13 @@
 #include "access/amapi.h"
 #include "access/reloptions.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_opclass.h"
+#include "catalog/pg_type_d.h"
 #include "commands/vacuum.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 PG_MODULE_MAGIC;
 
@@ -20,6 +25,24 @@ PG_FUNCTION_INFO_V1(roaring_page_handler);
 bool
 roaring_validate(Oid opclassoid)
 {
+    HeapTuple       ht;
+    Form_pg_opclass opcform;
+    Oid             opcintype;
+
+    ht = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclassoid));
+    if (!HeapTupleIsValid(ht))
+        elog(ERROR, "cache lookup failed for operator class %u", opclassoid);
+    opcform   = (Form_pg_opclass) GETSTRUCT(ht);
+    opcintype = opcform->opcintype;
+    ReleaseSysCache(ht);
+
+    if (opcintype != INT8OID && opcintype != INT4OID)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                 errmsg("roaring index operator class must use type bigint or integer"),
+                 errdetail("Type %s is not supported.",
+                           format_type_be(opcintype))));
+
     return true;
 }
 
@@ -40,8 +63,8 @@ roaring_handler(PG_FUNCTION_ARGS)
     amroutine->amcanorderbyop = false;
     amroutine->amcanbackward  = false;
     amroutine->amcanunique    = false;
-    amroutine->amcanmulticol  = false;
-    amroutine->amoptionalkey  = false;
+    amroutine->amcanmulticol  = true;
+    amroutine->amoptionalkey  = true;   /* any column subset is valid */
     amroutine->amsearcharray  = true;
     amroutine->amsearchnulls  = false;
     amroutine->amstorage      = false;
@@ -99,8 +122,8 @@ roaring_page_handler(PG_FUNCTION_ARGS)
     amroutine->amcanorderbyop = false;
     amroutine->amcanbackward  = false;
     amroutine->amcanunique    = false;
-    amroutine->amcanmulticol  = false;
-    amroutine->amoptionalkey  = false;
+    amroutine->amcanmulticol  = true;
+    amroutine->amoptionalkey  = true;   /* any column subset is valid */
     amroutine->amsearcharray  = true;
     amroutine->amsearchnulls  = false;
     amroutine->amstorage      = false;

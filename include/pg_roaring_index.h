@@ -21,7 +21,7 @@
  * On-disk constants
  * ---------- */
 #define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
-#define ROARING_INDEX_VERSION       2   /* bumped when on-disk metapage layout changes */
+#define ROARING_INDEX_VERSION       3   /* bumped when on-disk metapage layout changes */
 
 /*
  * Expected CRoaring major version stored in the metapage.  If the index was
@@ -52,7 +52,7 @@
 #define ROARING_PAGE_SIZE           BLCKSZ
 #define ROARING_DIR_ENTRY_SIZE      16      /* int64 high_key + BlockNumber + 4-byte pad */
 #define ROARING_PENDING_ENTRY_SIZE  16      /* int64 + uint32 + TransactionId */
-#define ROARING_PENDING_PER_PAGE    510     /* (8192-24-16)/16 */
+#define ROARING_PENDING_PER_PAGE    508     /* (8192-24-32)/16; special is 32 bytes */
 
 /*
  * Overflow pages: bitmap bytes that don't fit on a single leaf page are
@@ -68,6 +68,31 @@
 
 /* Pending list merge threshold (entries); override via storage param later */
 #define ROARING_PENDING_MERGE_THRESHOLD 10000
+
+/*
+ * Per-column key encoding for multi-column indexes (natts > 1).
+ *
+ * Key layout: high 32 bits = attno (1-indexed column number),
+ *             low  32 bits = (uint32)(int32)column_value.
+ *
+ * Each column is independently stored with its own set of bitmaps, namespaced
+ * by attno.  A multi-column AND query collects one bitmap per scan key and
+ * intersects them inside the AM before returning a TIDBitmap to the executor.
+ *
+ * This encoding supports up to INT32_MAX columns and any int4 value per column.
+ * Single-column indexes (natts == 1) do NOT use this encoding — they store the
+ * raw int8/int4 value directly, preserving backward compatibility.
+ *
+ * Multi-type extension note: for non-integer column types, the low 32 bits
+ * would carry a type-specific integer representation (float4 bit pattern,
+ * hash, etc.).  The attno prefix keeps columns independent regardless of type.
+ */
+#define ROARING_COL_KEY(attno, val32) \
+    (((int64)(attno) << 32) | (uint64)(uint32)(int32)(val32))
+#define ROARING_COL_KEY_RANGE_LO(attno) \
+    ((int64)(attno) << 32)
+#define ROARING_COL_KEY_RANGE_HI(attno) \
+    (((int64)(attno) << 32) | INT64_C(0x00000000FFFFFFFF))
 
 /* Fixed block number for the metapage */
 #define ROARING_METAPAGE_BLKNO          0
@@ -101,6 +126,14 @@ typedef struct RoaringMetaPageData
      * Also acts as a mutex: a second merger that sees this set bails out.
      */
     BlockNumber pending_merging_head;
+
+    /*
+     * Set atomically with the first carry page in Step B of merge; cleared in
+     * Step C when the carry chain becomes the live pending_insert chain.
+     * If non-InvalidBlockNumber during Case 1 crash recovery, these carry pages
+     * are orphaned and will leak until REINDEX (no FSM yet).
+     */
+    BlockNumber pending_carry_head;
 
     BlockNumber pending_delete_head;    /* exact mode */
     BlockNumber pending_delete_tail;
@@ -179,7 +212,7 @@ typedef struct RoaringLeafSpecial
  * Fixed-size pending entry — 16 bytes, 510 per page.
  * Linearization: (blkno << 9) | (offset - 1)
  *   9 bits for offset: up to 511 tuples/page (MaxHeapTuplesPerPage ≈ 255)
- *   23 bits for blkno: up to 2^23 blocks = 64 TB table
+ *   23 bits for blkno: up to 2^23 blocks = 64 GiB table
  *   Container key = linear_tid >> 16 = blkno >> 7: 128 blocks per container
  * Reverse: blkno = linear_tid >> 9; offset = (linear_tid & 0x1FF) + 1
  */
@@ -192,6 +225,8 @@ typedef struct RoaringPendingEntry
 
 StaticAssertDecl(sizeof(RoaringPendingEntry) == ROARING_PENDING_ENTRY_SIZE,
                  "RoaringPendingEntry must be 16 bytes");
+StaticAssertDecl(MaxHeapTuplesPerPage <= 511,
+                 "offset field too narrow — rebuild with larger BLCKSZ or extend linearization");
 
 typedef struct RoaringPendingSpecial
 {
