@@ -5,7 +5,9 @@
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "utils/builtins.h"
+#include "common/hashfn.h"
 #include "utils/memutils.h"
+#include "utils/uuid.h"
 
 /*
  * roaring_datum_to_key32
@@ -31,6 +33,18 @@ roaring_datum_to_key32(Datum d, Oid typid)
 			return roaring_float4_to_key32(DatumGetFloat4(d));
 		case OIDOID:
 			return (int32) DatumGetObjectId(d);
+		case TEXTOID:
+		case VARCHAROID:
+		{
+			text *t = DatumGetTextPP(d);
+			return (int32) hash_bytes((const unsigned char *) VARDATA_ANY(t),
+									VARSIZE_ANY_EXHDR(t));
+		}
+		case UUIDOID:
+		{
+			pg_uuid_t *u = DatumGetUUIDP(d);
+			return (int32) hash_bytes(u->data, UUID_LEN);
+		}
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -66,6 +80,18 @@ roaring_datum_to_key64(Datum d, Oid typid)
 			return (int64) roaring_float4_to_key32(DatumGetFloat4(d));
 		case OIDOID:
 			return (int64)(uint32) DatumGetObjectId(d);
+		case TEXTOID:
+		case VARCHAROID:
+		{
+			text *t = DatumGetTextPP(d);
+			return (int64)(uint32) hash_bytes((const unsigned char *) VARDATA_ANY(t),
+											VARSIZE_ANY_EXHDR(t));
+		}
+		case UUIDOID:
+		{
+			pg_uuid_t *u = DatumGetUUIDP(d);
+			return (int64)(uint32) hash_bytes(u->data, UUID_LEN);
+		}
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

@@ -57,6 +57,17 @@ CREATE OPERATOR CLASS roaring_oid_tid_ops
     DEFAULT FOR TYPE oid USING roaring AS
     OPERATOR 1 =(oid, oid);
 
+-- Hash-keyed types (prototype): text, varchar, uuid.
+-- Keys are hash_any(bytes) → int32; collisions are theoretically possible
+-- but negligible at low-to-moderate cardinality (< ~100K distinct values).
+CREATE OPERATOR CLASS roaring_text_tid_ops
+    DEFAULT FOR TYPE text USING roaring AS
+    OPERATOR 1 =(text, text);
+
+CREATE OPERATOR CLASS roaring_uuid_tid_ops
+    DEFAULT FOR TYPE uuid USING roaring AS
+    OPERATOR 1 =(uuid, uuid);
+
 -- ----------------------------------------------------------------
 -- Lossy (page-level) opclasses — roaring_page_ops
 --
@@ -112,3 +123,11 @@ CREATE OPERATOR CLASS roaring_float4_page_ops
 CREATE OPERATOR CLASS roaring_oid_page_ops
     DEFAULT FOR TYPE oid USING roaring_lossy AS
     OPERATOR 1 =(oid, oid);
+
+CREATE OPERATOR CLASS roaring_text_page_ops
+    DEFAULT FOR TYPE text USING roaring_lossy AS
+    OPERATOR 1 =(text, text);
+
+CREATE OPERATOR CLASS roaring_uuid_page_ops
+    DEFAULT FOR TYPE uuid USING roaring_lossy AS
+    OPERATOR 1 =(uuid, uuid);

@@ -39,12 +39,15 @@ roaring_validate(Oid opclassoid)
     if (opcintype != INT8OID  && opcintype != INT4OID  &&
         opcintype != INT2OID  && opcintype != BOOLOID  &&
         opcintype != DATEOID  && opcintype != FLOAT4OID &&
-        opcintype != OIDOID)
+        opcintype != OIDOID   && opcintype != TEXTOID   &&
+        opcintype != UUIDOID)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
                  errmsg("roaring index operator class must use a supported type"),
                  errdetail("Type %s is not supported.  Supported types: "
-                           "bigint, integer, smallint, boolean, date, real, oid.",
+                           "bigint, integer, smallint, boolean, date, real, oid, "
+                           "text, uuid (text/uuid use hash keys — "
+                           "prototype quality, collisions theoretically possible).",
                            format_type_be(opcintype))));
 
     return true;
