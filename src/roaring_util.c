@@ -1,9 +1,79 @@
 #include "pg_roaring_index.h"
 
 #include "access/xloginsert.h"
+#include "catalog/pg_type_d.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "utils/builtins.h"
 #include "utils/memutils.h"
+
+/*
+ * roaring_datum_to_key32
+ *
+ * Convert a non-null Datum of a supported index type to an int32 key for use
+ * in ROARING_COL_KEY() (multi-column indexes).  The mapping is injective for
+ * all finite, non-NaN values within each type's domain.
+ */
+int32
+roaring_datum_to_key32(Datum d, Oid typid)
+{
+	switch (typid)
+	{
+		case INT4OID:
+			return DatumGetInt32(d);
+		case INT2OID:
+			return (int32) DatumGetInt16(d);
+		case BOOLOID:
+			return DatumGetBool(d) ? 1 : 0;
+		case DATEOID:
+			return DatumGetInt32(d);		/* DateADT is int32 */
+		case FLOAT4OID:
+			return roaring_float4_to_key32(DatumGetFloat4(d));
+		case OIDOID:
+			return (int32) DatumGetObjectId(d);
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("roaring index: unsupported column type %s for multi-column key",
+							format_type_be(typid))));
+			return 0;					/* unreachable */
+	}
+}
+
+/*
+ * roaring_datum_to_key64
+ *
+ * Convert a non-null Datum to an int64 leaf key for single-column indexes.
+ * INT8 is the only type with a full 64-bit key range; all others are
+ * sign/zero-extended to int64.
+ */
+int64
+roaring_datum_to_key64(Datum d, Oid typid)
+{
+	switch (typid)
+	{
+		case INT8OID:
+			return DatumGetInt64(d);
+		case INT4OID:
+			return (int64) DatumGetInt32(d);
+		case INT2OID:
+			return (int64) DatumGetInt16(d);
+		case BOOLOID:
+			return DatumGetBool(d) ? INT64_C(1) : INT64_C(0);
+		case DATEOID:
+			return (int64) DatumGetInt32(d);
+		case FLOAT4OID:
+			return (int64) roaring_float4_to_key32(DatumGetFloat4(d));
+		case OIDOID:
+			return (int64)(uint32) DatumGetObjectId(d);
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("roaring index: unsupported column type %s",
+							format_type_be(typid))));
+			return 0;
+	}
+}
 
 /*
  * roaring_validate_metapage

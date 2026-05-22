@@ -1,5 +1,7 @@
 #include "pg_roaring_index.h"
 
+#include <math.h>
+
 #include "access/generic_xlog.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -222,9 +224,14 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 
 		for (i = 0; i < index->rd_att->natts; i++)
 		{
+			Oid typid = TupleDescAttr(index->rd_att, i)->atttypid;
+
 			if (isnull[i])
 				continue;
-			entry.value      = ROARING_COL_KEY(i + 1, DatumGetInt32(values[i]));
+			if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
+				continue;
+			entry.value      = ROARING_COL_KEY(i + 1,
+											   roaring_datum_to_key32(values[i], typid));
 			entry.linear_tid = linear_tid;
 			entry.xmin       = xmin;
 			roaring_pending_append(index, &entry);
@@ -232,9 +239,13 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 		return false;
 	}
 
-	entry.value = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID)
-				  ? (int64) DatumGetInt32(values[0])
-				  : DatumGetInt64(values[0]);
+	{
+		Oid typid = TupleDescAttr(index->rd_att, 0)->atttypid;
+
+		if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[0])))
+			return false;
+		entry.value = roaring_datum_to_key64(values[0], typid);
+	}
 	entry.linear_tid = ((uint32) ItemPointerGetBlockNumber(ht_ctid) << 9) |
 					   (uint32)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
 	entry.xmin       = GetCurrentTransactionId();
@@ -274,9 +285,14 @@ roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
 
 		for (i = 0; i < index->rd_att->natts; i++)
 		{
+			Oid typid = TupleDescAttr(index->rd_att, i)->atttypid;
+
 			if (isnull[i])
 				continue;
-			entry.value      = ROARING_COL_KEY(i + 1, DatumGetInt32(values[i]));
+			if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
+				continue;
+			entry.value      = ROARING_COL_KEY(i + 1,
+											   roaring_datum_to_key32(values[i], typid));
 			entry.linear_tid = blkno;
 			entry.xmin       = xmin;
 			roaring_pending_append(index, &entry);
@@ -284,9 +300,13 @@ roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
 		return false;
 	}
 
-	entry.value = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID)
-				  ? (int64) DatumGetInt32(values[0])
-				  : DatumGetInt64(values[0]);
+	{
+		Oid typid = TupleDescAttr(index->rd_att, 0)->atttypid;
+
+		if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[0])))
+			return false;
+		entry.value = roaring_datum_to_key64(values[0], typid);
+	}
 	entry.linear_tid = (uint32) ItemPointerGetBlockNumber(ht_ctid);
 	entry.xmin       = GetCurrentTransactionId();
 

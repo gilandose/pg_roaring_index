@@ -4,6 +4,7 @@
 #include "access/htup_details.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/index.h"
 #include "catalog/pg_type_d.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -1648,7 +1649,8 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	Relation			 index        = info->index;
 	Relation			 heap         = info->heaprel;
 	TupleDesc			 tupdesc;
-	bool				 is_int4;
+	Oid					 col_typid;
+	AttrNumber			 heap_attnum;
 	BlockNumber			 heap_nblocks;
 	BlockNumber			 leftmost, cur;
 	Buffer				 metabuf;
@@ -1657,7 +1659,11 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		return;
 
 	tupdesc      = RelationGetDescr(heap);
-	is_int4      = (TupleDescAttr(index->rd_att, 0)->atttypid == INT4OID);
+	col_typid    = TupleDescAttr(index->rd_att, 0)->atttypid;
+	{
+		IndexInfo *ii = BuildIndexInfo(index);
+		heap_attnum  = ii->ii_IndexAttrNumbers[0];  /* 1-based heap column */
+	}
 	heap_nblocks = RelationGetNumberOfBlocks(heap);
 
 	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
@@ -1784,13 +1790,12 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 									if (HeapTupleHeaderXminInvalid(htup.t_data))
 										continue;
 
-									val = heap_getattr(&htup, 1, tupdesc, &isnull);
+									val = heap_getattr(&htup, heap_attnum,
+													   tupdesc, &isnull);
 									if (isnull)
 										continue;
 
-									col_val = is_int4
-											  ? (int64) DatumGetInt32(val)
-											  : DatumGetInt64(val);
+									col_val = roaring_datum_to_key64(val, col_typid);
 									if (col_val == value)
 										has_live = true;
 								}

@@ -254,6 +254,25 @@ typedef struct RoaringOverflowSpecial
  * ---------- */
 
 /*
+ * roaring_float4_to_key32 — map a float4 to a stable int32 equality key.
+ *
+ * Uses the raw IEEE 754 bit pattern, with one adjustment: both +0.0 and -0.0
+ * map to the same key (0), matching float4eq semantics.  NaN values are NOT
+ * handled here — callers must skip NaN before calling this function.
+ */
+static inline int32
+roaring_float4_to_key32(float4 f)
+{
+	uint32 bits;
+
+	memcpy(&bits, &f, sizeof(bits));
+	/* ±0.0 → same key (clear sign bit check on the remaining 31 bits) */
+	if ((bits & UINT32_C(0x7FFFFFFF)) == 0)
+		return 0;
+	return (int32) bits;
+}
+
+/*
  * roaring_cardinality32 — return bitmap cardinality as uint32.
  * Assert it fits: a roaring32 bitmap can theoretically hold all 2^32 values,
  * which is UINT32_MAX+1 and would silently truncate.  In practice our TID
@@ -313,6 +332,20 @@ extern BlockNumber roaring_write_overflow_chain(Relation index,
                                                 size_t prefix_len);
 extern roaring_bitmap_t *roaring_read_overflow_bitmap(
     Relation index, const RoaringOverflowEntry *oe);
+
+/*
+ * roaring_datum_to_key32 — convert a Datum of supported type to an int32
+ * index key for use in the low 32 bits of ROARING_COL_KEY() (multi-column).
+ *
+ * roaring_datum_to_key64 — convert a Datum of supported type to an int64
+ * index key for single-column indexes.
+ *
+ * Supported types: INT8, INT4, INT2, BOOL, DATE, FLOAT4, OID.
+ * Callers must skip NULL datums before calling these functions.
+ * For FLOAT4: callers must also skip NaN (use roaring_float4_to_key32 guard).
+ */
+extern int32  roaring_datum_to_key32(Datum d, Oid typid);
+extern int64  roaring_datum_to_key64(Datum d, Oid typid);
 
 /* roaring_vacuum.c — also called from roaring_insert for back-pressure */
 extern void roaring_merge_pending(Relation index);

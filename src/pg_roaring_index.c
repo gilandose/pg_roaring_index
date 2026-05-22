@@ -36,11 +36,15 @@ roaring_validate(Oid opclassoid)
     opcintype = opcform->opcintype;
     ReleaseSysCache(ht);
 
-    if (opcintype != INT8OID && opcintype != INT4OID)
+    if (opcintype != INT8OID  && opcintype != INT4OID  &&
+        opcintype != INT2OID  && opcintype != BOOLOID  &&
+        opcintype != DATEOID  && opcintype != FLOAT4OID &&
+        opcintype != OIDOID)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-                 errmsg("roaring index operator class must use type bigint or integer"),
-                 errdetail("Type %s is not supported.",
+                 errmsg("roaring index operator class must use a supported type"),
+                 errdetail("Type %s is not supported.  Supported types: "
+                           "bigint, integer, smallint, boolean, date, real, oid.",
                            format_type_be(opcintype))));
 
     return true;

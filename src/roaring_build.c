@@ -1,5 +1,7 @@
 #include "pg_roaring_index.h"
 
+#include <math.h>
+
 #include "access/tableam.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_type_d.h"
@@ -52,17 +54,16 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 
 		for (i = 0; i < natts; i++)
 		{
-			int64 value;
+			Oid		typid = TupleDescAttr(index->rd_att, i)->atttypid;
+			int64	value;
 
 			if (isnull[i])
 				continue;
 
-			if (TupleDescAttr(index->rd_att, i)->atttypid != INT4OID)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("roaring multi-column indexes require all columns to be integer (int4)")));
+			if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
+				continue;			/* NaN is not equality-indexable */
 
-			value = ROARING_COL_KEY(i + 1, DatumGetInt32(values[i]));
+			value = ROARING_COL_KEY(i + 1, roaring_datum_to_key32(values[i], typid));
 
 			if (bstate->ntuples == bstate->nalloc)
 			{
@@ -87,9 +88,11 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 
 		if (isnull[0])
 			return;
-		value = (bstate->atttypid == INT4OID)
-				? (int64) DatumGetInt32(values[0])
-				: DatumGetInt64(values[0]);
+
+		if (bstate->atttypid == FLOAT4OID && isnan(DatumGetFloat4(values[0])))
+			return;					/* NaN is not equality-indexable */
+
+		value = roaring_datum_to_key64(values[0], bstate->atttypid);
 
 		if (bstate->ntuples == bstate->nalloc)
 		{
@@ -643,17 +646,16 @@ roaring_build_callback_lossy(Relation index, ItemPointer tid, Datum *values,
 
 		for (i = 0; i < natts; i++)
 		{
-			int64 value;
+			Oid		typid = TupleDescAttr(index->rd_att, i)->atttypid;
+			int64	value;
 
 			if (isnull[i])
 				continue;
 
-			if (TupleDescAttr(index->rd_att, i)->atttypid != INT4OID)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("roaring multi-column indexes require all columns to be integer (int4)")));
+			if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
+				continue;
 
-			value = ROARING_COL_KEY(i + 1, DatumGetInt32(values[i]));
+			value = ROARING_COL_KEY(i + 1, roaring_datum_to_key32(values[i], typid));
 
 			if (bstate->ntuples == bstate->nalloc)
 			{
@@ -677,9 +679,11 @@ roaring_build_callback_lossy(Relation index, ItemPointer tid, Datum *values,
 
 		if (isnull[0])
 			return;
-		value = (bstate->atttypid == INT4OID)
-				? (int64) DatumGetInt32(values[0])
-				: DatumGetInt64(values[0]);
+
+		if (bstate->atttypid == FLOAT4OID && isnan(DatumGetFloat4(values[0])))
+			return;
+
+		value = roaring_datum_to_key64(values[0], bstate->atttypid);
 
 		if (bstate->ntuples == bstate->nalloc)
 		{

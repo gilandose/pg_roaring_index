@@ -32,6 +32,31 @@ CREATE OPERATOR CLASS roaring_int4_tid_ops
 ALTER OPERATOR FAMILY roaring_int4_tid_ops USING roaring ADD
     OPERATOR 1 =(int4, int8);
 
+CREATE OPERATOR CLASS roaring_int2_tid_ops
+    DEFAULT FOR TYPE int2 USING roaring AS
+    OPERATOR 1 =(int2, int2);
+
+-- Cross-type: smallint col compared to integer/bigint literals
+ALTER OPERATOR FAMILY roaring_int2_tid_ops USING roaring ADD
+    OPERATOR 1 =(int2, int4),
+    OPERATOR 1 =(int2, int8);
+
+CREATE OPERATOR CLASS roaring_bool_tid_ops
+    DEFAULT FOR TYPE bool USING roaring AS
+    OPERATOR 1 =(boolean, boolean);
+
+CREATE OPERATOR CLASS roaring_date_tid_ops
+    DEFAULT FOR TYPE date USING roaring AS
+    OPERATOR 1 =(date, date);
+
+CREATE OPERATOR CLASS roaring_float4_tid_ops
+    DEFAULT FOR TYPE float4 USING roaring AS
+    OPERATOR 1 =(float4, float4);
+
+CREATE OPERATOR CLASS roaring_oid_tid_ops
+    DEFAULT FOR TYPE oid USING roaring AS
+    OPERATOR 1 =(oid, oid);
+
 -- ----------------------------------------------------------------
 -- Lossy (page-level) opclasses — roaring_page_ops
 --
@@ -63,3 +88,27 @@ CREATE OPERATOR CLASS roaring_int4_page_ops
 
 ALTER OPERATOR FAMILY roaring_int4_page_ops USING roaring_lossy ADD
     OPERATOR 1 =(int4, int8);
+
+CREATE OPERATOR CLASS roaring_int2_page_ops
+    DEFAULT FOR TYPE int2 USING roaring_lossy AS
+    OPERATOR 1 =(int2, int2);
+
+ALTER OPERATOR FAMILY roaring_int2_page_ops USING roaring_lossy ADD
+    OPERATOR 1 =(int2, int4),
+    OPERATOR 1 =(int2, int8);
+
+CREATE OPERATOR CLASS roaring_bool_page_ops
+    DEFAULT FOR TYPE bool USING roaring_lossy AS
+    OPERATOR 1 =(boolean, boolean);
+
+CREATE OPERATOR CLASS roaring_date_page_ops
+    DEFAULT FOR TYPE date USING roaring_lossy AS
+    OPERATOR 1 =(date, date);
+
+CREATE OPERATOR CLASS roaring_float4_page_ops
+    DEFAULT FOR TYPE float4 USING roaring_lossy AS
+    OPERATOR 1 =(float4, float4);
+
+CREATE OPERATOR CLASS roaring_oid_page_ops
+    DEFAULT FOR TYPE oid USING roaring_lossy AS
+    OPERATOR 1 =(oid, oid);

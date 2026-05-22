@@ -1,5 +1,7 @@
 #include "pg_roaring_index.h"
 
+#include <math.h>
+
 #include "access/relscan.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -8,6 +10,7 @@
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/array.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -576,12 +579,18 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 				if (k->sk_flags & SK_SEARCHARRAY)
 				{
+					Oid		col_typid = TupleDescAttr(index->rd_att,
+													  k->sk_attno - 1)->atttypid;
 					ArrayType *arr = DatumGetArrayTypeP(k->sk_argument);
 					Datum	  *elems;
 					bool	  *nulls;
 					int		   nelems, i;
+					int16	   typlen;
+					bool	   typbyval;
+					char	   typalign;
 
-					deconstruct_array(arr, INT4OID, 4, true, 'i',
+					get_typlenbyvalalign(col_typid, &typlen, &typbyval, &typalign);
+					deconstruct_array(arr, col_typid, typlen, typbyval, typalign,
 									  &elems, &nulls, &nelems);
 					col_bm = roaring_bitmap_create();
 
@@ -592,8 +601,12 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 						if (nulls[i])
 							continue;
+						if (col_typid == FLOAT4OID &&
+							isnan(DatumGetFloat4(elems[i])))
+							continue;
 						col_key = ROARING_COL_KEY(k->sk_attno,
-												   DatumGetInt32(elems[i]));
+												   roaring_datum_to_key32(elems[i],
+																		   col_typid));
 						vbm = lookup_value_as_bitmap(index, root_blkno, col_key);
 						if (pending_count > 0 || merging_head != InvalidBlockNumber)
 						{
@@ -618,23 +631,36 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 				}
 				else
 				{
-					int64 col_key = ROARING_COL_KEY(k->sk_attno,
-													 DatumGetInt32(k->sk_argument));
+					Oid		col_typid = TupleDescAttr(index->rd_att,
+													  k->sk_attno - 1)->atttypid;
+					int64	col_key;
 
-					col_bm = lookup_value_as_bitmap(index, root_blkno, col_key);
-					if (pending_count > 0 || merging_head != InvalidBlockNumber)
+					if (col_typid == FLOAT4OID &&
+						isnan(DatumGetFloat4(k->sk_argument)))
 					{
-						roaring_bitmap_t *pbm =
-							pending_chain_as_bitmap(index, pending_head,
-													 col_key, snapshot);
-						roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
-						roaring_bitmap_free(pbm);
-						if (merging_head != InvalidBlockNumber)
+						/* NaN never equals anything; skip key entirely. */
+						col_bm = roaring_bitmap_create();
+					}
+					else
+					{
+						col_key = ROARING_COL_KEY(k->sk_attno,
+												   roaring_datum_to_key32(k->sk_argument,
+																		   col_typid));
+						col_bm = lookup_value_as_bitmap(index, root_blkno, col_key);
+						if (pending_count > 0 || merging_head != InvalidBlockNumber)
 						{
-							pbm = pending_chain_as_bitmap(index, merging_head,
-														   col_key, snapshot);
+							roaring_bitmap_t *pbm =
+								pending_chain_as_bitmap(index, pending_head,
+														 col_key, snapshot);
 							roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
 							roaring_bitmap_free(pbm);
+							if (merging_head != InvalidBlockNumber)
+							{
+								pbm = pending_chain_as_bitmap(index, merging_head,
+															   col_key, snapshot);
+								roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
+								roaring_bitmap_free(pbm);
+							}
 						}
 					}
 				}
@@ -681,23 +707,20 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		ScanKey key      = &scan->keyData[0];
 		Oid		atttypid = TupleDescAttr(index->rd_att, 0)->atttypid;
 
-#define ROARING_DATUM_TO_INT64(d) \
-	((atttypid == INT4OID) ? (int64) DatumGetInt32(d) : DatumGetInt64(d))
-
 		if (key->sk_flags & SK_SEARCHARRAY)
 		{
 			ArrayType *arr = DatumGetArrayTypeP(key->sk_argument);
 			Datum	  *elems;
 			bool	  *nulls;
 			int		   nelems, i;
+			int16	   typlen;
+			bool	   typbyval;
+			char	   typalign;
 			roaring_bitmap_t * volatile bm = NULL;
 
-			if (atttypid == INT4OID)
-				deconstruct_array(arr, INT4OID, 4, true, 'i',
-								  &elems, &nulls, &nelems);
-			else
-				deconstruct_array(arr, INT8OID, 8, true, 'd',
-								  &elems, &nulls, &nelems);
+			get_typlenbyvalalign(atttypid, &typlen, &typbyval, &typalign);
+			deconstruct_array(arr, atttypid, typlen, typbyval, typalign,
+							  &elems, &nulls, &nelems);
 
 			PG_TRY();
 			{
@@ -707,7 +730,9 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 					if (nulls[i])
 						continue;
-					v = ROARING_DATUM_TO_INT64(elems[i]);
+					if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(elems[i])))
+						continue;
+					v = roaring_datum_to_key64(elems[i], atttypid);
 
 					bm = lookup_value_as_bitmap(index, root_blkno, v);
 					if (pending_count > 0 || merging_head != InvalidBlockNumber)
@@ -742,7 +767,12 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		else
 		{
 			roaring_bitmap_t * volatile bm = NULL;
-			int64 scan_value = ROARING_DATUM_TO_INT64(key->sk_argument);
+			int64 scan_value;
+
+			if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(key->sk_argument)))
+				goto single_exact_done;
+
+			scan_value = roaring_datum_to_key64(key->sk_argument, atttypid);
 
 			PG_TRY();
 			{
@@ -772,8 +802,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			}
 			PG_END_TRY();
 		}
-
-#undef ROARING_DATUM_TO_INT64
+		single_exact_done:;
 	}
 
 	if (tid_count > 0)
@@ -881,12 +910,18 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 
 				if (k->sk_flags & SK_SEARCHARRAY)
 				{
+					Oid		col_typid = TupleDescAttr(index->rd_att,
+													  k->sk_attno - 1)->atttypid;
 					ArrayType *arr = DatumGetArrayTypeP(k->sk_argument);
 					Datum	  *elems;
 					bool	  *nulls;
 					int		   nelems, i;
+					int16	   typlen;
+					bool	   typbyval;
+					char	   typalign;
 
-					deconstruct_array(arr, INT4OID, 4, true, 'i',
+					get_typlenbyvalalign(col_typid, &typlen, &typbyval, &typalign);
+					deconstruct_array(arr, col_typid, typlen, typbyval, typalign,
 									  &elems, &nulls, &nelems);
 					col_bm = roaring_bitmap_create();
 
@@ -897,8 +932,12 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 
 						if (nulls[i])
 							continue;
+						if (col_typid == FLOAT4OID &&
+							isnan(DatumGetFloat4(elems[i])))
+							continue;
 						col_key = ROARING_COL_KEY(k->sk_attno,
-												   DatumGetInt32(elems[i]));
+												   roaring_datum_to_key32(elems[i],
+																		   col_typid));
 						vbm = lookup_value_as_bitmap_lossy(index, root_blkno, col_key);
 						if (pending_count > 0 || merging_head != InvalidBlockNumber)
 						{
@@ -923,23 +962,35 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 				}
 				else
 				{
-					int64 col_key = ROARING_COL_KEY(k->sk_attno,
-													 DatumGetInt32(k->sk_argument));
+					Oid		col_typid = TupleDescAttr(index->rd_att,
+													  k->sk_attno - 1)->atttypid;
+					int64	col_key;
 
-					col_bm = lookup_value_as_bitmap_lossy(index, root_blkno, col_key);
-					if (pending_count > 0 || merging_head != InvalidBlockNumber)
+					if (col_typid == FLOAT4OID &&
+						isnan(DatumGetFloat4(k->sk_argument)))
 					{
-						roaring_bitmap_t *pbm =
-							pending_chain_as_bitmap_lossy(index, pending_head,
-														   col_key, snapshot);
-						roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
-						roaring_bitmap_free(pbm);
-						if (merging_head != InvalidBlockNumber)
+						col_bm = roaring_bitmap_create();
+					}
+					else
+					{
+						col_key = ROARING_COL_KEY(k->sk_attno,
+												   roaring_datum_to_key32(k->sk_argument,
+																		   col_typid));
+						col_bm = lookup_value_as_bitmap_lossy(index, root_blkno, col_key);
+						if (pending_count > 0 || merging_head != InvalidBlockNumber)
 						{
-							pbm = pending_chain_as_bitmap_lossy(index, merging_head,
-																 col_key, snapshot);
+							roaring_bitmap_t *pbm =
+								pending_chain_as_bitmap_lossy(index, pending_head,
+															   col_key, snapshot);
 							roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
 							roaring_bitmap_free(pbm);
+							if (merging_head != InvalidBlockNumber)
+							{
+								pbm = pending_chain_as_bitmap_lossy(index, merging_head,
+																	 col_key, snapshot);
+								roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
+								roaring_bitmap_free(pbm);
+							}
 						}
 					}
 				}
@@ -980,23 +1031,20 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 		ScanKey key      = &scan->keyData[0];
 		Oid		atttypid = TupleDescAttr(index->rd_att, 0)->atttypid;
 
-#define ROARING_DATUM_TO_INT64_LOSSY(d) \
-	((atttypid == INT4OID) ? (int64) DatumGetInt32(d) : DatumGetInt64(d))
-
 		if (key->sk_flags & SK_SEARCHARRAY)
 		{
 			ArrayType *arr = DatumGetArrayTypeP(key->sk_argument);
 			Datum	  *elems;
 			bool	  *nulls;
 			int		   nelems, i;
+			int16	   typlen;
+			bool	   typbyval;
+			char	   typalign;
 			roaring_bitmap_t * volatile bm = NULL;
 
-			if (atttypid == INT4OID)
-				deconstruct_array(arr, INT4OID, 4, true, 'i',
-								  &elems, &nulls, &nelems);
-			else
-				deconstruct_array(arr, INT8OID, 8, true, 'd',
-								  &elems, &nulls, &nelems);
+			get_typlenbyvalalign(atttypid, &typlen, &typbyval, &typalign);
+			deconstruct_array(arr, atttypid, typlen, typbyval, typalign,
+							  &elems, &nulls, &nelems);
 
 			PG_TRY();
 			{
@@ -1006,7 +1054,9 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 
 					if (nulls[i])
 						continue;
-					v = ROARING_DATUM_TO_INT64_LOSSY(elems[i]);
+					if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(elems[i])))
+						continue;
+					v = roaring_datum_to_key64(elems[i], atttypid);
 
 					bm = lookup_value_as_bitmap_lossy(index, root_blkno, v);
 					if (pending_count > 0 || merging_head != InvalidBlockNumber)
@@ -1041,7 +1091,12 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 		else
 		{
 			roaring_bitmap_t * volatile bm = NULL;
-			int64 scan_value = ROARING_DATUM_TO_INT64_LOSSY(key->sk_argument);
+			int64 scan_value;
+
+			if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(key->sk_argument)))
+				goto single_lossy_done;
+
+			scan_value = roaring_datum_to_key64(key->sk_argument, atttypid);
 
 			PG_TRY();
 			{
@@ -1071,8 +1126,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 			}
 			PG_END_TRY();
 		}
-
-#undef ROARING_DATUM_TO_INT64_LOSSY
+		single_lossy_done:;
 	}
 
 	return ntids;
