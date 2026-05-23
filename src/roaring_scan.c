@@ -924,9 +924,10 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	Buffer				metabuf;
 	RoaringMetaPageData *meta;
 	BlockNumber			root_blkno;
-	BlockNumber			pending_head;
-	BlockNumber			merging_head;
+	BlockNumber			insert_heads[ROARING_PENDING_SHARDS];
+	BlockNumber			merging_heads[ROARING_PENDING_SHARDS];
 	uint32				pending_count;
+	bool				any_pending;
 	Snapshot			snapshot;
 
 	ItemPointerData		tid_buf[ROARING_TID_BATCH];
@@ -946,22 +947,42 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	{
 		RoaringAmCache *cache = (RoaringAmCache *) index->rd_amcache;
 
-		if (cache != NULL &&
-			cache->pending_count == 0 &&
-			cache->merging_head == InvalidBlockNumber)
+		if (cache != NULL && cache->pending_count == 0)
 		{
-			Buffer     tmp     = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-			XLogRecPtr cur_lsn = BufferGetLSNAtomic(tmp);
+			bool	   any_merging = false;
+			int		   si;
 
-			ReleaseBuffer(tmp);
+			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+				if (cache->merging_head[si] != InvalidBlockNumber)
+				{ any_merging = true; break; }
 
-			if (cur_lsn == cache->meta_lsn)
+			if (!any_merging)
 			{
-				root_blkno    = cache->root_blkno;
-				pending_count = 0;
-				pending_head  = InvalidBlockNumber;
-				merging_head  = InvalidBlockNumber;
-				goto after_meta;
+				Buffer     tmp     = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+				XLogRecPtr cur_lsn = BufferGetLSNAtomic(tmp);
+
+				ReleaseBuffer(tmp);
+
+				if (cur_lsn == cache->meta_lsn)
+				{
+					int k;
+
+					root_blkno    = cache->root_blkno;
+					pending_count = 0;
+					for (k = 0; k < ROARING_PENDING_SHARDS; k++)
+					{
+						insert_heads[k]  = cache->insert_head[k];
+						merging_heads[k] = InvalidBlockNumber;
+					}
+					/*
+					 * insert_count is updated only on page extension, not on
+					 * every hot-path insert.  pending_count == 0 does NOT mean
+					 * the chains are empty.  Always walk the chains for
+					 * correctness; head pages are typically in shared_buffers.
+					 */
+					any_pending = true;
+					goto after_meta;
+				}
 			}
 		}
 
@@ -970,9 +991,18 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		meta = RoaringPageGetMeta(BufferGetPage(metabuf));
 		roaring_validate_metapage(index, meta);
 		root_blkno    = meta->root_directory_page;
-		pending_count = meta->pending_insert_count;
-		pending_head  = meta->pending_insert_head;
-		merging_head  = meta->pending_merging_head;
+		{
+			uint32 total = 0;
+			int    si;
+
+			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+			{
+				total               += meta->shards[si].insert_count;
+				insert_heads[si]     = meta->shards[si].insert_head;
+				merging_heads[si]    = meta->shards[si].merging_head;
+			}
+			pending_count = total;
+		}
 
 		if (cache == NULL)
 		{
@@ -981,12 +1011,30 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 									   sizeof(RoaringAmCache));
 			index->rd_amcache = cache;
 		}
+		{
+			int si;
+
+			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+			{
+				cache->insert_head[si]  = insert_heads[si];
+				cache->merging_head[si] = merging_heads[si];
+			}
+		}
 		cache->root_blkno    = root_blkno;
 		cache->total_entries = meta->total_entries;
 		cache->meta_lsn      = PageGetLSN(BufferGetPage(metabuf));
 		cache->pending_count = pending_count;
-		cache->merging_head  = merging_head;
 		UnlockReleaseBuffer(metabuf);
+
+		{
+			bool   any_merging = false;
+			int    si;
+
+			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+				if (merging_heads[si] != InvalidBlockNumber)
+				{ any_merging = true; break; }
+			any_pending = (pending_count > 0 || any_merging);
+		}
 	}
 	after_meta:;
 
@@ -1031,8 +1079,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			 * Not safe when pending_count > 0 — that column might have
 			 * freshly inserted rows not yet merged into the main index.
 			 */
-			if (order[ki].card_est == 0 &&
-				pending_count == 0 && merging_head == InvalidBlockNumber)
+			if (order[ki].card_est == 0 && !any_pending)
 			{
 				pfree(order);
 				return 0;
@@ -1094,16 +1141,21 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 								col_keys[m++] = col_keys[j];
 						nkeys = m;
 
-						if (pending_count > 0 || merging_head != InvalidBlockNumber)
+						if (any_pending)
 						{
+							int s;
+
 							pbms = palloc(nkeys * sizeof(roaring_bitmap_t *));
 							for (j = 0; j < nkeys; j++)
 								pbms[j] = roaring_bitmap_create();
-							pending_chain_fill_values(index, pending_head,
-													  col_keys, pbms, nkeys, snapshot);
-							if (merging_head != InvalidBlockNumber)
-								pending_chain_fill_values(index, merging_head,
+							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+							{
+								pending_chain_fill_values(index, insert_heads[s],
 														  col_keys, pbms, nkeys, snapshot);
+								if (merging_heads[s] != InvalidBlockNumber)
+									pending_chain_fill_values(index, merging_heads[s],
+															  col_keys, pbms, nkeys, snapshot);
+							}
 						}
 
 						{
@@ -1143,23 +1195,28 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					}
 					else
 					{
+						int s;
+
 						col_key = ROARING_COL_KEY(k->sk_attno,
 												   roaring_datum_to_key32(k->sk_argument,
 																		   col_typid));
 						col_bm = lookup_value_as_bitmap(index, root_blkno, col_key);
-						if (pending_count > 0 || merging_head != InvalidBlockNumber)
+						if (any_pending)
 						{
-							roaring_bitmap_t *pbm =
-								pending_chain_as_bitmap(index, pending_head,
-														 col_key, snapshot);
-							roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
-							roaring_bitmap_free(pbm);
-							if (merging_head != InvalidBlockNumber)
+							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 							{
-								pbm = pending_chain_as_bitmap(index, merging_head,
-															   col_key, snapshot);
+								roaring_bitmap_t *pbm =
+									pending_chain_as_bitmap(index, insert_heads[s],
+															 col_key, snapshot);
 								roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
 								roaring_bitmap_free(pbm);
+								if (merging_heads[s] != InvalidBlockNumber)
+								{
+									pbm = pending_chain_as_bitmap(index, merging_heads[s],
+																   col_key, snapshot);
+									roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
+									roaring_bitmap_free(pbm);
+								}
 							}
 						}
 					}
@@ -1259,18 +1316,23 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 				PG_TRY();
 				{
-					if (pending_count > 0 || merging_head != InvalidBlockNumber)
+					if (any_pending)
 					{
+						int s;
+
 						pbms = palloc(nvals * sizeof(roaring_bitmap_t *));
 						for (j = 0; j < nvals; j++)
 							pbms[j] = roaring_bitmap_create();
-						pending_chain_fill_values(index, pending_head,
-												  vals, (roaring_bitmap_t **) pbms,
-												  nvals, snapshot);
-						if (merging_head != InvalidBlockNumber)
-							pending_chain_fill_values(index, merging_head,
+						for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+						{
+							pending_chain_fill_values(index, insert_heads[s],
 													  vals, (roaring_bitmap_t **) pbms,
 													  nvals, snapshot);
+							if (merging_heads[s] != InvalidBlockNumber)
+								pending_chain_fill_values(index, merging_heads[s],
+														  vals, (roaring_bitmap_t **) pbms,
+														  nvals, snapshot);
+						}
 					}
 
 					bms = palloc(nvals * sizeof(roaring_bitmap_t *));
@@ -1334,17 +1396,24 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			PG_TRY();
 			{
 				bm = lookup_value_as_bitmap(index, root_blkno, scan_value);
-				if (pending_count > 0 || merging_head != InvalidBlockNumber)
+				if (any_pending)
 				{
-					roaring_bitmap_t *pbm =
-						pending_chain_as_bitmap(index, pending_head, scan_value, snapshot);
-					roaring_bitmap_or_inplace(bm, pbm);
-					roaring_bitmap_free(pbm);
-					if (merging_head != InvalidBlockNumber)
+					int s;
+
+					for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 					{
-						pbm = pending_chain_as_bitmap(index, merging_head, scan_value, snapshot);
+						roaring_bitmap_t *pbm =
+							pending_chain_as_bitmap(index, insert_heads[s],
+													scan_value, snapshot);
 						roaring_bitmap_or_inplace(bm, pbm);
 						roaring_bitmap_free(pbm);
+						if (merging_heads[s] != InvalidBlockNumber)
+						{
+							pbm = pending_chain_as_bitmap(index, merging_heads[s],
+														  scan_value, snapshot);
+							roaring_bitmap_or_inplace(bm, pbm);
+							roaring_bitmap_free(pbm);
+						}
 					}
 				}
 				ntids = emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count,
@@ -1385,9 +1454,10 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 	Buffer				metabuf;
 	RoaringMetaPageData *meta;
 	BlockNumber			root_blkno;
-	BlockNumber			pending_head;
-	BlockNumber			merging_head;
+	BlockNumber			insert_heads[ROARING_PENDING_SHARDS];
+	BlockNumber			merging_heads[ROARING_PENDING_SHARDS];
 	uint32				pending_count;
+	bool				any_pending;
 	Snapshot			snapshot;
 
 	if (so->bitmap_loaded)
@@ -1404,22 +1474,42 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 	{
 		RoaringAmCache *cache = (RoaringAmCache *) index->rd_amcache;
 
-		if (cache != NULL &&
-			cache->pending_count == 0 &&
-			cache->merging_head == InvalidBlockNumber)
+		if (cache != NULL && cache->pending_count == 0)
 		{
-			Buffer     tmp     = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-			XLogRecPtr cur_lsn = BufferGetLSNAtomic(tmp);
+			bool	   any_merging = false;
+			int		   si;
 
-			ReleaseBuffer(tmp);
+			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+				if (cache->merging_head[si] != InvalidBlockNumber)
+				{ any_merging = true; break; }
 
-			if (cur_lsn == cache->meta_lsn)
+			if (!any_merging)
 			{
-				root_blkno    = cache->root_blkno;
-				pending_count = 0;
-				pending_head  = InvalidBlockNumber;
-				merging_head  = InvalidBlockNumber;
-				goto after_meta_lossy;
+				Buffer     tmp     = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+				XLogRecPtr cur_lsn = BufferGetLSNAtomic(tmp);
+
+				ReleaseBuffer(tmp);
+
+				if (cur_lsn == cache->meta_lsn)
+				{
+					int k;
+
+					root_blkno    = cache->root_blkno;
+					pending_count = 0;
+					for (k = 0; k < ROARING_PENDING_SHARDS; k++)
+					{
+						insert_heads[k]  = cache->insert_head[k];
+						merging_heads[k] = InvalidBlockNumber;
+					}
+					/*
+					 * insert_count is updated only on page extension, not on
+					 * every hot-path insert. pending_count == 0 does NOT mean
+					 * the chains are empty. Always walk the chains for
+					 * correctness; head pages are typically in shared_buffers.
+					 */
+					any_pending = true;
+					goto after_meta_lossy;
+				}
 			}
 		}
 
@@ -1428,9 +1518,18 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 		meta = RoaringPageGetMeta(BufferGetPage(metabuf));
 		roaring_validate_metapage(index, meta);
 		root_blkno    = meta->root_directory_page;
-		pending_count = meta->pending_insert_count;
-		pending_head  = meta->pending_insert_head;
-		merging_head  = meta->pending_merging_head;
+		{
+			uint32 total = 0;
+			int    si;
+
+			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+			{
+				total               += meta->shards[si].insert_count;
+				insert_heads[si]     = meta->shards[si].insert_head;
+				merging_heads[si]    = meta->shards[si].merging_head;
+			}
+			pending_count = total;
+		}
 
 		if (cache == NULL)
 		{
@@ -1439,12 +1538,30 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 									   sizeof(RoaringAmCache));
 			index->rd_amcache = cache;
 		}
+		{
+			int si;
+
+			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+			{
+				cache->insert_head[si]  = insert_heads[si];
+				cache->merging_head[si] = merging_heads[si];
+			}
+		}
 		cache->root_blkno    = root_blkno;
 		cache->total_entries = meta->total_entries;
 		cache->meta_lsn      = PageGetLSN(BufferGetPage(metabuf));
 		cache->pending_count = pending_count;
-		cache->merging_head  = merging_head;
 		UnlockReleaseBuffer(metabuf);
+
+		{
+			bool   any_merging = false;
+			int    si;
+
+			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+				if (merging_heads[si] != InvalidBlockNumber)
+				{ any_merging = true; break; }
+			any_pending = (pending_count > 0 || any_merging);
+		}
 	}
 	after_meta_lossy:;
 
@@ -1479,8 +1596,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 			}
 
 			/* Absent key, no pending list → AND result is empty. */
-			if (order[ki].card_est == 0 &&
-				pending_count == 0 && merging_head == InvalidBlockNumber)
+			if (order[ki].card_est == 0 && !any_pending)
 			{
 				pfree(order);
 				return 0;
@@ -1542,16 +1658,21 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 								col_keys[m++] = col_keys[j];
 						nkeys = m;
 
-						if (pending_count > 0 || merging_head != InvalidBlockNumber)
+						if (any_pending)
 						{
+							int s;
+
 							pbms = palloc(nkeys * sizeof(roaring_bitmap_t *));
 							for (j = 0; j < nkeys; j++)
 								pbms[j] = roaring_bitmap_create();
-							pending_chain_fill_values(index, pending_head,
-													  col_keys, pbms, nkeys, snapshot);
-							if (merging_head != InvalidBlockNumber)
-								pending_chain_fill_values(index, merging_head,
+							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+							{
+								pending_chain_fill_values(index, insert_heads[s],
 														  col_keys, pbms, nkeys, snapshot);
+								if (merging_heads[s] != InvalidBlockNumber)
+									pending_chain_fill_values(index, merging_heads[s],
+															  col_keys, pbms, nkeys, snapshot);
+							}
 						}
 
 						{
@@ -1595,19 +1716,24 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 												   roaring_datum_to_key32(k->sk_argument,
 																		   col_typid));
 						col_bm = lookup_value_as_bitmap_lossy(index, root_blkno, col_key);
-						if (pending_count > 0 || merging_head != InvalidBlockNumber)
+						if (any_pending)
 						{
-							roaring_bitmap_t *pbm =
-								pending_chain_as_bitmap_lossy(index, pending_head,
-															   col_key, snapshot);
-							roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
-							roaring_bitmap_free(pbm);
-							if (merging_head != InvalidBlockNumber)
+							int s;
+
+							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 							{
-								pbm = pending_chain_as_bitmap_lossy(index, merging_head,
-																	 col_key, snapshot);
+								roaring_bitmap_t *pbm =
+									pending_chain_as_bitmap_lossy(index, insert_heads[s],
+																   col_key, snapshot);
 								roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
 								roaring_bitmap_free(pbm);
+								if (merging_heads[s] != InvalidBlockNumber)
+								{
+									pbm = pending_chain_as_bitmap_lossy(
+										index, merging_heads[s], col_key, snapshot);
+									roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
+									roaring_bitmap_free(pbm);
+								}
 							}
 						}
 					}
@@ -1700,18 +1826,23 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 
 				PG_TRY();
 				{
-					if (pending_count > 0 || merging_head != InvalidBlockNumber)
+					if (any_pending)
 					{
+						int s;
+
 						pbms = palloc(nvals * sizeof(roaring_bitmap_t *));
 						for (j = 0; j < nvals; j++)
 							pbms[j] = roaring_bitmap_create();
-						pending_chain_fill_values(index, pending_head,
-												  vals, (roaring_bitmap_t **) pbms,
-												  nvals, snapshot);
-						if (merging_head != InvalidBlockNumber)
-							pending_chain_fill_values(index, merging_head,
+						for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+						{
+							pending_chain_fill_values(index, insert_heads[s],
 													  vals, (roaring_bitmap_t **) pbms,
 													  nvals, snapshot);
+							if (merging_heads[s] != InvalidBlockNumber)
+								pending_chain_fill_values(index, merging_heads[s],
+														  vals, (roaring_bitmap_t **) pbms,
+														  nvals, snapshot);
+						}
 					}
 
 					bms = palloc(nvals * sizeof(roaring_bitmap_t *));
@@ -1773,17 +1904,24 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 			PG_TRY();
 			{
 				bm = lookup_value_as_bitmap_lossy(index, root_blkno, scan_value);
-				if (pending_count > 0 || merging_head != InvalidBlockNumber)
+				if (any_pending)
 				{
-					roaring_bitmap_t *pbm =
-						pending_chain_as_bitmap_lossy(index, pending_head, scan_value, snapshot);
-					roaring_bitmap_or_inplace(bm, pbm);
-					roaring_bitmap_free(pbm);
-					if (merging_head != InvalidBlockNumber)
+					int s;
+
+					for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 					{
-						pbm = pending_chain_as_bitmap_lossy(index, merging_head, scan_value, snapshot);
+						roaring_bitmap_t *pbm =
+							pending_chain_as_bitmap_lossy(index, insert_heads[s],
+														  scan_value, snapshot);
 						roaring_bitmap_or_inplace(bm, pbm);
 						roaring_bitmap_free(pbm);
+						if (merging_heads[s] != InvalidBlockNumber)
+						{
+							pbm = pending_chain_as_bitmap_lossy(index, merging_heads[s],
+																scan_value, snapshot);
+							roaring_bitmap_or_inplace(bm, pbm);
+							roaring_bitmap_free(pbm);
+						}
 					}
 				}
 				ntids = emit_lossy_bitmap_to_tbm(bm, tbm);

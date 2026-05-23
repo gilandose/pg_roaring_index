@@ -134,6 +134,14 @@ roaring_validate_metapage(Relation index, const RoaringMetaPageData *meta)
 			 RelationGetRelationName(index),
 			 (unsigned) meta->croaring_format_version,
 			 (unsigned) ROARING_EXPECTED_FORMAT_VERSION);
+
+	if (meta->num_shards != ROARING_PENDING_SHARDS)
+		elog(ERROR,
+			 "pg_roaring_index: index \"%s\" has %u pending shards, "
+			 "but this build expects %u — REINDEX required",
+			 RelationGetRelationName(index),
+			 (unsigned) meta->num_shards,
+			 (unsigned) ROARING_PENDING_SHARDS);
 }
 
 /*

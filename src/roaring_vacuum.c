@@ -451,14 +451,13 @@ roaring_merge_pending(Relation index)
 	Buffer				 metabuf;
 	Page				 metapage;
 	RoaringMetaPageData *meta;
-	BlockNumber			 old_head;
+	BlockNumber			 frozen_heads[ROARING_PENDING_SHARDS];
+	bool				 shard_active[ROARING_PENDING_SHARDS];
+	int					 nactive;
 	BlockNumber			 root_dir;
 	BlockNumber			 leftmost_leaf;
 	BlockNumber			 rightmost_leaf;
 	uint32				 old_total_entries;
-	BlockNumber			 new_pending_blkno;
-	Buffer				 new_pending_buf;
-	Page				 new_pending_page;
 	int					 ncarry			 = 0;
 	BlockNumber			 carry_head		 = InvalidBlockNumber;
 	BlockNumber			 carry_tail_blkno = InvalidBlockNumber;
@@ -469,20 +468,16 @@ roaring_merge_pending(Relation index)
 	uint32				 new_total_entries;
 
 	/*
-	 * Step 1: crash-safe merge setup.
+	 * Step 1: crash-safe merge setup for all shards.
 	 *
 	 * Ordering (critical for correctness):
-	 *   A. WAL: set pending_merging_head = old pending_insert_head.
+	 *   A. WAL: for each active shard set shards[i].merging_head = insert_head.
 	 *      Crash-recovery anchor and concurrent-merger mutex.
-	 *   B. While still holding metapage exclusive, scan the frozen old chain
-	 *      for in-progress-xid entries; write them to new carry pages.
-	 *      These entries are not ready to merge (their transactions may commit
-	 *      or abort later) but must not be discarded — if dropped here and the
-	 *      owning transaction later commits, those TIDs would be permanently lost.
-	 *   C. WAL: swap pending_insert_head/tail to carry chain (or a fresh empty
-	 *      page if no in-progress entries).  New inserts now land here.
-	 *      pending_insert_count = ncarry.
-	 *   D. After ALL leaf writes, WAL: clear pending_merging_head, update
+	 *   B. While still holding metapage exclusive, scan each frozen shard
+	 *      chain for in-progress-xid entries; write them to new carry pages.
+	 *   C. For each active shard: WAL: swap insert_head/tail to carry chain
+	 *      (shard 0) or fresh empty page (shards 1..N-1).
+	 *   D. After ALL leaf writes: WAL: clear all merging_heads, update
 	 *      root_directory_page and total_entries atomically.
 	 */
 	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
@@ -491,87 +486,108 @@ roaring_merge_pending(Relation index)
 	meta     = RoaringPageGetMeta(metapage);
 	roaring_validate_metapage(index, meta);
 
-	/* Bail if another merger is already active (pending_merging_head is set). */
-	if (meta->pending_merging_head != InvalidBlockNumber)
+	nactive = 0;
+	for (i = 0; i < ROARING_PENDING_SHARDS; i++)
+	{
+		shard_active[i]  = false;
+		frozen_heads[i]  = InvalidBlockNumber;
+
+		if (meta->shards[i].merging_head != InvalidBlockNumber)
+		{
+			/* Another merger is active (or crash recovery needed) — bail. */
+			UnlockReleaseBuffer(metabuf);
+			return;
+		}
+		if (meta->shards[i].insert_count == 0)
+			continue;
+
+		shard_active[i] = true;
+		frozen_heads[i] = meta->shards[i].insert_head;
+		nactive++;
+	}
+
+	if (nactive == 0)
 	{
 		UnlockReleaseBuffer(metabuf);
 		return;
 	}
 
-	if (meta->pending_insert_count == 0)
-	{
-		UnlockReleaseBuffer(metabuf);
-		return;
-	}
-
-	old_head		  = meta->pending_insert_head;
 	root_dir		  = meta->root_directory_page;
 	leftmost_leaf	  = meta->leftmost_leaf_page;
 	rightmost_leaf	  = meta->rightmost_leaf_page;
 	old_total_entries = meta->total_entries;
 
-	/* Step A: record pending_merging_head — this is the crash-recovery anchor. */
+	/* Step A: atomically set merging_head for all active shards. */
 	{
-		GenericXLogState *state = GenericXLogStart(index);
+		GenericXLogState *state    = GenericXLogStart(index);
 		Page			  meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
+		RoaringMetaPageData *m     = RoaringPageGetMeta(meta_img);
 
-		RoaringPageGetMeta(meta_img)->pending_merging_head = old_head;
+		for (i = 0; i < ROARING_PENDING_SHARDS; i++)
+			if (shard_active[i])
+				m->shards[i].merging_head = frozen_heads[i];
 		GenericXLogFinish(state);
 	}
 
 	/*
-	 * Step B: scan the frozen old chain for in-progress entries and carry them
-	 * forward.  We hold the metapage exclusive throughout, so no new inserts
-	 * can reach the old chain and it is effectively frozen.
-	 *
-	 * Reading pending pages with a share lock while holding the metapage
-	 * exclusive is safe: no other backend holds pending-page locks while
-	 * acquiring the metapage (roaring_pending_append takes metapage first,
-	 * then pending page).
+	 * Step B: scan all frozen shard chains for in-progress entries.
+	 * We hold metapage EX throughout; new inserts wanting SHARE will wait.
+	 * Reading pending pages SHARE under metapage EX is safe: the new insert
+	 * hot path only holds tail EX (no metapage), so it can interleave but
+	 * cannot deadlock — it finishes and releases tail before merge can block
+	 * on the same page.
 	 */
 	{
 		RoaringPendingEntry *carry     = NULL;
 		int					 carry_cap = 0;
-		BlockNumber			 cscan	   = old_head;
+		int					 s;
 
-		while (cscan != InvalidBlockNumber)
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 		{
-			Buffer				  pb;
-			Page				  pp;
-			RoaringPendingSpecial *pspc;
-			RoaringPendingEntry   *praw;
-			uint16				  k;
+			BlockNumber cscan;
 
-			pb   = ReadBuffer(index, cscan);
-			LockBuffer(pb, BUFFER_LOCK_SHARE);
-			pp   = BufferGetPage(pb);
-			pspc = (RoaringPendingSpecial *) PageGetSpecialPointer(pp);
-			praw = (RoaringPendingEntry *)   PageGetContents(pp);
+			if (!shard_active[s])
+				continue;
 
-			for (k = 0; k < pspc->entry_count; k++)
+			for (cscan = frozen_heads[s]; cscan != InvalidBlockNumber; )
 			{
-				TransactionId xmin = praw[k].xmin;
+				Buffer				  pb;
+				Page				  pp;
+				RoaringPendingSpecial *pspc;
+				RoaringPendingEntry   *praw;
+				uint16				  k;
 
-				if (!TransactionIdIsValid(xmin))					continue;
-				if (TransactionIdDidAbort(xmin))					continue;
-				if (TransactionIdIsCurrentTransactionId(xmin) ||
-					TransactionIdDidCommit(xmin))					continue;
+				pb   = ReadBuffer(index, cscan);
+				LockBuffer(pb, BUFFER_LOCK_SHARE);
+				pp   = BufferGetPage(pb);
+				pspc = (RoaringPendingSpecial *) PageGetSpecialPointer(pp);
+				praw = (RoaringPendingEntry *)   PageGetContents(pp);
 
-				/* In-progress: carry forward to new pending chain. */
-				if (ncarry == carry_cap)
+				for (k = 0; k < pspc->entry_count; k++)
 				{
-					carry_cap = (carry_cap == 0) ? 64 : carry_cap * 2;
-					carry	  = (RoaringPendingEntry *)
-								(carry == NULL
-								 ? palloc(carry_cap * sizeof(RoaringPendingEntry))
-								 : repalloc(carry,
-											carry_cap * sizeof(RoaringPendingEntry)));
-				}
-				carry[ncarry++] = praw[k];
-			}
+					TransactionId xmin = praw[k].xmin;
 
-			cscan = pspc->next_page;
-			UnlockReleaseBuffer(pb);
+					if (!TransactionIdIsValid(xmin))				continue;
+					if (TransactionIdDidAbort(xmin))				continue;
+					if (TransactionIdIsCurrentTransactionId(xmin) ||
+						TransactionIdDidCommit(xmin))				continue;
+
+					/* In-progress: carry forward. */
+					if (ncarry == carry_cap)
+					{
+						carry_cap = (carry_cap == 0) ? 64 : carry_cap * 2;
+						carry	  = (RoaringPendingEntry *)
+									(carry == NULL
+									 ? palloc(carry_cap * sizeof(RoaringPendingEntry))
+									 : repalloc(carry,
+												carry_cap * sizeof(RoaringPendingEntry)));
+					}
+					carry[ncarry++] = praw[k];
+				}
+
+				cscan = pspc->next_page;
+				UnlockReleaseBuffer(pb);
+			}
 		}
 
 		if (ncarry > 0)
@@ -618,10 +634,9 @@ roaring_merge_pending(Relation index)
 				if (p == 0)
 				{
 					/*
-					 * Atomically record pending_carry_head in the metapage
-					 * within the same WAL record as the first carry page.
-					 * This ensures Case 1 crash recovery can locate orphaned
-					 * carry pages if we crash before Step C's metapage swap.
+					 * Atomically record carry_head in shard 0's slot and WAL
+					 * the first carry page.  Crash recovery uses this to locate
+					 * orphaned carry pages before Step C's metapage swap.
 					 */
 					GenericXLogState *cstate = GenericXLogStart(index);
 					Page carry_img = GenericXLogRegisterBuffer(cstate, cbufs[0],
@@ -629,7 +644,7 @@ roaring_merge_pending(Relation index)
 					Page meta_img  = GenericXLogRegisterBuffer(cstate, metabuf, 0);
 
 					memcpy(carry_img, cp, BLCKSZ);
-					RoaringPageGetMeta(meta_img)->pending_carry_head = cblknos[0];
+					RoaringPageGetMeta(meta_img)->shards[0].carry_head = cblknos[0];
 
 					GenericXLogFinish(cstate);
 					UnlockReleaseBuffer(cbufs[0]);
@@ -640,7 +655,7 @@ roaring_merge_pending(Relation index)
 				}
 			}
 
-			carry_head		= cblknos[0];
+			carry_head		 = cblknos[0];
 			carry_tail_blkno = cblknos[npages - 1];
 
 			pfree(cblknos);
@@ -650,70 +665,117 @@ roaring_merge_pending(Relation index)
 	}
 
 	/*
-	 * Step C: atomically swap pending_insert_head to the carry chain (if any
-	 * in-progress entries were found) or to a fresh empty page otherwise.
+	 * Step C: for each active shard, swap its insert chain to the carry chain
+	 * (shard 0 only, if carry entries exist) or a fresh empty page.
+	 * Each shard gets its own WAL record (2 buffers: new page + metapage)
+	 * to stay within MAX_GENERIC_XLOG_PAGES = 4.
 	 */
-	if (ncarry > 0)
 	{
-		/* Carry pages are already WAL'd; only the metapage needs updating. */
-		GenericXLogState *state	   = GenericXLogStart(index);
-		Page			  meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
+		int s;
 
-		meta					   = RoaringPageGetMeta(meta_img);
-		meta->pending_insert_head  = carry_head;
-		meta->pending_insert_tail  = carry_tail_blkno;
-		meta->pending_insert_count = (uint32) ncarry;
-		meta->pending_carry_head   = InvalidBlockNumber; /* carry chain is now live */
-
-		GenericXLogFinish(state);
-		UnlockReleaseBuffer(metabuf);
-	}
-	else
-	{
-		/* No in-progress entries: extend a fresh empty pending page. */
-		GenericXLogState *state = GenericXLogStart(index);
-		Page			  np_img, meta_img;
-
-		new_pending_buf   = roaring_extend_page(index);
-		new_pending_blkno = BufferGetBlockNumber(new_pending_buf);
-		new_pending_page  = BufferGetPage(new_pending_buf);
-		PageInit(new_pending_page, BLCKSZ, sizeof(RoaringPendingSpecial));
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 		{
-			RoaringPendingSpecial *spc =
-				(RoaringPendingSpecial *) PageGetSpecialPointer(new_pending_page);
-			spc->page_type	 = ROARING_PAGE_PENDING_INSERT;
-			spc->flags		 = 0;
-			spc->entry_count = 0;
-			spc->next_page	 = InvalidBlockNumber;
-			spc->xmin_low	 = InvalidTransactionId;
-			spc->_pad		 = 0;
-			spc->value_min	 = PG_INT64_MAX;
-			spc->value_max	 = PG_INT64_MIN;
+			GenericXLogState *state;
+			Page			  meta_img;
+			RoaringMetaPageData *m;
+
+			if (!shard_active[s])
+				continue;
+
+			if (s == 0 && ncarry > 0)
+			{
+				/* Shard 0 gets the carry chain (already WAL'd). */
+				state    = GenericXLogStart(index);
+				meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
+				m        = RoaringPageGetMeta(meta_img);
+				m->shards[0].insert_head  = carry_head;
+				m->shards[0].insert_tail  = carry_tail_blkno;
+				m->shards[0].insert_count = (uint32) ncarry;
+				m->shards[0].carry_head   = InvalidBlockNumber;
+				GenericXLogFinish(state);
+			}
+			else
+			{
+				/* Fresh empty pending page. */
+				Buffer				  npbuf;
+				BlockNumber			  npblkno;
+				Page				  nppage;
+				Page				  np_img;
+				RoaringPendingSpecial *npspc;
+
+				npbuf   = roaring_extend_page(index);
+				npblkno = BufferGetBlockNumber(npbuf);
+				nppage  = BufferGetPage(npbuf);
+				PageInit(nppage, BLCKSZ, sizeof(RoaringPendingSpecial));
+				npspc = (RoaringPendingSpecial *) PageGetSpecialPointer(nppage);
+				npspc->page_type   = ROARING_PAGE_PENDING_INSERT;
+				npspc->flags       = 0;
+				npspc->entry_count = 0;
+				npspc->next_page   = InvalidBlockNumber;
+				npspc->xmin_low    = InvalidTransactionId;
+				npspc->_pad        = 0;
+				npspc->value_min   = PG_INT64_MAX;
+				npspc->value_max   = PG_INT64_MIN;
+				((PageHeader) nppage)->pd_lower = SizeOfPageHeaderData;
+
+				state    = GenericXLogStart(index);
+				np_img   = GenericXLogRegisterBuffer(state, npbuf,
+													 GENERIC_XLOG_FULL_IMAGE);
+				memcpy(np_img, nppage, BLCKSZ);
+				meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
+				m        = RoaringPageGetMeta(meta_img);
+				m->shards[s].insert_head  = npblkno;
+				m->shards[s].insert_tail  = npblkno;
+				m->shards[s].insert_count = 0;
+				GenericXLogFinish(state);
+				UnlockReleaseBuffer(npbuf);
+			}
+		}
+	}
+
+	UnlockReleaseBuffer(metabuf);
+
+	/* ---- Step 2: collect entries from all frozen shard chains, sort. ---- */
+	{
+		int			 s;
+		Size		 cap		= 256;
+		int			 ntotal		= 0;
+		CollectedEntry *all_entries = (CollectedEntry *)
+									  palloc(cap * sizeof(CollectedEntry));
+
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			int			 shard_n;
+			CollectedEntry *shard_e;
+
+			if (!shard_active[s])
+				continue;
+
+			shard_e = collect_pending(index, frozen_heads[s], &shard_n);
+			if (ntotal + shard_n > (int) cap)
+			{
+				while (ntotal + shard_n > (int) cap)
+					cap *= 2;
+				all_entries = (CollectedEntry *)
+							  repalloc(all_entries, cap * sizeof(CollectedEntry));
+			}
+			memcpy(all_entries + ntotal, shard_e, shard_n * sizeof(CollectedEntry));
+			ntotal += shard_n;
+			pfree(shard_e);
 		}
 
-		np_img = GenericXLogRegisterBuffer(state, new_pending_buf,
-										   GENERIC_XLOG_FULL_IMAGE);
-		memcpy(np_img, new_pending_page, BLCKSZ);
+		if (ntotal > 1)
+			qsort(all_entries, ntotal, sizeof(CollectedEntry), cmp_collected);
 
-		meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
-		meta	 = RoaringPageGetMeta(meta_img);
-		meta->pending_insert_head  = new_pending_blkno;
-		meta->pending_insert_tail  = new_pending_blkno;
-		meta->pending_insert_count = 0;
-
-		GenericXLogFinish(state);
-		UnlockReleaseBuffer(new_pending_buf);
-		UnlockReleaseBuffer(metabuf);
+		entries  = all_entries;
+		nentries = ntotal;
 	}
 
-	/* ---- Step 2: collect and sort the old pending chain. ---- */
-	entries = collect_pending(index, old_head, &nentries);
 	if (nentries == 0)
 	{
 		/*
 		 * All pending entries were in-progress or aborted — nothing to merge.
-		 * We must still clear pending_merging_head; leaving it set causes all
-		 * subsequent merges to bail out and all scans to walk a stranded chain.
+		 * Clear all merging_heads so subsequent merges can proceed normally.
 		 */
 		pfree(entries);
 		metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
@@ -725,8 +787,12 @@ roaring_merge_pending(Relation index)
 			{
 				Page			  img = GenericXLogRegisterBuffer(
 					(GenericXLogState *) xstate, metabuf, 0);
+				RoaringMetaPageData *m = RoaringPageGetMeta(img);
+				int					  si;
 
-				RoaringPageGetMeta(img)->pending_merging_head = InvalidBlockNumber;
+				for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+					if (shard_active[si])
+						m->shards[si].merging_head = InvalidBlockNumber;
 				GenericXLogFinish((GenericXLogState *) xstate);
 				xstate = NULL;
 			}
@@ -1285,11 +1351,8 @@ roaring_merge_pending(Relation index)
 		root_dir = rebuild_directory(index, leftmost_leaf);
 
 	/*
-	 * Step D: atomically commit the merge — clear pending_merging_head and
+	 * Step D: atomically commit the merge — clear all active merging_heads and
 	 * update the directory pointer and entry count in a single WAL record.
-	 * After this WAL record is durable the merge is complete.  The old chain
-	 * starting at old_head is now unreachable and will be reclaimed on the
-	 * next REINDEX / amvacuumcleanup free-space pass.
 	 */
 	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
@@ -1300,12 +1363,15 @@ roaring_merge_pending(Relation index)
 			Page			  img = GenericXLogRegisterBuffer(
 				(GenericXLogState *) xstate, metabuf, 0);
 			RoaringMetaPageData *m  = RoaringPageGetMeta(img);
+			int					  si;
 
-			m->root_directory_page  = root_dir;
-			m->leftmost_leaf_page   = leftmost_leaf;
-			m->rightmost_leaf_page  = rightmost_leaf;
-			m->total_entries	    = new_total_entries;
-			m->pending_merging_head = InvalidBlockNumber; /* merge committed */
+			m->root_directory_page = root_dir;
+			m->leftmost_leaf_page  = leftmost_leaf;
+			m->rightmost_leaf_page = rightmost_leaf;
+			m->total_entries	   = new_total_entries;
+			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+				if (shard_active[si])
+					m->shards[si].merging_head = InvalidBlockNumber;
 
 			GenericXLogFinish((GenericXLogState *) xstate);
 			xstate = NULL;
@@ -1986,71 +2052,115 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
 	Relation			 index = info->index;
 	Buffer				 metabuf;
-	Page				 metapage;
 	RoaringMetaPageData *meta;
-	BlockNumber			 merging_head;
-	BlockNumber			 insert_head;
-	uint32				 insert_count;
+	BlockNumber			 merging_heads[ROARING_PENDING_SHARDS];
+	BlockNumber			 insert_heads[ROARING_PENDING_SHARDS];
+	uint32				 insert_counts[ROARING_PENDING_SHARDS];
 	uint16				 flags;
+	bool				 any_stuck = false;
+	int					 s;
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
-	/* Check for a stuck pending_merging_head left by a prior crash. */
-	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+	/* Read per-shard state; check for crash-left merging_heads. */
+	metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
-	metapage = BufferGetPage(metabuf);
-	meta     = RoaringPageGetMeta(metapage);
-	merging_head = meta->pending_merging_head;
-	insert_head  = meta->pending_insert_head;
-	insert_count = meta->pending_insert_count;
-	flags        = meta->flags;
+	meta    = RoaringPageGetMeta(BufferGetPage(metabuf));
+	roaring_validate_metapage(index, meta);
+	for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+	{
+		merging_heads[s]  = meta->shards[s].merging_head;
+		insert_heads[s]   = meta->shards[s].insert_head;
+		insert_counts[s]  = meta->shards[s].insert_count;
+		if (merging_heads[s] != InvalidBlockNumber)
+			any_stuck = true;
+	}
+	flags = meta->flags;
 	UnlockReleaseBuffer(metabuf);
 
-	if (merging_head != InvalidBlockNumber)
+	/*
+	 * Per-shard crash recovery.  PostgreSQL serializes VACUUM per relation,
+	 * so any set merging_head here is always crash recovery, never a live
+	 * concurrent merger.
+	 *
+	 * Case 1 (per shard): crash before Step C — shards[s].insert_head still
+	 *   equals merging_head.  Clear both anchors for this shard.
+	 *
+	 * Case 2 (per shard): crash after Step C — insert_head was already swapped
+	 *   to carry/fresh chain; old merging chain is stranded.  Fuse the two
+	 *   chains in one WAL record.
+	 */
+	if (any_stuck)
 	{
-		if (insert_head == merging_head)
+		/*
+		 * Case 1 shards: clear merging_head and carry_head in one WAL.
+		 * Case 2 shards: each gets its own 2-buffer WAL (tail page + metapage).
+		 */
+		bool case1_any = false;
+
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 		{
-			/*
-			 * Case 1: crash before Step C — pending_insert_head still holds
-			 * the old chain.  Clear both anchors.  Any carry pages recorded in
-			 * pending_carry_head are orphaned and will leak until REINDEX (no
-			 * FSM integration yet); clearing the field prevents repeated
-			 * spurious warnings on future vacuumcleanup calls.
-			 */
-			metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			if (merging_heads[s] == InvalidBlockNumber)
+				continue;
+			if (insert_heads[s] == merging_heads[s])
+				case1_any = true;
+		}
+
+		if (case1_any)
+		{
+			metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 			{
 				GenericXLogState *state = GenericXLogStart(index);
 				Page			  img   = GenericXLogRegisterBuffer(state, metabuf, 0);
 				RoaringMetaPageData *m  = RoaringPageGetMeta(img);
 
-				m->pending_merging_head = InvalidBlockNumber;
-				m->pending_carry_head   = InvalidBlockNumber;
+				for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+				{
+					if (merging_heads[s] == InvalidBlockNumber)
+						continue;
+					if (insert_heads[s] == merging_heads[s])
+					{
+						m->shards[s].merging_head = InvalidBlockNumber;
+						m->shards[s].carry_head   = InvalidBlockNumber;
+					}
+				}
 				GenericXLogFinish(state);
 			}
 			UnlockReleaseBuffer(metabuf);
 		}
-		else
+
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 		{
+			BlockNumber tail_blkno;
+			uint32		old_count;
+			Buffer		pb;
+			GenericXLogState *state;
+			Page		pb_img, meta_img;
+			RoaringMetaPageData *m;
+
+			if (merging_heads[s] == InvalidBlockNumber)
+				continue;
+			if (insert_heads[s] == merging_heads[s])
+				continue;	/* handled as Case 1 above */
+
 			/*
-			 * Case 2: carry chain is at pending_insert_head; old merging chain
-			 * is stranded at merging_head.  Walk old chain to its tail, link
-			 * carry chain onto it, re-route insert_head to old chain head.
+			 * Case 2: carry/fresh chain at insert_head; old merging chain
+			 * stranded at merging_heads[s].  Walk to its tail and fuse.
 			 */
-			BlockNumber tail_blkno = merging_head;
-			uint32		old_count  = 0;
+			tail_blkno = merging_heads[s];
+			old_count  = 0;
 
 			for (;;)
 			{
-				Buffer				  pb;
 				RoaringPendingSpecial *pspc;
-				BlockNumber			  next;
+				BlockNumber			   next;
 
 				pb   = ReadBuffer(index, tail_blkno);
 				LockBuffer(pb, BUFFER_LOCK_SHARE);
 				pspc = (RoaringPendingSpecial *)
-						   PageGetSpecialPointer(BufferGetPage(pb));
+						PageGetSpecialPointer(BufferGetPage(pb));
 				next      = pspc->next_page;
 				old_count += pspc->entry_count;
 				UnlockReleaseBuffer(pb);
@@ -2060,50 +2170,32 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 				tail_blkno = next;
 			}
 
-			/*
-			 * Fuse tail-link and metapage re-route into one WAL record so
-			 * there is no window where pending_merging_head is cleared but
-			 * the tail link has not yet been written (which would cause
-			 * pending_insert_count double-counting on crash recovery).
-			 */
-			{
-				Buffer				  pb;
-				GenericXLogState	 *state;
-				Page				  pb_img;
-				Page				  meta_img;
-				RoaringMetaPageData  *m;
+			pb      = ReadBuffer(index, tail_blkno);
+			metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			LockBuffer(pb,      BUFFER_LOCK_EXCLUSIVE);
+			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 
-				pb      = ReadBuffer(index, tail_blkno);
-				metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			state    = GenericXLogStart(index);
+			pb_img   = GenericXLogRegisterBuffer(state, pb,      0);
+			meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
 
-				LockBuffer(pb,      BUFFER_LOCK_EXCLUSIVE);
-				LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+			((RoaringPendingSpecial *)
+			 PageGetSpecialPointer(pb_img))->next_page = insert_heads[s];
 
-				state    = GenericXLogStart(index);
-				pb_img   = GenericXLogRegisterBuffer(state, pb,      0);
-				meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
+			m = RoaringPageGetMeta(meta_img);
+			m->shards[s].insert_head  = merging_heads[s];
+			m->shards[s].insert_count = old_count + insert_counts[s];
+			m->shards[s].merging_head = InvalidBlockNumber;
 
-				((RoaringPendingSpecial *)
-				     PageGetSpecialPointer(pb_img))->next_page = insert_head;
-
-				m = RoaringPageGetMeta(meta_img);
-				m->pending_insert_head  = merging_head;
-				m->pending_insert_count = old_count + insert_count;
-				m->pending_merging_head = InvalidBlockNumber;
-
-				GenericXLogFinish(state);
-
-				UnlockReleaseBuffer(pb);
-				UnlockReleaseBuffer(metabuf);
-			}
+			GenericXLogFinish(state);
+			UnlockReleaseBuffer(pb);
+			UnlockReleaseBuffer(metabuf);
 		}
 	}
 
 	roaring_merge_pending(info->index);
 
-	/* Dead-block cleanup only implemented for single-column lossy indexes.
-	 * For composite (natts==2) indexes the leaf value is a packed key that
-	 * doesn't match any single heap column — skip until that's implemented. */
+	/* Dead-block cleanup only for single-column lossy indexes. */
 	if ((flags & ROARING_FLAG_LOSSY) &&
 		info->index->rd_att->natts == 1)
 		roaring_resummarize_lossy(info, stats);

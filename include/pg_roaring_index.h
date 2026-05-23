@@ -21,7 +21,7 @@
  * On-disk constants
  * ---------- */
 #define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
-#define ROARING_INDEX_VERSION       4   /* bumped when on-disk metapage layout changes */
+#define ROARING_INDEX_VERSION       5   /* bumped for pending-list sharding */
 
 /*
  * Expected CRoaring major version stored in the metapage.  If the index was
@@ -67,6 +67,24 @@
 #define ROARING_PENDING_MERGE_THRESHOLD 10000
 
 /*
+ * Number of independent pending-list shards.  Writers pick a shard by
+ * ROARING_VALUE_SHARD(value) and compete only with other writers that hash
+ * to the same shard.  Must be a power-of-two so that modulo is a bitmask.
+ * Changing this constant requires a REINDEX (on-disk version bump covers it).
+ */
+#define ROARING_PENDING_SHARDS      8
+#define ROARING_SHARD_MASK          (ROARING_PENDING_SHARDS - 1)
+
+/*
+ * Shard selection: XOR the high and low 32 bits of the int64 key so that
+ * multi-column keys (attno packed in the high 32 bits) and sequential
+ * values both distribute across shards.
+ */
+#define ROARING_VALUE_SHARD(value) \
+    ((int) (((uint32)((uint64)(value) >> 32) ^ (uint32)(uint64)(value)) \
+            & ROARING_SHARD_MASK))
+
+/*
  * Per-column key encoding for multi-column indexes (natts > 1).
  *
  * Key layout: high 32 bits = attno (1-indexed column number),
@@ -98,39 +116,40 @@
  * On-disk page structures
  * ---------- */
 
+/*
+ * Per-shard state stored in the metapage.  Each shard is an independent
+ * pending-insert chain; writers pick a shard via ROARING_VALUE_SHARD() and
+ * compete only with other writers mapping to the same shard.
+ *
+ * insert_head / insert_tail / insert_count: the live append chain.
+ * merging_head: set at merge start; acts as a mutex (second merger bails out).
+ *               Concurrent scans must walk both insert_head and merging_head.
+ * carry_head:   Case-2 crash-recovery anchor (set in Step B, cleared in Step C).
+ */
+typedef struct RoaringPendingShard
+{
+    BlockNumber insert_head;
+    BlockNumber insert_tail;
+    uint32      insert_count;   /* updated on page extension; approximate between */
+    BlockNumber merging_head;
+    BlockNumber carry_head;
+} RoaringPendingShard;          /* 20 bytes */
+
 typedef struct RoaringMetaPageData
 {
     uint32      magic;
     uint16      version;
     uint16      flags;
     uint16      croaring_format_version;  /* ROARING_EXPECTED_FORMAT_VERSION */
-    uint16      _reserved;               /* explicit pad; keep next field 4-byte aligned */
+    uint8       num_shards;              /* = ROARING_PENDING_SHARDS; validated on open */
+    uint8       _reserved;
 
     BlockNumber root_directory_page;
     BlockNumber leftmost_leaf_page;
     BlockNumber rightmost_leaf_page;
 
-    BlockNumber pending_insert_head;
-    BlockNumber pending_insert_tail;
-    uint32      pending_insert_count;
-
-    /*
-     * Set to the pending_insert_head at the start of a merge; cleared when
-     * the merge commits.  Crash recovery: if non-InvalidBlockNumber, a prior
-     * merge was interrupted; re-merge from this chain on next vacuum.
-     * Concurrent scans: amgetbitmap must walk both pending_insert_head and
-     * pending_merging_head chains to avoid stale-read gaps.
-     * Also acts as a mutex: a second merger that sees this set bails out.
-     */
-    BlockNumber pending_merging_head;
-
-    /*
-     * Set atomically with the first carry page in Step B of merge; cleared in
-     * Step C when the carry chain becomes the live pending_insert chain.
-     * If non-InvalidBlockNumber during Case 1 crash recovery, these carry pages
-     * are orphaned and will leak until REINDEX (no FSM yet).
-     */
-    BlockNumber pending_carry_head;
+    /* Per-shard pending-list state (ROARING_PENDING_SHARDS entries) */
+    RoaringPendingShard shards[ROARING_PENDING_SHARDS];
 
     /* Statistics (updated on merge) */
     uint32      total_entries;
@@ -292,8 +311,10 @@ typedef struct RoaringAmCache
     BlockNumber root_blkno;
     uint32      total_entries;
     XLogRecPtr  meta_lsn;
-    uint32      pending_count;
-    BlockNumber merging_head;
+    uint32      pending_count;          /* sum across all shards */
+    /* Per-shard head pointers so scans can walk all chains without re-reading meta */
+    BlockNumber insert_head[ROARING_PENDING_SHARDS];
+    BlockNumber merging_head[ROARING_PENDING_SHARDS];
 } RoaringAmCache;
 
 /* ----------

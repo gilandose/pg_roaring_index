@@ -12,85 +12,174 @@
 /* ----------------------------------------------------------------
  * roaring_pending_append
  *
- * Append one entry to the pending insert list.
+ * Append one entry to the pending insert list for the shard determined
+ * by ROARING_VALUE_SHARD(newentry->value).
  *
- * Locking protocol:
- *   1. Lock metapage EXCLUSIVE — held for the entire operation.
- *      This serialises concurrent inserts and merges and eliminates
- *      any TOCTOU races on the tail pointer.
- *   2. While holding metapage: lock tail page EXCLUSIVE.
- *   3. If tail full: extend new page and link it in one WAL record.
- *   4. Write entry to tail page and bump meta count in one WAL record.
- *   5. Release tail, release metapage.
+ * Locking protocol (two-phase):
  *
- * pd_lower note: our metapage and pending pages store data starting at
- * SizeOfPageHeaderData but do not advance pd_lower via PageAddItem.
- * We set pd_lower explicitly so that GenericXLog's mask_unused_space
- * does not zero the data region when computing WAL deltas.
+ *   Hot path (tail has space):
+ *     1. Lock metapage SHARE: read shards[shard].insert_tail + total count.
+ *     2. Release metapage SHARE.
+ *     3. Lock tail page EXCLUSIVE.
+ *     4. If tail has space: write entry, WAL covers tail page only.
+ *        insert_count is NOT updated on the hot path — only on extension.
+ *        Max undercount per shard: ROARING_PENDING_PER_PAGE entries.
+ *     5. Release tail.
+ *
+ *   Extension path (tail full after step 3):
+ *     4b. Release tail EXCLUSIVE.
+ *     4c. Lock metapage EXCLUSIVE; re-read shards[shard].insert_tail.
+ *         If changed (another writer extended first), release and goto retry.
+ *     4d. Re-acquire old tail EXCLUSIVE under metapage EX
+ *         (lock order: blk 0 before tail_blkno).
+ *     4e. Allocate new page, write entry there.
+ *         Fused WAL: old_tail.next_page + new page (FULL_IMAGE) +
+ *         metapage shard update (insert_tail = newblkno,
+ *                                insert_count += ROARING_PENDING_PER_PAGE).
+ *     5. Release new page, old tail, metapage.
+ *
+ * Back-pressure: total = sum(shards[i].insert_count) under SHARE.
+ * Counts are updated only on page extension, so max undercount is
+ * ROARING_PENDING_SHARDS * ROARING_PENDING_PER_PAGE = 4064 entries.
+ *
+ * pd_lower note: pending pages store data starting at SizeOfPageHeaderData
+ * but do not advance pd_lower via PageAddItem.  We set pd_lower explicitly
+ * so that GenericXLog's mask_unused_space does not zero the data region.
  * ---------------------------------------------------------------- */
 static void
 roaring_pending_append(Relation index, RoaringPendingEntry *newentry)
 {
-	Buffer				 metabuf;
-	Page				 metapage;
-	RoaringMetaPageData *meta;
+	int					 shard_id;
 	BlockNumber			 tail_blkno;
+	Buffer				 metabuf;
+	RoaringMetaPageData *meta;
 	Buffer				 tailbuf;
-	Page				 tailimg;
 	RoaringPendingSpecial *tailspc;
 	bool				 merged_unproductively = false;
 
+	shard_id = ROARING_VALUE_SHARD(newentry->value);
+
 retry:
-	/* Step 1: lock metapage exclusively — held throughout. */
-	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-	metapage = BufferGetPage(metabuf);
-	meta	 = RoaringPageGetMeta(metapage);
+	/* Phase 1: read metapage under SHARE to get tail blkno and back-pressure. */
+	metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	meta = RoaringPageGetMeta(BufferGetPage(metabuf));
 	roaring_validate_metapage(index, meta);
-	tail_blkno = meta->pending_insert_tail;
+	tail_blkno = meta->shards[shard_id].insert_tail;
 
-	if (!merged_unproductively &&
-		meta->pending_insert_count >= meta->pending_merge_threshold)
+	if (!merged_unproductively)
 	{
-		uint32 count_before = meta->pending_insert_count;
+		uint32 total = 0;
+		int    i;
 
-		UnlockReleaseBuffer(metabuf);
-		roaring_merge_pending(index);
+		for (i = 0; i < ROARING_PENDING_SHARDS; i++)
+			total += meta->shards[i].insert_count;
 
-		/*
-		 * Re-read to detect an unproductive merge (all pending entries
-		 * belonged to in-progress transactions; none were flushed).  If so,
-		 * skip the threshold check on the next attempt to avoid an infinite
-		 * retry loop.
-		 */
+		if (total >= meta->pending_merge_threshold)
 		{
-			Buffer tmp = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			uint32 count_before = total;
 
-			LockBuffer(tmp, BUFFER_LOCK_SHARE);
-			if (RoaringPageGetMeta(BufferGetPage(tmp))->pending_insert_count
-				>= count_before)
-				merged_unproductively = true;
-			UnlockReleaseBuffer(tmp);
+			UnlockReleaseBuffer(metabuf);
+			roaring_merge_pending(index);
+
+			/*
+			 * Re-read to detect an unproductive merge (all pending entries
+			 * belong to in-progress transactions).  If so, skip the threshold
+			 * check on the next pass to avoid an infinite retry loop.
+			 */
+			{
+				Buffer tmp;
+				uint32 total_after = 0;
+				int    j;
+
+				tmp = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+				LockBuffer(tmp, BUFFER_LOCK_SHARE);
+				meta = RoaringPageGetMeta(BufferGetPage(tmp));
+				for (j = 0; j < ROARING_PENDING_SHARDS; j++)
+					total_after += meta->shards[j].insert_count;
+				UnlockReleaseBuffer(tmp);
+
+				if (total_after >= count_before)
+					merged_unproductively = true;
+			}
+			goto retry;
 		}
-		goto retry;
 	}
 
-	/* Step 2: lock tail page while metapage is still held exclusively. */
+	/* Phase 2: release metapage SHARE, then lock shard tail EX. */
+	UnlockReleaseBuffer(metabuf);
+
 	tailbuf = ReadBuffer(index, tail_blkno);
 	LockBuffer(tailbuf, BUFFER_LOCK_EXCLUSIVE);
 	tailspc = (RoaringPendingSpecial *)
 			  PageGetSpecialPointer(BufferGetPage(tailbuf));
 
-	if (tailspc->entry_count >= ROARING_PENDING_PER_PAGE)
+	if (tailspc->entry_count < ROARING_PENDING_PER_PAGE)
 	{
-		/* Step 3: tail full — extend new page and link in one WAL record. */
+		/* Hot path: write entry, WAL covers tail page only (no metapage). */
+		GenericXLogState * volatile xstate = GenericXLogStart(index);
+		Page				 tailimg;
+		RoaringPendingEntry *slot;
+
+		PG_TRY();
+		{
+			tailimg = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
+												tailbuf, 0);
+			tailspc = (RoaringPendingSpecial *) PageGetSpecialPointer(tailimg);
+			slot = (RoaringPendingEntry *) PageGetContents(tailimg)
+				   + tailspc->entry_count;
+			*slot = *newentry;
+			if (!TransactionIdIsValid(tailspc->xmin_low) ||
+				TransactionIdPrecedes(newentry->xmin, tailspc->xmin_low))
+				tailspc->xmin_low = newentry->xmin;
+			if (newentry->value < tailspc->value_min)
+				tailspc->value_min = newentry->value;
+			if (newentry->value > tailspc->value_max)
+				tailspc->value_max = newentry->value;
+			tailspc->entry_count++;
+			((PageHeader) tailimg)->pd_lower += sizeof(RoaringPendingEntry);
+
+			GenericXLogFinish((GenericXLogState *) xstate);
+			xstate = NULL;
+		}
+		PG_CATCH();
+		{
+			if (xstate)
+				GenericXLogAbort((GenericXLogState *) xstate);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		UnlockReleaseBuffer(tailbuf);
+		return;
+	}
+
+	/* Extension: tail full. Release tail, acquire metapage EX. */
+	UnlockReleaseBuffer(tailbuf);
+
+	metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	meta = RoaringPageGetMeta(BufferGetPage(metabuf));
+
+	if (meta->shards[shard_id].insert_tail != tail_blkno)
+	{
+		/* Another writer extended this shard first; retry with updated tail. */
+		UnlockReleaseBuffer(metabuf);
+		goto retry;
+	}
+
+	/* Re-acquire old tail under metapage EX (lock order: blk0 < tail_blkno). */
+	tailbuf = ReadBuffer(index, tail_blkno);
+	LockBuffer(tailbuf, BUFFER_LOCK_EXCLUSIVE);
+
+	{
 		Buffer				  newbuf;
 		Page				  newpage;
 		Page				  old_img, new_img, meta_img;
 		RoaringPendingSpecial *newspc;
 		BlockNumber			  newblkno;
 
-		newbuf   = roaring_extend_page(index);	/* EB_LOCK_FIRST */
+		newbuf   = roaring_extend_page(index);
 		newblkno = BufferGetBlockNumber(newbuf);
 		newpage  = BufferGetPage(newbuf);
 		PageInit(newpage, BLCKSZ, sizeof(RoaringPendingSpecial));
@@ -104,7 +193,6 @@ retry:
 		newspc->value_min	= newentry->value;
 		newspc->value_max	= newentry->value;
 
-		/* Write the new entry directly into the new page's data area. */
 		{
 			RoaringPendingEntry *slot =
 				(RoaringPendingEntry *) PageGetContents(newpage);
@@ -129,9 +217,9 @@ retry:
 
 			meta_img = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
 												 metabuf, 0);
-			meta	 = RoaringPageGetMeta(meta_img);
-			meta->pending_insert_tail  = newblkno;
-			meta->pending_insert_count++;
+			meta = RoaringPageGetMeta(meta_img);
+			meta->shards[shard_id].insert_tail  = newblkno;
+			meta->shards[shard_id].insert_count += ROARING_PENDING_PER_PAGE;
 
 			GenericXLogFinish((GenericXLogState *) xstate);
 			xstate = NULL;
@@ -148,51 +236,7 @@ retry:
 		UnlockReleaseBuffer(newbuf);
 		UnlockReleaseBuffer(tailbuf);
 		UnlockReleaseBuffer(metabuf);
-		return;
 	}
-
-	/* Step 4: append entry to existing tail page and bump meta count. */
-	{
-		GenericXLogState * volatile xstate = GenericXLogStart(index);
-		Page				 meta_img;
-		RoaringPendingEntry *slot;
-
-		PG_TRY();
-		{
-			tailimg  = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
-												 tailbuf, 0);
-			tailspc  = (RoaringPendingSpecial *) PageGetSpecialPointer(tailimg);
-			slot	 = (RoaringPendingEntry *) PageGetContents(tailimg)
-					   + tailspc->entry_count;
-			*slot = *newentry;
-			if (!TransactionIdIsValid(tailspc->xmin_low) ||
-				TransactionIdPrecedes(newentry->xmin, tailspc->xmin_low))
-				tailspc->xmin_low = newentry->xmin;
-			if (newentry->value < tailspc->value_min)
-				tailspc->value_min = newentry->value;
-			if (newentry->value > tailspc->value_max)
-				tailspc->value_max = newentry->value;
-			tailspc->entry_count++;
-			((PageHeader) tailimg)->pd_lower += sizeof(RoaringPendingEntry);
-
-			meta_img = GenericXLogRegisterBuffer((GenericXLogState *) xstate,
-												 metabuf, 0);
-			RoaringPageGetMeta(meta_img)->pending_insert_count++;
-
-			GenericXLogFinish((GenericXLogState *) xstate);
-			xstate = NULL;
-		}
-		PG_CATCH();
-		{
-			if (xstate)
-				GenericXLogAbort((GenericXLogState *) xstate);
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-	}
-
-	UnlockReleaseBuffer(tailbuf);
-	UnlockReleaseBuffer(metabuf);
 }
 
 /* ----------------------------------------------------------------

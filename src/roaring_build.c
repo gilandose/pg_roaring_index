@@ -132,13 +132,14 @@ write_metapage(Relation index,
 			   BlockNumber root_dir,
 			   BlockNumber leftmost_leaf,
 			   BlockNumber rightmost_leaf,
-			   BlockNumber pending_insert,
+			   BlockNumber pending_blknos[ROARING_PENDING_SHARDS],
 			   uint32 total_entries,
 			   uint16 flags)
 {
 	Buffer				buf;
 	Page				page;
 	RoaringMetaPageData *meta;
+	int					 i;
 
 	buf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -152,14 +153,20 @@ write_metapage(Relation index,
 	meta->version				   = ROARING_INDEX_VERSION;
 	meta->flags					   = flags;
 	meta->croaring_format_version  = ROARING_EXPECTED_FORMAT_VERSION;
-	meta->root_directory_page	 = root_dir;
-	meta->leftmost_leaf_page	 = leftmost_leaf;
-	meta->rightmost_leaf_page	 = rightmost_leaf;
-	meta->pending_insert_head	 = pending_insert;
-	meta->pending_insert_tail	 = pending_insert;
-	meta->pending_insert_count	 = 0;
-	meta->pending_merging_head	 = InvalidBlockNumber;
-	meta->pending_carry_head	 = InvalidBlockNumber;
+	meta->num_shards			   = ROARING_PENDING_SHARDS;
+	meta->root_directory_page	   = root_dir;
+	meta->leftmost_leaf_page	   = leftmost_leaf;
+	meta->rightmost_leaf_page	   = rightmost_leaf;
+
+	for (i = 0; i < ROARING_PENDING_SHARDS; i++)
+	{
+		meta->shards[i].insert_head  = pending_blknos[i];
+		meta->shards[i].insert_tail  = pending_blknos[i];
+		meta->shards[i].insert_count = 0;
+		meta->shards[i].merging_head = InvalidBlockNumber;
+		meta->shards[i].carry_head   = InvalidBlockNumber;
+	}
+
 	meta->total_entries			 = total_entries;
 	meta->pending_merge_threshold = ROARING_PENDING_MERGE_THRESHOLD;
 
@@ -468,7 +475,7 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	BlockNumber			root_dir		= InvalidBlockNumber;
 	BlockNumber			leftmost_leaf	= InvalidBlockNumber;
 	BlockNumber			rightmost_leaf	= InvalidBlockNumber;
-	BlockNumber			pending_insert;
+
 
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 
@@ -512,11 +519,18 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	pfree(bstate.tuples);
 
-	pending_insert = roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
+	{
+		BlockNumber pending_blknos[ROARING_PENDING_SHARDS];
+		int			i;
 
-	write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
-				   pending_insert, (uint32) nentries,
-				   ROARING_FLAG_EXACT);
+		for (i = 0; i < ROARING_PENDING_SHARDS; i++)
+			pending_blknos[i] =
+				roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
+
+		write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
+					   pending_blknos, (uint32) nentries,
+					   ROARING_FLAG_EXACT);
+	}
 
 	result->heap_tuples  = reltuples;
 	result->index_tuples = (double) nentries;
@@ -538,12 +552,12 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 void
 roaring_buildempty(Relation index)
 {
-	SMgrRelation		 smgr				 = RelationGetSmgr(index);
-	char				*buf				 = (char *) palloc(BLCKSZ);
-	Page				 page				 = (Page) buf;
-	RoaringMetaPageData *meta;
+	SMgrRelation		  smgr = RelationGetSmgr(index);
+	char				 *buf  = (char *) palloc(BLCKSZ);
+	Page				  page = (Page) buf;
+	RoaringMetaPageData  *meta;
 	RoaringPendingSpecial *spc;
-	const BlockNumber	 pending_insert_blkno = 1;
+	int					  i;
 
 	smgrcreate(smgr, INIT_FORKNUM, false);
 
@@ -555,14 +569,22 @@ roaring_buildempty(Relation index)
 	meta->version				   = ROARING_INDEX_VERSION;
 	meta->flags					   = ROARING_FLAG_EXACT;
 	meta->croaring_format_version  = ROARING_EXPECTED_FORMAT_VERSION;
-	meta->root_directory_page	  = InvalidBlockNumber;
-	meta->leftmost_leaf_page	  = InvalidBlockNumber;
-	meta->rightmost_leaf_page	  = InvalidBlockNumber;
-	meta->pending_insert_head	  = pending_insert_blkno;
-	meta->pending_insert_tail	  = pending_insert_blkno;
-	meta->pending_insert_count	  = 0;
-	meta->pending_merging_head	  = InvalidBlockNumber;
-	meta->pending_carry_head	  = InvalidBlockNumber;
+	meta->num_shards			   = ROARING_PENDING_SHARDS;
+	meta->root_directory_page	   = InvalidBlockNumber;
+	meta->leftmost_leaf_page	   = InvalidBlockNumber;
+	meta->rightmost_leaf_page	   = InvalidBlockNumber;
+
+	/* Shards occupy pages 1..ROARING_PENDING_SHARDS */
+	for (i = 0; i < ROARING_PENDING_SHARDS; i++)
+	{
+		BlockNumber blkno = (BlockNumber)(i + 1);
+
+		meta->shards[i].insert_head  = blkno;
+		meta->shards[i].insert_tail  = blkno;
+		meta->shards[i].insert_count = 0;
+		meta->shards[i].merging_head = InvalidBlockNumber;
+		meta->shards[i].carry_head   = InvalidBlockNumber;
+	}
 	meta->total_entries			  = 0;
 	meta->pending_merge_threshold = ROARING_PENDING_MERGE_THRESHOLD;
 	((PageHeader) page)->pd_lower =
@@ -572,21 +594,26 @@ roaring_buildempty(Relation index)
 	log_newpage(&smgr->smgr_rlocator.locator, INIT_FORKNUM,
 				ROARING_METAPAGE_BLKNO, page, true);
 
-	/* Page 1: pending insert */
+	/* Pages 1..ROARING_PENDING_SHARDS: one empty pending page per shard */
 	PageInit(page, BLCKSZ, sizeof(RoaringPendingSpecial));
-	spc			   = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
-	spc->page_type	= ROARING_PAGE_PENDING_INSERT;
-	spc->flags		= 0;
+	spc = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
+	spc->page_type	 = ROARING_PAGE_PENDING_INSERT;
+	spc->flags		 = 0;
 	spc->entry_count = 0;
-	spc->next_page	= InvalidBlockNumber;
-	spc->xmin_low	= InvalidTransactionId;
-	spc->_pad		= 0;
-	spc->value_min	= PG_INT64_MAX;
-	spc->value_max	= PG_INT64_MIN;
-	PageSetChecksumInplace(page, pending_insert_blkno);
-	smgrextend(smgr, INIT_FORKNUM, pending_insert_blkno, page, true);
-	log_newpage(&smgr->smgr_rlocator.locator, INIT_FORKNUM,
-				pending_insert_blkno, page, true);
+	spc->next_page	 = InvalidBlockNumber;
+	spc->xmin_low	 = InvalidTransactionId;
+	spc->_pad		 = 0;
+	spc->value_min	 = PG_INT64_MAX;
+	spc->value_max	 = PG_INT64_MIN;
+
+	for (i = 0; i < ROARING_PENDING_SHARDS; i++)
+	{
+		BlockNumber blkno = (BlockNumber)(i + 1);
+
+		PageSetChecksumInplace(page, blkno);
+		smgrextend(smgr, INIT_FORKNUM, blkno, page, true);
+		log_newpage(&smgr->smgr_rlocator.locator, INIT_FORKNUM, blkno, page, true);
+	}
 
 	smgrimmedsync(smgr, INIT_FORKNUM);
 	pfree(buf);
@@ -683,7 +710,7 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	BlockNumber			root_dir		= InvalidBlockNumber;
 	BlockNumber			leftmost_leaf	= InvalidBlockNumber;
 	BlockNumber			rightmost_leaf	= InvalidBlockNumber;
-	BlockNumber			pending_insert;
+
 
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 
@@ -737,11 +764,18 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	pfree(bstate.tuples);
 
-	pending_insert = roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
+	{
+		BlockNumber pending_blknos[ROARING_PENDING_SHARDS];
+		int			i;
 
-	write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
-				   pending_insert, (uint32) nentries,
-				   ROARING_FLAG_LOSSY);
+		for (i = 0; i < ROARING_PENDING_SHARDS; i++)
+			pending_blknos[i] =
+				roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
+
+		write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
+					   pending_blknos, (uint32) nentries,
+					   ROARING_FLAG_LOSSY);
+	}
 
 	result->heap_tuples  = reltuples;
 	result->index_tuples = (double) nentries;
