@@ -711,9 +711,26 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 									   roaring_build_callback_lossy,
 									   &bstate, NULL);
 
-	/* Sort by (value, blkno); roaring deduplicates repeated blknos. */
+	/* Sort by (value, blkno). */
 	qsort(bstate.tuples, bstate.ntuples, sizeof(RoaringBuildTuple),
 		  cmp_build_tuple);
+
+	/* Remove duplicate (value, blkno) pairs — many heap TIDs share the same
+	 * block.  Dedup here so write_leaf_and_dir_pages sees unique entries only,
+	 * cutting bitmap work 10-100x at low ndistinct. */
+	{
+		long out = 0;
+		long in;
+
+		for (in = 0; in < bstate.ntuples; in++)
+		{
+			if (out == 0 ||
+				bstate.tuples[in].value != bstate.tuples[out - 1].value ||
+				bstate.tuples[in].tid   != bstate.tuples[out - 1].tid)
+				bstate.tuples[out++] = bstate.tuples[in];
+		}
+		bstate.ntuples = out;
+	}
 
 	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples, &nentries,
 							 &root_dir, &leftmost_leaf, &rightmost_leaf);
