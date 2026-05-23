@@ -36,6 +36,7 @@
 #define ROARING_PAGE_LEAF           0x03
 #define ROARING_PAGE_OVERFLOW       0x04
 #define ROARING_PAGE_PENDING_INSERT 0x05
+#define ROARING_PAGE_FREE           0x06    /* recycled page on the free list */
 
 /* Metapage flags */
 #define ROARING_FLAG_EXACT          0x01
@@ -147,6 +148,7 @@ typedef struct RoaringMetaPageData
     BlockNumber root_directory_page;
     BlockNumber leftmost_leaf_page;
     BlockNumber rightmost_leaf_page;
+    BlockNumber free_list_head;         /* head of recycled-page free list */
 
     /* Per-shard pending-list state (ROARING_PENDING_SHARDS entries) */
     RoaringPendingShard shards[ROARING_PENDING_SHARDS];
@@ -259,6 +261,21 @@ typedef struct RoaringOverflowSpecial
     BlockNumber owner_page;
 } RoaringOverflowSpecial;   /* 16 bytes */
 
+/*
+ * RoaringFreeSpecial — special area for a recycled page on the free list.
+ *
+ * next_free sits at the same byte offset as RoaringPendingSpecial.next_page
+ * (offset 4), so we can read the link using either struct.  When a page is
+ * popped from the free list, the caller overwrites it entirely via
+ * GENERIC_XLOG_FULL_IMAGE before the WAL record commits.
+ */
+typedef struct RoaringFreeSpecial
+{
+    uint8       page_type;  /* ROARING_PAGE_FREE */
+    uint8       _pad[3];
+    BlockNumber next_free;  /* next page on free list, or InvalidBlockNumber */
+} RoaringFreeSpecial;   /* 8 bytes — fits inside any existing special area */
+
 /* ----------
  * Inline helpers
  * ---------- */
@@ -334,6 +351,8 @@ typedef struct RoaringScanOpaque
 extern void   roaring_validate_metapage(Relation index,
 										const RoaringMetaPageData *meta);
 extern Buffer roaring_extend_page(Relation index);
+extern Buffer roaring_alloc_page(Relation index, Buffer metabuf,
+								 BlockNumber *new_free_list_head_out);
 extern void   roaring_wal_and_release(Relation index, Buffer buf);
 extern BlockNumber roaring_init_pending_page(Relation index, uint8 page_type);
 extern BlockNumber roaring_write_dir_page(Relation index,

@@ -157,6 +157,7 @@ write_metapage(Relation index,
 	meta->root_directory_page	   = root_dir;
 	meta->leftmost_leaf_page	   = leftmost_leaf;
 	meta->rightmost_leaf_page	   = rightmost_leaf;
+	meta->free_list_head		   = InvalidBlockNumber;
 
 	for (i = 0; i < ROARING_PENDING_SHARDS; i++)
 	{
@@ -573,6 +574,7 @@ roaring_buildempty(Relation index)
 	meta->root_directory_page	   = InvalidBlockNumber;
 	meta->leftmost_leaf_page	   = InvalidBlockNumber;
 	meta->rightmost_leaf_page	   = InvalidBlockNumber;
+	meta->free_list_head		   = InvalidBlockNumber;
 
 	/* Shards occupy pages 1..ROARING_PENDING_SHARDS */
 	for (i = 0; i < ROARING_PENDING_SHARDS; i++)

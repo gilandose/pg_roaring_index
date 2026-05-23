@@ -178,8 +178,9 @@ retry:
 		Page				  old_img, new_img, meta_img;
 		RoaringPendingSpecial *newspc;
 		BlockNumber			  newblkno;
+		BlockNumber			  new_free_list_head;
 
-		newbuf   = roaring_extend_page(index);
+		newbuf   = roaring_alloc_page(index, metabuf, &new_free_list_head);
 		newblkno = BufferGetBlockNumber(newbuf);
 		newpage  = BufferGetPage(newbuf);
 		PageInit(newpage, BLCKSZ, sizeof(RoaringPendingSpecial));
@@ -220,6 +221,8 @@ retry:
 			meta = RoaringPageGetMeta(meta_img);
 			meta->shards[shard_id].insert_tail  = newblkno;
 			meta->shards[shard_id].insert_count += ROARING_PENDING_PER_PAGE;
+			if (new_free_list_head != meta->free_list_head)
+				meta->free_list_head = new_free_list_head;
 
 			GenericXLogFinish((GenericXLogState *) xstate);
 			xstate = NULL;

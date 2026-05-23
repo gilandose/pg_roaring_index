@@ -421,6 +421,71 @@ leaf_split_and_update(Relation index,
 }
 
 /* ----------------------------------------------------------------
+ * recycle_chain
+ *
+ * Walk the pending chain starting at head_blkno and push every page onto
+ * the index free list.  The caller must hold metabuf EXCLUSIVE; this
+ * function issues one 2-buffer GenericXLog record per page (freed page +
+ * metapage), updating free_list_head after each push.
+ *
+ * The frozen chain is no longer reachable from the metapage (merging_head
+ * has already been cleared), so no concurrent reader can be traversing it.
+ * ---------------------------------------------------------------- */
+static void
+recycle_chain(Relation index, Buffer metabuf, BlockNumber head_blkno)
+{
+	BlockNumber cur = head_blkno;
+
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				  fbuf;
+		Page				  fpage;
+		BlockNumber			  nxt;
+
+		fbuf  = ReadBuffer(index, cur);
+		LockBuffer(fbuf, BUFFER_LOCK_EXCLUSIVE);
+		fpage = BufferGetPage(fbuf);
+
+		/* Save next pointer before we overwrite the page content. */
+		nxt = ((RoaringPendingSpecial *) PageGetSpecialPointer(fpage))->next_page;
+
+		{
+			GenericXLogState * volatile xstate = GenericXLogStart(index);
+			PG_TRY();
+			{
+				Page			  fimg = GenericXLogRegisterBuffer(
+					(GenericXLogState *) xstate, fbuf, 0);
+				Page			  mimg = GenericXLogRegisterBuffer(
+					(GenericXLogState *) xstate, metabuf, 0);
+				RoaringMetaPageData *m   = RoaringPageGetMeta(mimg);
+				RoaringFreeSpecial  *fs  = (RoaringFreeSpecial *)
+										   PageGetSpecialPointer(fimg);
+
+				fs->page_type = ROARING_PAGE_FREE;
+				fs->_pad[0]   = 0;
+				fs->_pad[1]   = 0;
+				fs->_pad[2]   = 0;
+				fs->next_free = m->free_list_head;
+				m->free_list_head = cur;
+
+				GenericXLogFinish((GenericXLogState *) xstate);
+				xstate = NULL;
+			}
+			PG_CATCH();
+			{
+				if (xstate)
+					GenericXLogAbort((GenericXLogState *) xstate);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+		}
+
+		UnlockReleaseBuffer(fbuf);
+		cur = nxt;
+	}
+}
+
+/* ----------------------------------------------------------------
  * roaring_merge_pending
  *
  * Merge all pending inserts into the main leaf pages.
@@ -439,6 +504,7 @@ leaf_split_and_update(Relation index,
  *   4. Rebuild the directory if the leaf structure changed.
  *   5. Update the metapage: new root_directory_page, leftmost/rightmost,
  *      updated total_entries.
+ *   6. Step E: recycle frozen chain pages onto the free list.
  * ---------------------------------------------------------------- */
 void
 roaring_merge_pending(Relation index)
@@ -696,14 +762,15 @@ roaring_merge_pending(Relation index)
 			}
 			else
 			{
-				/* Fresh empty pending page. */
+				/* Fresh empty pending page (from free list or file extension). */
 				Buffer				  npbuf;
 				BlockNumber			  npblkno;
+				BlockNumber			  new_free_list_head;
 				Page				  nppage;
 				Page				  np_img;
 				RoaringPendingSpecial *npspc;
 
-				npbuf   = roaring_extend_page(index);
+				npbuf   = roaring_alloc_page(index, metabuf, &new_free_list_head);
 				npblkno = BufferGetBlockNumber(npbuf);
 				nppage  = BufferGetPage(npbuf);
 				PageInit(nppage, BLCKSZ, sizeof(RoaringPendingSpecial));
@@ -727,6 +794,8 @@ roaring_merge_pending(Relation index)
 				m->shards[s].insert_head  = npblkno;
 				m->shards[s].insert_tail  = npblkno;
 				m->shards[s].insert_count = 0;
+				if (new_free_list_head != m->free_list_head)
+					m->free_list_head = new_free_list_head;
 				GenericXLogFinish(state);
 				UnlockReleaseBuffer(npbuf);
 			}
@@ -775,8 +844,11 @@ roaring_merge_pending(Relation index)
 	{
 		/*
 		 * All pending entries were in-progress or aborted — nothing to merge.
-		 * Clear all merging_heads so subsequent merges can proceed normally.
+		 * Clear all merging_heads so subsequent merges can proceed normally,
+		 * then recycle the frozen chain pages.
 		 */
+		int s;
+
 		pfree(entries);
 		metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
@@ -804,6 +876,15 @@ roaring_merge_pending(Relation index)
 			}
 			PG_END_TRY();
 		}
+
+		/* Recycle frozen chain pages (metabuf still held EX). */
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			if (!shard_active[s] || frozen_heads[s] == InvalidBlockNumber)
+				continue;
+			recycle_chain(index, metabuf, frozen_heads[s]);
+		}
+
 		UnlockReleaseBuffer(metabuf);
 		return;
 	}
@@ -1385,6 +1466,32 @@ roaring_merge_pending(Relation index)
 		PG_END_TRY();
 	}
 	UnlockReleaseBuffer(metabuf);
+
+	/*
+	 * Step E: recycle the frozen pending chain pages.
+	 *
+	 * All active merging_heads were cleared in Step D, so the frozen chains
+	 * are no longer reachable from the metapage.  Re-acquire metapage EX
+	 * and push every page from each frozen chain onto the free list.
+	 *
+	 * Lock ordering: metapage (blk 0) before any frozen page — same as
+	 * every other path that locks metapage + another buffer.
+	 */
+	{
+		int s;
+
+		metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			if (!shard_active[s] || frozen_heads[s] == InvalidBlockNumber)
+				continue;
+			recycle_chain(index, metabuf, frozen_heads[s]);
+		}
+
+		UnlockReleaseBuffer(metabuf);
+	}
 }
 
 /* ----------------------------------------------------------------
