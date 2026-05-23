@@ -6,6 +6,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
+#include "postmaster/bgworker.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
@@ -77,32 +78,48 @@ retry:
 
 		if (total >= meta->pending_merge_threshold)
 		{
-			uint32 count_before = total;
+			bool bgworker_running = (meta->flags & ROARING_FLAG_BGMERGE_SPAWNED) != 0;
+			bool over_hard_cap    = (total >= 2 * meta->pending_merge_threshold);
 
-			UnlockReleaseBuffer(metabuf);
-			roaring_merge_pending(index);
-
-			/*
-			 * Re-read to detect an unproductive merge (all pending entries
-			 * belong to in-progress transactions).  If so, skip the threshold
-			 * check on the next pass to avoid an infinite retry loop.
-			 */
+			if (!bgworker_running || over_hard_cap)
 			{
-				Buffer tmp;
-				uint32 total_after = 0;
-				int    j;
+				/*
+				 * No background worker running (flag not set), OR pending list
+				 * has grown past the hard cap (2× threshold) — fall back to
+				 * synchronous merge to bound list growth.
+				 */
+				uint32 count_before = total;
 
-				tmp = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-				LockBuffer(tmp, BUFFER_LOCK_SHARE);
-				meta = RoaringPageGetMeta(BufferGetPage(tmp));
-				for (j = 0; j < ROARING_PENDING_SHARDS; j++)
-					total_after += meta->shards[j].insert_count;
-				UnlockReleaseBuffer(tmp);
+				UnlockReleaseBuffer(metabuf);
+				roaring_merge_pending(index);
 
-				if (total_after >= count_before)
-					merged_unproductively = true;
+				/*
+				 * Re-read to detect an unproductive merge (all pending entries
+				 * belong to in-progress transactions).  If so, skip the
+				 * threshold check on the next pass to avoid an infinite retry.
+				 */
+				{
+					Buffer tmp;
+					uint32 total_after = 0;
+					int    j;
+
+					tmp = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+					LockBuffer(tmp, BUFFER_LOCK_SHARE);
+					meta = RoaringPageGetMeta(BufferGetPage(tmp));
+					for (j = 0; j < ROARING_PENDING_SHARDS; j++)
+						total_after += meta->shards[j].insert_count;
+					UnlockReleaseBuffer(tmp);
+
+					if (total_after >= count_before)
+						merged_unproductively = true;
+				}
+				goto retry;
 			}
-			goto retry;
+			/*
+			 * Background worker is running (flag set) and below the hard cap:
+			 * let the worker drain the list asynchronously.  Continue the
+			 * insert normally — the tail read below is still valid.
+			 */
 		}
 	}
 
@@ -179,6 +196,7 @@ retry:
 		RoaringPendingSpecial *newspc;
 		BlockNumber			  newblkno;
 		BlockNumber			  new_free_list_head;
+		bool				  spawn_worker = false;
 
 		newbuf   = roaring_alloc_page(index, metabuf, &new_free_list_head);
 		newblkno = BufferGetBlockNumber(newbuf);
@@ -224,6 +242,27 @@ retry:
 			if (new_free_list_head != meta->free_list_head)
 				meta->free_list_head = new_free_list_head;
 
+			/*
+			 * If the total pending count (after updating this shard) now
+			 * crosses the merge threshold AND no bgworker flag is set yet,
+			 * set the flag and arrange to spawn a worker after releasing locks.
+			 * The flag and the insert_count update are in the same WAL record.
+			 */
+			{
+				uint32 total = 0;
+				int    k;
+
+				for (k = 0; k < ROARING_PENDING_SHARDS; k++)
+					total += meta->shards[k].insert_count;
+
+				if (total >= meta->pending_merge_threshold &&
+					!(meta->flags & ROARING_FLAG_BGMERGE_SPAWNED))
+				{
+					meta->flags |= ROARING_FLAG_BGMERGE_SPAWNED;
+					spawn_worker = true;
+				}
+			}
+
 			GenericXLogFinish((GenericXLogState *) xstate);
 			xstate = NULL;
 		}
@@ -239,6 +278,15 @@ retry:
 		UnlockReleaseBuffer(newbuf);
 		UnlockReleaseBuffer(tailbuf);
 		UnlockReleaseBuffer(metabuf);
+
+		/*
+		 * Spawn the background merge worker AFTER releasing all locks.
+		 * If the spawn fails (max_worker_processes exhausted), the hard-cap
+		 * check in the soft-threshold path will trigger a sync merge when
+		 * pending grows past 2 × pending_merge_threshold.
+		 */
+		if (spawn_worker)
+			roaring_try_spawn_merge_worker(index);
 	}
 }
 

@@ -865,6 +865,7 @@ roaring_merge_pending(Relation index)
 				for (si = 0; si < ROARING_PENDING_SHARDS; si++)
 					if (shard_active[si])
 						m->shards[si].merging_head = InvalidBlockNumber;
+				m->flags &= ~ROARING_FLAG_BGMERGE_SPAWNED;
 				GenericXLogFinish((GenericXLogState *) xstate);
 				xstate = NULL;
 			}
@@ -1453,6 +1454,7 @@ roaring_merge_pending(Relation index)
 			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
 				if (shard_active[si])
 					m->shards[si].merging_head = InvalidBlockNumber;
+			m->flags &= ~ROARING_FLAG_BGMERGE_SPAWNED;
 
 			GenericXLogFinish((GenericXLogState *) xstate);
 			xstate = NULL;

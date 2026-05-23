@@ -39,8 +39,18 @@
 #define ROARING_PAGE_FREE           0x06    /* recycled page on the free list */
 
 /* Metapage flags */
-#define ROARING_FLAG_EXACT          0x01
-#define ROARING_FLAG_LOSSY          0x02
+#define ROARING_FLAG_EXACT              0x01
+#define ROARING_FLAG_LOSSY              0x02
+/*
+ * ROARING_FLAG_BGMERGE_SPAWNED: set (under metapage EX, in the same WAL record
+ * as the page extension that crossed pending_merge_threshold) when a background
+ * merge worker has been spawned for this index.  Cleared by roaring_merge_pending
+ * Step D when the merge commits.  Allows roaring_pending_append to skip the
+ * inline back-pressure merge while the worker is running, eliminating
+ * multi-second INSERT latency spikes.  Hard cap (2× threshold) forces an
+ * inline fallback if the worker is too slow or crashed.
+ */
+#define ROARING_FLAG_BGMERGE_SPAWNED    0x04
 
 /* Leaf entry flags */
 #define ROARING_ENTRY_INLINE        0x00
@@ -381,6 +391,10 @@ extern int64  roaring_datum_to_key64(Datum d, Oid typid);
 
 /* roaring_vacuum.c — also called from roaring_insert for back-pressure */
 extern void roaring_merge_pending(Relation index);
+
+/* roaring_bgworker.c */
+extern PGDLLEXPORT void roaring_bgworker_main(Datum main_arg);
+extern void roaring_try_spawn_merge_worker(Relation index);
 
 /* roaring_build.c */
 extern IndexBuildResult *roaring_build(Relation heap, Relation index,
