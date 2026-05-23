@@ -21,7 +21,7 @@
  * On-disk constants
  * ---------- */
 #define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
-#define ROARING_INDEX_VERSION       3   /* bumped when on-disk metapage layout changes */
+#define ROARING_INDEX_VERSION       4   /* bumped when on-disk metapage layout changes */
 
 /*
  * Expected CRoaring major version stored in the metapage.  If the index was
@@ -36,13 +36,10 @@
 #define ROARING_PAGE_LEAF           0x03
 #define ROARING_PAGE_OVERFLOW       0x04
 #define ROARING_PAGE_PENDING_INSERT 0x05
-#define ROARING_PAGE_PENDING_DELETE 0x06
-#define ROARING_PAGE_TOMBSTONE      0x07
 
 /* Metapage flags */
 #define ROARING_FLAG_EXACT          0x01
 #define ROARING_FLAG_LOSSY          0x02
-#define ROARING_FLAG_HAS_TOMBSTONE  0x04
 
 /* Leaf entry flags */
 #define ROARING_ENTRY_INLINE        0x00
@@ -135,12 +132,6 @@ typedef struct RoaringMetaPageData
      */
     BlockNumber pending_carry_head;
 
-    BlockNumber pending_delete_head;    /* exact mode */
-    BlockNumber pending_delete_tail;
-    uint32      pending_delete_count;
-
-    BlockNumber tombstone_root_page;    /* exact mode */
-
     /* Statistics (updated on merge) */
     uint32      total_entries;
     uint32      total_heap_pages;
@@ -201,7 +192,7 @@ typedef struct RoaringOverflowEntry
 
 typedef struct RoaringLeafSpecial
 {
-    uint8       page_type;  /* ROARING_PAGE_LEAF or ROARING_PAGE_TOMBSTONE */
+    uint8       page_type;  /* ROARING_PAGE_LEAF */
     uint8       flags;
     uint16      entry_count;
     BlockNumber left_page;
