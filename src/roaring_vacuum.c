@@ -709,7 +709,35 @@ roaring_merge_pending(Relation index)
 	entries = collect_pending(index, old_head, &nentries);
 	if (nentries == 0)
 	{
+		/*
+		 * All pending entries were in-progress or aborted — nothing to merge.
+		 * We must still clear pending_merging_head; leaving it set causes all
+		 * subsequent merges to bail out and all scans to walk a stranded chain.
+		 */
 		pfree(entries);
+		metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+		{
+			GenericXLogState * volatile xstate = GenericXLogStart(index);
+
+			PG_TRY();
+			{
+				Page			  img = GenericXLogRegisterBuffer(
+					(GenericXLogState *) xstate, metabuf, 0);
+
+				RoaringPageGetMeta(img)->pending_merging_head = InvalidBlockNumber;
+				GenericXLogFinish((GenericXLogState *) xstate);
+				xstate = NULL;
+			}
+			PG_CATCH();
+			{
+				if (xstate)
+					GenericXLogAbort((GenericXLogState *) xstate);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+		}
+		UnlockReleaseBuffer(metabuf);
 		return;
 	}
 

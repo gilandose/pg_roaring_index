@@ -118,6 +118,24 @@ roaring_beginscan(Relation rel, int nkeys, int norderbys)
 	so				  = (RoaringScanOpaque *) palloc0(sizeof(RoaringScanOpaque));
 	so->bitmap_loaded = false;
 
+	/* Detect hash-keyed columns (text, uuid): their bitmaps can collide, so
+	 * the executor must recheck every matched tuple. */
+	so->needs_recheck = false;
+	{
+		int i;
+
+		for (i = 0; i < rel->rd_index->indnkeyatts; i++)
+		{
+			Oid opcintype = rel->rd_opcintype[i];
+
+			if (opcintype == TEXTOID || opcintype == UUIDOID)
+			{
+				so->needs_recheck = true;
+				break;
+			}
+		}
+	}
+
 	scan->opaque = so;
 	return scan;
 }
@@ -178,40 +196,82 @@ lookup_value_as_bitmap(Relation index, BlockNumber root_blkno, int64 value)
 	BlockNumber		 leaf_blkno;
 	Buffer			 leafbuf;
 	Page			 leafpage;
-	OffsetNumber	 lo, hi;
-	OffsetNumber	 found_off = InvalidOffsetNumber;
-	RoaringLeafEntry *le	   = NULL;
+	OffsetNumber	 found_off;
+	RoaringLeafEntry *le;
 	roaring_bitmap_t *bm;
 
 	leaf_blkno = roaring_dir_lookup(index, root_blkno, value);
 	if (leaf_blkno == InvalidBlockNumber)
 		return roaring_bitmap_create();
 
-	leafbuf  = ReadBuffer(index, leaf_blkno);
-	LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
-	leafpage = BufferGetPage(leafbuf);
-
-	lo = 1;
-	hi = PageGetMaxOffsetNumber(leafpage);
-	while (lo <= hi)
+	for (;;)
 	{
-		OffsetNumber	  mid = (lo + hi) / 2;
-		RoaringLeafEntry *e   = (RoaringLeafEntry *)
-								PageGetItem(leafpage,
-											PageGetItemId(leafpage, mid));
-		if (e->value == value)
+		OffsetNumber		lo,
+							hi;
+		RoaringLeafSpecial *lspc;
+
+		leafbuf   = ReadBuffer(index, leaf_blkno);
+		LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
+		leafpage  = BufferGetPage(leafbuf);
+		found_off = InvalidOffsetNumber;
+		le		  = NULL;
+
+		lo = 1;
+		hi = PageGetMaxOffsetNumber(leafpage);
+		while (lo <= hi)
 		{
-			le        = e;
-			found_off = mid;
-			break;
+			OffsetNumber	  mid = (lo + hi) / 2;
+			RoaringLeafEntry *e   = (RoaringLeafEntry *)
+									PageGetItem(leafpage,
+												PageGetItemId(leafpage, mid));
+
+			if (e->value == value)
+			{
+				le		  = e;
+				found_off = mid;
+				break;
+			}
+			else if (e->value < value)
+				lo = mid + 1;
+			else
+				hi = mid - 1;
 		}
-		else if (e->value < value)
-			lo = mid + 1;
-		else
-			hi = mid - 1;
+
+		if (le != NULL)
+			break;
+
+		/*
+		 * Binary search miss.  A concurrent merge may have split this leaf
+		 * after our directory lookup, moving the target value to the right
+		 * sibling.  Follow the right link if the target is beyond this
+		 * leaf's max key (_bt_moveright pattern).
+		 */
+		lspc = (RoaringLeafSpecial *) PageGetSpecialPointer(leafpage);
+		if (lspc->right_page != InvalidBlockNumber)
+		{
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(leafpage);
+
+			if (maxoff >= 1)
+			{
+				RoaringLeafEntry *last = (RoaringLeafEntry *)
+					PageGetItem(leafpage, PageGetItemId(leafpage, maxoff));
+
+				if (last->value < value)
+				{
+					BlockNumber right = lspc->right_page;
+
+					UnlockReleaseBuffer(leafbuf);
+					leaf_blkno = right;
+					continue;
+				}
+			}
+		}
+
+		UnlockReleaseBuffer(leafbuf);
+		return roaring_bitmap_create();
 	}
 
-	if (le == NULL)
+	if (le->cardinality == 0)
 	{
 		UnlockReleaseBuffer(leafbuf);
 		return roaring_bitmap_create();
@@ -227,9 +287,15 @@ lookup_value_as_bitmap(Relation index, BlockNumber root_blkno, int64 value)
 	}
 	else
 	{
-		Size item_len   = ItemIdGetLength(PageGetItemId(leafpage, found_off));
-		Size bitmap_len = item_len - sizeof(RoaringLeafEntry);
+		Size item_len = ItemIdGetLength(PageGetItemId(leafpage, found_off));
+		Size bitmap_len;
 
+		if (item_len < sizeof(RoaringLeafEntry))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("pg_roaring_index: leaf entry at offset %u is too short",
+							found_off)));
+		bitmap_len = item_len - sizeof(RoaringLeafEntry);
 		bm = roaring_bitmap_portable_deserialize_safe(
 				(const char *)(le + 1), bitmap_len);
 		UnlockReleaseBuffer(leafbuf);
@@ -307,40 +373,76 @@ lookup_value_as_bitmap_lossy(Relation index, BlockNumber root_blkno, int64 value
 	BlockNumber		 leaf_blkno;
 	Buffer			 leafbuf;
 	Page			 leafpage;
-	OffsetNumber	 lo, hi;
-	OffsetNumber	 found_off = InvalidOffsetNumber;
-	RoaringLeafEntry *le	   = NULL;
+	OffsetNumber	 found_off;
+	RoaringLeafEntry *le;
 	roaring_bitmap_t *bm;
 
 	leaf_blkno = roaring_dir_lookup(index, root_blkno, value);
 	if (leaf_blkno == InvalidBlockNumber)
 		return roaring_bitmap_create();
 
-	leafbuf  = ReadBuffer(index, leaf_blkno);
-	LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
-	leafpage = BufferGetPage(leafbuf);
-
-	lo = 1;
-	hi = PageGetMaxOffsetNumber(leafpage);
-	while (lo <= hi)
+	for (;;)
 	{
-		OffsetNumber	  mid = (lo + hi) / 2;
-		RoaringLeafEntry *e   = (RoaringLeafEntry *)
-								PageGetItem(leafpage,
-											PageGetItemId(leafpage, mid));
-		if (e->value == value)
+		OffsetNumber		lo,
+							hi;
+		RoaringLeafSpecial *lspc;
+
+		leafbuf   = ReadBuffer(index, leaf_blkno);
+		LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
+		leafpage  = BufferGetPage(leafbuf);
+		found_off = InvalidOffsetNumber;
+		le		  = NULL;
+
+		lo = 1;
+		hi = PageGetMaxOffsetNumber(leafpage);
+		while (lo <= hi)
 		{
-			le        = e;
-			found_off = mid;
-			break;
+			OffsetNumber	  mid = (lo + hi) / 2;
+			RoaringLeafEntry *e   = (RoaringLeafEntry *)
+									PageGetItem(leafpage,
+												PageGetItemId(leafpage, mid));
+
+			if (e->value == value)
+			{
+				le		  = e;
+				found_off = mid;
+				break;
+			}
+			else if (e->value < value)
+				lo = mid + 1;
+			else
+				hi = mid - 1;
 		}
-		else if (e->value < value)
-			lo = mid + 1;
-		else
-			hi = mid - 1;
+
+		if (le != NULL)
+			break;
+
+		lspc = (RoaringLeafSpecial *) PageGetSpecialPointer(leafpage);
+		if (lspc->right_page != InvalidBlockNumber)
+		{
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(leafpage);
+
+			if (maxoff >= 1)
+			{
+				RoaringLeafEntry *last = (RoaringLeafEntry *)
+					PageGetItem(leafpage, PageGetItemId(leafpage, maxoff));
+
+				if (last->value < value)
+				{
+					BlockNumber right = lspc->right_page;
+
+					UnlockReleaseBuffer(leafbuf);
+					leaf_blkno = right;
+					continue;
+				}
+			}
+		}
+
+		UnlockReleaseBuffer(leafbuf);
+		return roaring_bitmap_create();
 	}
 
-	if (le == NULL)
+	if (le->cardinality == 0)
 	{
 		UnlockReleaseBuffer(leafbuf);
 		return roaring_bitmap_create();
@@ -356,9 +458,15 @@ lookup_value_as_bitmap_lossy(Relation index, BlockNumber root_blkno, int64 value
 	}
 	else
 	{
-		Size item_len   = ItemIdGetLength(PageGetItemId(leafpage, found_off));
-		Size bitmap_len = item_len - sizeof(RoaringLeafEntry);
+		Size item_len = ItemIdGetLength(PageGetItemId(leafpage, found_off));
+		Size bitmap_len;
 
+		if (item_len < sizeof(RoaringLeafEntry))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("pg_roaring_index: leaf entry at offset %u is too short",
+							found_off)));
+		bitmap_len = item_len - sizeof(RoaringLeafEntry);
 		bm = roaring_bitmap_portable_deserialize_safe(
 				(const char *)(le + 1), bitmap_len);
 		UnlockReleaseBuffer(leafbuf);
@@ -581,7 +689,8 @@ scankey_order_cmp(const void *a, const void *b)
  * ---------------------------------------------------------------- */
 static int64
 emit_exact_bitmap_to_tbm(roaring_bitmap_t *bm, TIDBitmap *tbm,
-						  ItemPointerData *tid_buf, int *tid_count_p)
+						  ItemPointerData *tid_buf, int *tid_count_p,
+						  bool recheck)
 {
 	roaring_uint32_iterator_t it;
 	int64				ntids = 0;
@@ -595,7 +704,7 @@ emit_exact_bitmap_to_tbm(roaring_bitmap_t *bm, TIDBitmap *tbm,
 
 		if (*tid_count_p == ROARING_TID_BATCH)
 		{
-			tbm_add_tuples(tbm, tid_buf, *tid_count_p, false);
+			tbm_add_tuples(tbm, tid_buf, *tid_count_p, recheck);
 			*tid_count_p = 0;
 		}
 		ItemPointerSet(&tid_buf[(*tid_count_p)++], block, off);
@@ -897,7 +1006,8 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			if (result != NULL)
 			{
 				ntids = emit_exact_bitmap_to_tbm((roaring_bitmap_t *) result,
-												  tbm, tid_buf, &tid_count);
+												  tbm, tid_buf, &tid_count,
+												  so->needs_recheck);
 				roaring_bitmap_free((roaring_bitmap_t *) result);
 				result = NULL;
 			}
@@ -916,7 +1026,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		pfree(order);
 
 		if (tid_count > 0)
-			tbm_add_tuples(tbm, tid_buf, tid_count, false);
+			tbm_add_tuples(tbm, tid_buf, tid_count, so->needs_recheck);
 
 		return ntids;
 	}
@@ -993,7 +1103,8 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 							roaring_bitmap_free(pbms[j]);
 							pbms[j] = NULL;
 						}
-						ntids += emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count);
+						ntids += emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count,
+														  so->needs_recheck);
 						roaring_bitmap_free(bm);
 						bm = NULL;
 					}
@@ -1047,7 +1158,8 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						roaring_bitmap_free(pbm);
 					}
 				}
-				ntids = emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count);
+				ntids = emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count,
+												 so->needs_recheck);
 				roaring_bitmap_free(bm);
 				bm = NULL;
 			}
@@ -1063,7 +1175,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	}
 
 	if (tid_count > 0)
-		tbm_add_tuples(tbm, tid_buf, tid_count, false);
+		tbm_add_tuples(tbm, tid_buf, tid_count, so->needs_recheck);
 
 	return ntids;
 }

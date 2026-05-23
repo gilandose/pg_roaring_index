@@ -311,6 +311,7 @@ typedef struct RoaringAmCache
 typedef struct RoaringScanOpaque
 {
     bool    bitmap_loaded;
+    bool    needs_recheck;  /* true when any index column uses a hash-keyed type */
 } RoaringScanOpaque;
 
 /* ----------
