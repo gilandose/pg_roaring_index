@@ -220,11 +220,6 @@ rebuild_directory(Relation index, BlockNumber leftmost_leaf)
 		RoaringDirEntry *l1_entries;
 		uint32 j;
 
-		if (l1_count > max_dir)
-			elog(ERROR,
-				 "pg_roaring_index: rebuild_directory: index too large for "
-				 "two-level directory (%u leaf pages)", leaf_count);
-
 		l1_entries = (RoaringDirEntry *)
 					 palloc(l1_count * sizeof(RoaringDirEntry));
 
@@ -240,7 +235,37 @@ rebuild_directory(Relation index, BlockNumber leftmost_leaf)
 			l1_entries[j].child_page = blkno;
 		}
 
-		root_dir = roaring_write_dir_page(index, l1_entries, l1_count, 1);
+		if (l1_count > max_dir)
+		{
+			uint32           l2_count  = (l1_count + max_dir - 1) / max_dir;
+			RoaringDirEntry *l2_entries;
+			uint32           k;
+
+			if (l2_count > max_dir)
+				elog(ERROR,
+					 "pg_roaring_index: rebuild_directory: index too large for "
+					 "three-level directory (%u leaf pages)", leaf_count);
+
+			l2_entries = (RoaringDirEntry *)
+						 palloc(l2_count * sizeof(RoaringDirEntry));
+
+			for (k = 0; k < l2_count; k++)
+			{
+				uint32      start = k * max_dir;
+				uint32      count = Min(max_dir, l1_count - start);
+				BlockNumber blkno;
+
+				blkno = roaring_write_dir_page(index, l1_entries + start, count, 1);
+				l2_entries[k].high_key   = l1_entries[start + count - 1].high_key;
+				l2_entries[k].child_page = blkno;
+			}
+
+			root_dir = roaring_write_dir_page(index, l2_entries, l2_count, 2);
+			pfree(l2_entries);
+		}
+		else
+			root_dir = roaring_write_dir_page(index, l1_entries, l1_count, 1);
+
 		pfree(l1_entries);
 	}
 
