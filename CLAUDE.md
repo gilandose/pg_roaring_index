@@ -29,6 +29,16 @@ make installcheck       # run regression tests (needs a running PG cluster)
 make clean
 ```
 
+> **macOS stale-dylib trap**: `make install` replaces the file on disk, but any
+> PostgreSQL backends that already `dlopen`'d the old `.dylib` keep using the
+> old version in memory.  Always restart the server after install before running
+> tests or benchmarks:
+> ```sh
+> pg_ctl restart -D /opt/homebrew/var/postgresql@18
+> ```
+> Symptom of loading the wrong version: crash reports whose UUID does not match
+> `dwarfdump --uuid /opt/homebrew/lib/postgresql@18/pg_roaring_index.dylib`.
+
 **Single regression test**:
 
 ```sh

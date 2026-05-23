@@ -3,6 +3,8 @@
 *.dylib
 *.a
 results/
+!bench/results/
+!bench/results/*.tsv
 tmp_check/
 src/vendor/croaring/roaring.c
 src/vendor/croaring/roaring.h

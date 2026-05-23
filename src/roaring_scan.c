@@ -421,6 +421,159 @@ pending_chain_as_bitmap_lossy(Relation index, BlockNumber start_blkno,
 }
 
 /* ----------------------------------------------------------------
+ * int64_cmp_for_sort — qsort comparator for int64 arrays
+ * ---------------------------------------------------------------- */
+static int
+int64_cmp_for_sort(const void *a, const void *b)
+{
+	int64 x = *(const int64 *) a;
+	int64 y = *(const int64 *) b;
+
+	if (x < y) return -1;
+	if (x > y) return 1;
+	return 0;
+}
+
+/* ----------------------------------------------------------------
+ * pending_chain_fill_values
+ *
+ * Walk one pending list chain once, adding visible TIDs into bitmaps[i]
+ * for every pending entry whose value equals values[i].
+ * values[] must be sorted ascending with no duplicates; bitmaps[] must
+ * be pre-allocated (roaring_bitmap_create).  Caller frees each bitmap.
+ *
+ * Used by SK_SEARCHARRAY paths to reduce N pending-chain walks to 1.
+ * Works for both exact (linear_tid = linearized TID) and lossy
+ * (linear_tid = block number) pending chains — same on-disk format.
+ * ---------------------------------------------------------------- */
+static void
+pending_chain_fill_values(Relation index, BlockNumber start_blkno,
+						   const int64 *values, roaring_bitmap_t **bitmaps,
+						   int nvalues, Snapshot snapshot)
+{
+	BlockNumber cur = start_blkno;
+
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				  buf;
+		Page				  page;
+		RoaringPendingSpecial *spc;
+		RoaringPendingEntry	  *raw;
+		uint16				  k;
+
+		buf  = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
+		raw  = (RoaringPendingEntry *) PageGetContents(page);
+
+		if (spc->entry_count > ROARING_PENDING_PER_PAGE)
+		{
+			UnlockReleaseBuffer(buf);
+			elog(ERROR,
+				 "pg_roaring_index: corrupt pending page %u: entry_count %u > max %d",
+				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
+		}
+
+		/* Page-level skip: none of our values fall in this page's range. */
+		if (values[0] <= spc->value_max && values[nvalues - 1] >= spc->value_min)
+		{
+			for (k = 0; k < spc->entry_count; k++)
+			{
+				int64 v  = raw[k].value;
+				int   lo = 0;
+				int   hi = nvalues - 1;
+
+				/* Binary search first; MVCC check only on match. */
+				while (lo <= hi)
+				{
+					int mid = (lo + hi) / 2;
+
+					if (values[mid] == v)
+					{
+						if (roaring_pending_visible(raw[k].xmin, snapshot))
+							roaring_bitmap_add(bitmaps[mid], raw[k].linear_tid);
+						break;
+					}
+					else if (values[mid] < v)
+						lo = mid + 1;
+					else
+						hi = mid - 1;
+				}
+			}
+		}
+
+		cur = spc->next_page;
+		UnlockReleaseBuffer(buf);
+	}
+}
+
+/* ----------------------------------------------------------------
+ * peek_value_cardinality
+ *
+ * Return the stored leaf cardinality for value without deserializing
+ * the bitmap.  Returns 0 if value is absent from the main index.
+ * Used to order multi-column AND keys smallest-first.
+ * ---------------------------------------------------------------- */
+static uint32
+peek_value_cardinality(Relation index, BlockNumber root_blkno, int64 value)
+{
+	BlockNumber		  leaf_blkno;
+	Buffer			  leafbuf;
+	Page			  leafpage;
+	OffsetNumber	  lo, hi;
+	uint32			  card = 0;
+
+	leaf_blkno = roaring_dir_lookup(index, root_blkno, value);
+	if (leaf_blkno == InvalidBlockNumber)
+		return 0;
+
+	leafbuf  = ReadBuffer(index, leaf_blkno);
+	LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
+	leafpage = BufferGetPage(leafbuf);
+
+	lo = 1;
+	hi = PageGetMaxOffsetNumber(leafpage);
+	while (lo <= hi)
+	{
+		OffsetNumber	  mid = (lo + hi) / 2;
+		RoaringLeafEntry *e   = (RoaringLeafEntry *)
+								 PageGetItem(leafpage,
+											 PageGetItemId(leafpage, mid));
+
+		if (e->value == value)
+		{
+			card = e->cardinality;
+			break;
+		}
+		else if (e->value < value)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+
+	UnlockReleaseBuffer(leafbuf);
+	return card;
+}
+
+typedef struct
+{
+	int    ki;
+	uint64 card_est;
+} ScanKeyOrder;
+
+static int
+scankey_order_cmp(const void *a, const void *b)
+{
+	const ScanKeyOrder *x = (const ScanKeyOrder *) a;
+	const ScanKeyOrder *y = (const ScanKeyOrder *) b;
+
+	if (x->card_est < y->card_est) return -1;
+	if (x->card_est > y->card_est) return 1;
+	return 0;
+}
+
+/* ----------------------------------------------------------------
  * emit_exact_bitmap_to_tbm
  *
  * Decode linearized TIDs from bm and add to tbm via tid_buf batching.
@@ -558,76 +711,136 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	snapshot = scan->xs_snapshot;
 
 	/*
-	 * Multi-column path: for each scan key look up its per-column bitmap
-	 * (main index OR pending), then AND all per-key bitmaps together and
-	 * emit the intersection to tbm.
+	 * Multi-column path: look up per-column bitmaps, AND them together, emit
+	 * to tbm.  Keys are processed in cardinality order (smallest first) so
+	 * each AND step narrows the running result as quickly as possible.
+	 * SK_SEARCHARRAY keys use a single pending-chain walk for all IN values.
 	 */
 	if (index->rd_att->natts > 1)
 	{
 		roaring_bitmap_t * volatile result = NULL;
 		roaring_bitmap_t * volatile col_bm = NULL;
+		ScanKeyOrder	   *order;
 		int ki;
+
+		/* Build cardinality estimates, sort keys ascending. */
+		order = palloc(scan->numberOfKeys * sizeof(ScanKeyOrder));
+		for (ki = 0; ki < scan->numberOfKeys; ki++)
+		{
+			ScanKey k     = &scan->keyData[ki];
+			Oid		typid = TupleDescAttr(index->rd_att, k->sk_attno - 1)->atttypid;
+
+			order[ki].ki = ki;
+			if (k->sk_flags & (SK_ISNULL | SK_SEARCHARRAY))
+				order[ki].card_est = UINT64_MAX;
+			else if (typid == FLOAT4OID && isnan(DatumGetFloat4(k->sk_argument)))
+				order[ki].card_est = 0;		/* NaN matches nothing; process first */
+			else
+			{
+				int64 col_key = ROARING_COL_KEY(k->sk_attno,
+												 roaring_datum_to_key32(k->sk_argument, typid));
+
+				order[ki].card_est = peek_value_cardinality(index, root_blkno, col_key);
+			}
+
+			/*
+			 * Absent key with no pending list: the AND result is provably
+			 * empty.  Stop peeking immediately; skip sort and bitmap work.
+			 * Not safe when pending_count > 0 — that column might have
+			 * freshly inserted rows not yet merged into the main index.
+			 */
+			if (order[ki].card_est == 0 &&
+				pending_count == 0 && merging_head == InvalidBlockNumber)
+			{
+				pfree(order);
+				return 0;
+			}
+		}
+		qsort(order, scan->numberOfKeys, sizeof(ScanKeyOrder), scankey_order_cmp);
 
 		PG_TRY();
 		{
 			for (ki = 0; ki < scan->numberOfKeys; ki++)
 			{
-				ScanKey k = &scan->keyData[ki];
+				ScanKey k = &scan->keyData[order[ki].ki];
 
 				if (k->sk_flags & SK_ISNULL)
 					continue;
 
 				if (k->sk_flags & SK_SEARCHARRAY)
 				{
-					Oid		col_typid = TupleDescAttr(index->rd_att,
-													  k->sk_attno - 1)->atttypid;
-					ArrayType *arr = DatumGetArrayTypeP(k->sk_argument);
+					Oid		   col_typid = TupleDescAttr(index->rd_att,
+														 k->sk_attno - 1)->atttypid;
+					ArrayType *arr		 = DatumGetArrayTypeP(k->sk_argument);
 					Datum	  *elems;
 					bool	  *nulls;
 					int		   nelems, i;
 					int16	   typlen;
 					bool	   typbyval;
 					char	   typalign;
+					int64	  *col_keys;
+					int		   nkeys	 = 0;
 
 					get_typlenbyvalalign(col_typid, &typlen, &typbyval, &typalign);
 					deconstruct_array(arr, col_typid, typlen, typbyval, typalign,
 									  &elems, &nulls, &nelems);
-					col_bm = roaring_bitmap_create();
+					col_bm	 = roaring_bitmap_create();
+					col_keys = palloc(nelems * sizeof(int64));
 
 					for (i = 0; i < nelems; i++)
 					{
-						roaring_bitmap_t *vbm;
-						int64			  col_key;
-
 						if (nulls[i])
 							continue;
 						if (col_typid == FLOAT4OID &&
 							isnan(DatumGetFloat4(elems[i])))
 							continue;
-						col_key = ROARING_COL_KEY(k->sk_attno,
-												   roaring_datum_to_key32(elems[i],
-																		   col_typid));
-						vbm = lookup_value_as_bitmap(index, root_blkno, col_key);
-						if (pending_count > 0 || merging_head != InvalidBlockNumber)
-						{
-							roaring_bitmap_t *pbm =
-								pending_chain_as_bitmap(index, pending_head,
-														 col_key, snapshot);
-							roaring_bitmap_or_inplace(vbm, pbm);
-							roaring_bitmap_free(pbm);
-							if (merging_head != InvalidBlockNumber)
-							{
-								pbm = pending_chain_as_bitmap(index, merging_head,
-															   col_key, snapshot);
-								roaring_bitmap_or_inplace(vbm, pbm);
-								roaring_bitmap_free(pbm);
-							}
-						}
-						roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, vbm);
-						roaring_bitmap_free(vbm);
+						col_keys[nkeys++] = ROARING_COL_KEY(
+							k->sk_attno,
+							roaring_datum_to_key32(elems[i], col_typid));
 					}
 					pfree(elems);
 					pfree(nulls);
+
+					if (nkeys > 0)
+					{
+						roaring_bitmap_t **pbms = NULL;
+						int				   j, m;
+
+						qsort(col_keys, nkeys, sizeof(int64), int64_cmp_for_sort);
+						for (j = 1, m = 1; j < nkeys; j++)
+							if (col_keys[j] != col_keys[j - 1])
+								col_keys[m++] = col_keys[j];
+						nkeys = m;
+
+						if (pending_count > 0 || merging_head != InvalidBlockNumber)
+						{
+							pbms = palloc(nkeys * sizeof(roaring_bitmap_t *));
+							for (j = 0; j < nkeys; j++)
+								pbms[j] = roaring_bitmap_create();
+							pending_chain_fill_values(index, pending_head,
+													  col_keys, pbms, nkeys, snapshot);
+							if (merging_head != InvalidBlockNumber)
+								pending_chain_fill_values(index, merging_head,
+														  col_keys, pbms, nkeys, snapshot);
+						}
+
+						for (j = 0; j < nkeys; j++)
+						{
+							roaring_bitmap_t *vbm =
+								lookup_value_as_bitmap(index, root_blkno, col_keys[j]);
+
+							if (pbms != NULL)
+							{
+								roaring_bitmap_or_inplace(vbm, pbms[j]);
+								roaring_bitmap_free(pbms[j]);
+							}
+							roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, vbm);
+							roaring_bitmap_free(vbm);
+						}
+						if (pbms != NULL)
+							pfree(pbms);
+					}
+					pfree(col_keys);
 				}
 				else
 				{
@@ -638,7 +851,6 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					if (col_typid == FLOAT4OID &&
 						isnan(DatumGetFloat4(k->sk_argument)))
 					{
-						/* NaN never equals anything; skip key entirely. */
 						col_bm = roaring_bitmap_create();
 					}
 					else
@@ -672,6 +884,12 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					roaring_bitmap_and_inplace((roaring_bitmap_t *) result,
 											   (roaring_bitmap_t *) col_bm);
 					roaring_bitmap_free((roaring_bitmap_t *) col_bm);
+					/* Early exit: no rows can match. */
+					if (roaring_bitmap_is_empty((roaring_bitmap_t *) result))
+					{
+						col_bm = NULL;
+						break;
+					}
 				}
 				col_bm = NULL;
 			}
@@ -686,6 +904,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		}
 		PG_CATCH();
 		{
+			pfree(order);
 			if (col_bm)
 				roaring_bitmap_free((roaring_bitmap_t *) col_bm);
 			if (result)
@@ -693,6 +912,8 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
+
+		pfree(order);
 
 		if (tid_count > 0)
 			tbm_add_tuples(tbm, tid_buf, tid_count, false);
@@ -716,53 +937,89 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			int16	   typlen;
 			bool	   typbyval;
 			char	   typalign;
-			roaring_bitmap_t * volatile bm = NULL;
+			int64	  *vals;
+			int		   nvals = 0;
+			roaring_bitmap_t * volatile  bm	  = NULL;
+			roaring_bitmap_t ** volatile pbms = NULL;
 
 			get_typlenbyvalalign(atttypid, &typlen, &typbyval, &typalign);
 			deconstruct_array(arr, atttypid, typlen, typbyval, typalign,
 							  &elems, &nulls, &nelems);
 
-			PG_TRY();
+			vals = palloc(nelems * sizeof(int64));
+			for (i = 0; i < nelems; i++)
 			{
-				for (i = 0; i < nelems; i++)
-				{
-					int64 v;
-
-					if (nulls[i])
-						continue;
-					if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(elems[i])))
-						continue;
-					v = roaring_datum_to_key64(elems[i], atttypid);
-
-					bm = lookup_value_as_bitmap(index, root_blkno, v);
-					if (pending_count > 0 || merging_head != InvalidBlockNumber)
-					{
-						roaring_bitmap_t *pbm =
-							pending_chain_as_bitmap(index, pending_head, v, snapshot);
-						roaring_bitmap_or_inplace(bm, pbm);
-						roaring_bitmap_free(pbm);
-						if (merging_head != InvalidBlockNumber)
-						{
-							pbm = pending_chain_as_bitmap(index, merging_head, v, snapshot);
-							roaring_bitmap_or_inplace(bm, pbm);
-							roaring_bitmap_free(pbm);
-						}
-					}
-					ntids += emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count);
-					roaring_bitmap_free(bm);
-					bm = NULL;
-				}
+				if (nulls[i])
+					continue;
+				if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(elems[i])))
+					continue;
+				vals[nvals++] = roaring_datum_to_key64(elems[i], atttypid);
 			}
-			PG_CATCH();
-			{
-				if (bm)
-					roaring_bitmap_free(bm);
-				PG_RE_THROW();
-			}
-			PG_END_TRY();
-
 			pfree(elems);
 			pfree(nulls);
+
+			if (nvals > 0)
+			{
+				int j, m;
+
+				qsort(vals, nvals, sizeof(int64), int64_cmp_for_sort);
+				for (j = 1, m = 1; j < nvals; j++)
+					if (vals[j] != vals[j - 1])
+						vals[m++] = vals[j];
+				nvals = m;
+
+				PG_TRY();
+				{
+					if (pending_count > 0 || merging_head != InvalidBlockNumber)
+					{
+						pbms = palloc(nvals * sizeof(roaring_bitmap_t *));
+						for (j = 0; j < nvals; j++)
+							pbms[j] = roaring_bitmap_create();
+						pending_chain_fill_values(index, pending_head,
+												  vals, (roaring_bitmap_t **) pbms,
+												  nvals, snapshot);
+						if (merging_head != InvalidBlockNumber)
+							pending_chain_fill_values(index, merging_head,
+													  vals, (roaring_bitmap_t **) pbms,
+													  nvals, snapshot);
+					}
+
+					for (j = 0; j < nvals; j++)
+					{
+						bm = lookup_value_as_bitmap(index, root_blkno, vals[j]);
+						if (pbms != NULL)
+						{
+							roaring_bitmap_or_inplace(bm, pbms[j]);
+							roaring_bitmap_free(pbms[j]);
+							pbms[j] = NULL;
+						}
+						ntids += emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count);
+						roaring_bitmap_free(bm);
+						bm = NULL;
+					}
+					if (pbms != NULL)
+					{
+						pfree((void *) pbms);
+						pbms = NULL;
+					}
+				}
+				PG_CATCH();
+				{
+					if (bm)
+						roaring_bitmap_free(bm);
+					if (pbms)
+					{
+						for (j = 0; j < nvals; j++)
+							if (pbms[j])
+								roaring_bitmap_free(pbms[j]);
+						pfree((void *) pbms);
+					}
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
+			}
+
+			pfree(vals);
 		}
 		else
 		{
@@ -897,68 +1154,122 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 	{
 		roaring_bitmap_t * volatile result = NULL;
 		roaring_bitmap_t * volatile col_bm = NULL;
+		ScanKeyOrder	   *order;
 		int ki;
+
+		/* Build cardinality estimates, sort keys ascending. */
+		order = palloc(scan->numberOfKeys * sizeof(ScanKeyOrder));
+		for (ki = 0; ki < scan->numberOfKeys; ki++)
+		{
+			ScanKey k     = &scan->keyData[ki];
+			Oid		typid = TupleDescAttr(index->rd_att, k->sk_attno - 1)->atttypid;
+
+			order[ki].ki = ki;
+			if (k->sk_flags & (SK_ISNULL | SK_SEARCHARRAY))
+				order[ki].card_est = UINT64_MAX;
+			else if (typid == FLOAT4OID && isnan(DatumGetFloat4(k->sk_argument)))
+				order[ki].card_est = 0;
+			else
+			{
+				int64 col_key = ROARING_COL_KEY(k->sk_attno,
+												 roaring_datum_to_key32(k->sk_argument, typid));
+
+				order[ki].card_est = peek_value_cardinality(index, root_blkno, col_key);
+			}
+
+			/* Absent key, no pending list → AND result is empty. */
+			if (order[ki].card_est == 0 &&
+				pending_count == 0 && merging_head == InvalidBlockNumber)
+			{
+				pfree(order);
+				return 0;
+			}
+		}
+		qsort(order, scan->numberOfKeys, sizeof(ScanKeyOrder), scankey_order_cmp);
 
 		PG_TRY();
 		{
 			for (ki = 0; ki < scan->numberOfKeys; ki++)
 			{
-				ScanKey k = &scan->keyData[ki];
+				ScanKey k = &scan->keyData[order[ki].ki];
 
 				if (k->sk_flags & SK_ISNULL)
 					continue;
 
 				if (k->sk_flags & SK_SEARCHARRAY)
 				{
-					Oid		col_typid = TupleDescAttr(index->rd_att,
-													  k->sk_attno - 1)->atttypid;
-					ArrayType *arr = DatumGetArrayTypeP(k->sk_argument);
+					Oid		   col_typid = TupleDescAttr(index->rd_att,
+														 k->sk_attno - 1)->atttypid;
+					ArrayType *arr		 = DatumGetArrayTypeP(k->sk_argument);
 					Datum	  *elems;
 					bool	  *nulls;
 					int		   nelems, i;
 					int16	   typlen;
 					bool	   typbyval;
 					char	   typalign;
+					int64	  *col_keys;
+					int		   nkeys	 = 0;
 
 					get_typlenbyvalalign(col_typid, &typlen, &typbyval, &typalign);
 					deconstruct_array(arr, col_typid, typlen, typbyval, typalign,
 									  &elems, &nulls, &nelems);
-					col_bm = roaring_bitmap_create();
+					col_bm	 = roaring_bitmap_create();
+					col_keys = palloc(nelems * sizeof(int64));
 
 					for (i = 0; i < nelems; i++)
 					{
-						roaring_bitmap_t *vbm;
-						int64			  col_key;
-
 						if (nulls[i])
 							continue;
 						if (col_typid == FLOAT4OID &&
 							isnan(DatumGetFloat4(elems[i])))
 							continue;
-						col_key = ROARING_COL_KEY(k->sk_attno,
-												   roaring_datum_to_key32(elems[i],
-																		   col_typid));
-						vbm = lookup_value_as_bitmap_lossy(index, root_blkno, col_key);
-						if (pending_count > 0 || merging_head != InvalidBlockNumber)
-						{
-							roaring_bitmap_t *pbm =
-								pending_chain_as_bitmap_lossy(index, pending_head,
-															   col_key, snapshot);
-							roaring_bitmap_or_inplace(vbm, pbm);
-							roaring_bitmap_free(pbm);
-							if (merging_head != InvalidBlockNumber)
-							{
-								pbm = pending_chain_as_bitmap_lossy(index, merging_head,
-																	 col_key, snapshot);
-								roaring_bitmap_or_inplace(vbm, pbm);
-								roaring_bitmap_free(pbm);
-							}
-						}
-						roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, vbm);
-						roaring_bitmap_free(vbm);
+						col_keys[nkeys++] = ROARING_COL_KEY(
+							k->sk_attno,
+							roaring_datum_to_key32(elems[i], col_typid));
 					}
 					pfree(elems);
 					pfree(nulls);
+
+					if (nkeys > 0)
+					{
+						roaring_bitmap_t **pbms = NULL;
+						int				   j, m;
+
+						qsort(col_keys, nkeys, sizeof(int64), int64_cmp_for_sort);
+						for (j = 1, m = 1; j < nkeys; j++)
+							if (col_keys[j] != col_keys[j - 1])
+								col_keys[m++] = col_keys[j];
+						nkeys = m;
+
+						if (pending_count > 0 || merging_head != InvalidBlockNumber)
+						{
+							pbms = palloc(nkeys * sizeof(roaring_bitmap_t *));
+							for (j = 0; j < nkeys; j++)
+								pbms[j] = roaring_bitmap_create();
+							pending_chain_fill_values(index, pending_head,
+													  col_keys, pbms, nkeys, snapshot);
+							if (merging_head != InvalidBlockNumber)
+								pending_chain_fill_values(index, merging_head,
+														  col_keys, pbms, nkeys, snapshot);
+						}
+
+						for (j = 0; j < nkeys; j++)
+						{
+							roaring_bitmap_t *vbm =
+								lookup_value_as_bitmap_lossy(index, root_blkno, col_keys[j]);
+
+							if (pbms != NULL)
+							{
+								roaring_bitmap_or_inplace(vbm, pbms[j]);
+								roaring_bitmap_free(pbms[j]);
+							}
+							roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, vbm);
+							roaring_bitmap_free(vbm);
+						}
+						if (pbms != NULL)
+							pfree(pbms);
+					}
+					pfree(col_keys);
 				}
 				else
 				{
@@ -1002,6 +1313,12 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 					roaring_bitmap_and_inplace((roaring_bitmap_t *) result,
 											   (roaring_bitmap_t *) col_bm);
 					roaring_bitmap_free((roaring_bitmap_t *) col_bm);
+					/* Early exit: no pages can match. */
+					if (roaring_bitmap_is_empty((roaring_bitmap_t *) result))
+					{
+						col_bm = NULL;
+						break;
+					}
 				}
 				col_bm = NULL;
 			}
@@ -1015,6 +1332,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 		}
 		PG_CATCH();
 		{
+			pfree(order);
 			if (col_bm)
 				roaring_bitmap_free((roaring_bitmap_t *) col_bm);
 			if (result)
@@ -1022,6 +1340,8 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
+
+		pfree(order);
 
 		return ntids;
 	}
@@ -1040,53 +1360,89 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 			int16	   typlen;
 			bool	   typbyval;
 			char	   typalign;
-			roaring_bitmap_t * volatile bm = NULL;
+			int64	  *vals;
+			int		   nvals = 0;
+			roaring_bitmap_t * volatile  bm	  = NULL;
+			roaring_bitmap_t ** volatile pbms = NULL;
 
 			get_typlenbyvalalign(atttypid, &typlen, &typbyval, &typalign);
 			deconstruct_array(arr, atttypid, typlen, typbyval, typalign,
 							  &elems, &nulls, &nelems);
 
-			PG_TRY();
+			vals = palloc(nelems * sizeof(int64));
+			for (i = 0; i < nelems; i++)
 			{
-				for (i = 0; i < nelems; i++)
-				{
-					int64 v;
-
-					if (nulls[i])
-						continue;
-					if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(elems[i])))
-						continue;
-					v = roaring_datum_to_key64(elems[i], atttypid);
-
-					bm = lookup_value_as_bitmap_lossy(index, root_blkno, v);
-					if (pending_count > 0 || merging_head != InvalidBlockNumber)
-					{
-						roaring_bitmap_t *pbm =
-							pending_chain_as_bitmap_lossy(index, pending_head, v, snapshot);
-						roaring_bitmap_or_inplace(bm, pbm);
-						roaring_bitmap_free(pbm);
-						if (merging_head != InvalidBlockNumber)
-						{
-							pbm = pending_chain_as_bitmap_lossy(index, merging_head, v, snapshot);
-							roaring_bitmap_or_inplace(bm, pbm);
-							roaring_bitmap_free(pbm);
-						}
-					}
-					ntids += emit_lossy_bitmap_to_tbm(bm, tbm);
-					roaring_bitmap_free(bm);
-					bm = NULL;
-				}
+				if (nulls[i])
+					continue;
+				if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(elems[i])))
+					continue;
+				vals[nvals++] = roaring_datum_to_key64(elems[i], atttypid);
 			}
-			PG_CATCH();
-			{
-				if (bm)
-					roaring_bitmap_free(bm);
-				PG_RE_THROW();
-			}
-			PG_END_TRY();
-
 			pfree(elems);
 			pfree(nulls);
+
+			if (nvals > 0)
+			{
+				int j, m;
+
+				qsort(vals, nvals, sizeof(int64), int64_cmp_for_sort);
+				for (j = 1, m = 1; j < nvals; j++)
+					if (vals[j] != vals[j - 1])
+						vals[m++] = vals[j];
+				nvals = m;
+
+				PG_TRY();
+				{
+					if (pending_count > 0 || merging_head != InvalidBlockNumber)
+					{
+						pbms = palloc(nvals * sizeof(roaring_bitmap_t *));
+						for (j = 0; j < nvals; j++)
+							pbms[j] = roaring_bitmap_create();
+						pending_chain_fill_values(index, pending_head,
+												  vals, (roaring_bitmap_t **) pbms,
+												  nvals, snapshot);
+						if (merging_head != InvalidBlockNumber)
+							pending_chain_fill_values(index, merging_head,
+													  vals, (roaring_bitmap_t **) pbms,
+													  nvals, snapshot);
+					}
+
+					for (j = 0; j < nvals; j++)
+					{
+						bm = lookup_value_as_bitmap_lossy(index, root_blkno, vals[j]);
+						if (pbms != NULL)
+						{
+							roaring_bitmap_or_inplace(bm, pbms[j]);
+							roaring_bitmap_free(pbms[j]);
+							pbms[j] = NULL;
+						}
+						ntids += emit_lossy_bitmap_to_tbm(bm, tbm);
+						roaring_bitmap_free(bm);
+						bm = NULL;
+					}
+					if (pbms != NULL)
+					{
+						pfree((void *) pbms);
+						pbms = NULL;
+					}
+				}
+				PG_CATCH();
+				{
+					if (bm)
+						roaring_bitmap_free(bm);
+					if (pbms)
+					{
+						for (j = 0; j < nvals; j++)
+							if (pbms[j])
+								roaring_bitmap_free(pbms[j]);
+						pfree((void *) pbms);
+					}
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
+			}
+
+			pfree(vals);
 		}
 		else
 		{
