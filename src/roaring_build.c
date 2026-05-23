@@ -445,13 +445,35 @@ write_leaf_and_dir_pages(Relation index,
 		}
 
 		if (l1_count > max_dir)
-			elog(ERROR,
-				 "roaring_build: index too large for two-level directory "
-				 "(%u leaf pages); three-level directory not yet implemented",
-				 leaf_count);
+		{
+			uint32           l2_count  = (l1_count + max_dir - 1) / max_dir;
+			RoaringDirEntry *l2_entries;
+			uint32           k;
 
-		/* Root (level=1): children are dir pages at level 0. */
-		*root_dir_out = roaring_write_dir_page(index, l1_entries, l1_count, 1);
+			if (l2_count > max_dir)
+				elog(ERROR,
+					 "roaring_build: index too large for three-level directory "
+					 "(%u leaf pages)", leaf_count);
+
+			l2_entries = palloc(l2_count * sizeof(RoaringDirEntry));
+
+			for (k = 0; k < l2_count; k++)
+			{
+				uint32      start = k * max_dir;
+				uint32      count = Min(max_dir, l1_count - start);
+				BlockNumber blkno;
+
+				blkno = roaring_write_dir_page(index, l1_entries + start, count, 1);
+				l2_entries[k].high_key   = l1_entries[start + count - 1].high_key;
+				l2_entries[k].child_page = blkno;
+			}
+
+			*root_dir_out = roaring_write_dir_page(index, l2_entries, l2_count, 2);
+			pfree(l2_entries);
+		}
+		else
+			*root_dir_out = roaring_write_dir_page(index, l1_entries, l1_count, 1);
+
 		pfree(l1_entries);
 	}
 
