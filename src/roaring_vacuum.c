@@ -489,6 +489,7 @@ roaring_merge_pending(Relation index)
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 	metapage = BufferGetPage(metabuf);
 	meta     = RoaringPageGetMeta(metapage);
+	roaring_validate_metapage(index, meta);
 
 	/* Bail if another merger is already active (pending_merging_head is set). */
 	if (meta->pending_merging_head != InvalidBlockNumber)

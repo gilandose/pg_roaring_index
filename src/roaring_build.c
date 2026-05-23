@@ -133,7 +133,6 @@ write_metapage(Relation index,
 			   BlockNumber leftmost_leaf,
 			   BlockNumber rightmost_leaf,
 			   BlockNumber pending_insert,
-			   BlockNumber pending_delete,
 			   uint32 total_entries,
 			   uint16 flags)
 {
@@ -161,10 +160,6 @@ write_metapage(Relation index,
 	meta->pending_insert_count	 = 0;
 	meta->pending_merging_head	 = InvalidBlockNumber;
 	meta->pending_carry_head	 = InvalidBlockNumber;
-	meta->pending_delete_head	 = pending_delete;
-	meta->pending_delete_tail	 = pending_delete;
-	meta->pending_delete_count	 = 0;
-	meta->tombstone_root_page	 = InvalidBlockNumber;
 	meta->total_entries			 = total_entries;
 	meta->pending_merge_threshold = ROARING_PENDING_MERGE_THRESHOLD;
 
@@ -474,7 +469,6 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	BlockNumber			leftmost_leaf	= InvalidBlockNumber;
 	BlockNumber			rightmost_leaf	= InvalidBlockNumber;
 	BlockNumber			pending_insert;
-	BlockNumber			pending_delete;
 
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 
@@ -518,13 +512,10 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	pfree(bstate.tuples);
 
-	/* Pending-list pages. */
 	pending_insert = roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
-	pending_delete = roaring_init_pending_page(index, ROARING_PAGE_PENDING_DELETE);
 
-	/* Write metapage into block 0. */
 	write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
-				   pending_insert, pending_delete, (uint32) nentries,
+				   pending_insert, (uint32) nentries,
 				   ROARING_FLAG_EXACT);
 
 	result->heap_tuples  = reltuples;
@@ -553,7 +544,6 @@ roaring_buildempty(Relation index)
 	RoaringMetaPageData *meta;
 	RoaringPendingSpecial *spc;
 	const BlockNumber	 pending_insert_blkno = 1;
-	const BlockNumber	 pending_delete_blkno = 2;
 
 	smgrcreate(smgr, INIT_FORKNUM, false);
 
@@ -573,10 +563,6 @@ roaring_buildempty(Relation index)
 	meta->pending_insert_count	  = 0;
 	meta->pending_merging_head	  = InvalidBlockNumber;
 	meta->pending_carry_head	  = InvalidBlockNumber;
-	meta->pending_delete_head	  = pending_delete_blkno;
-	meta->pending_delete_tail	  = pending_delete_blkno;
-	meta->pending_delete_count	  = 0;
-	meta->tombstone_root_page	  = InvalidBlockNumber;
 	meta->total_entries			  = 0;
 	meta->pending_merge_threshold = ROARING_PENDING_MERGE_THRESHOLD;
 	((PageHeader) page)->pd_lower =
@@ -601,22 +587,6 @@ roaring_buildempty(Relation index)
 	smgrextend(smgr, INIT_FORKNUM, pending_insert_blkno, page, true);
 	log_newpage(&smgr->smgr_rlocator.locator, INIT_FORKNUM,
 				pending_insert_blkno, page, true);
-
-	/* Page 2: pending delete */
-	PageInit(page, BLCKSZ, sizeof(RoaringPendingSpecial));
-	spc			   = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
-	spc->page_type	= ROARING_PAGE_PENDING_DELETE;
-	spc->flags		= 0;
-	spc->entry_count = 0;
-	spc->next_page	= InvalidBlockNumber;
-	spc->xmin_low	= InvalidTransactionId;
-	spc->_pad		= 0;
-	spc->value_min	= PG_INT64_MAX;
-	spc->value_max	= PG_INT64_MIN;
-	PageSetChecksumInplace(page, pending_delete_blkno);
-	smgrextend(smgr, INIT_FORKNUM, pending_delete_blkno, page, true);
-	log_newpage(&smgr->smgr_rlocator.locator, INIT_FORKNUM,
-				pending_delete_blkno, page, true);
 
 	smgrimmedsync(smgr, INIT_FORKNUM);
 	pfree(buf);
@@ -714,7 +684,6 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	BlockNumber			leftmost_leaf	= InvalidBlockNumber;
 	BlockNumber			rightmost_leaf	= InvalidBlockNumber;
 	BlockNumber			pending_insert;
-	BlockNumber			pending_delete;
 
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 
@@ -752,10 +721,9 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	pfree(bstate.tuples);
 
 	pending_insert = roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
-	pending_delete = roaring_init_pending_page(index, ROARING_PAGE_PENDING_DELETE);
 
 	write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
-				   pending_insert, pending_delete, (uint32) nentries,
+				   pending_insert, (uint32) nentries,
 				   ROARING_FLAG_LOSSY);
 
 	result->heap_tuples  = reltuples;
