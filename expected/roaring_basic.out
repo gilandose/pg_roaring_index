@@ -186,6 +186,63 @@ SELECT count(*) AS after_reindex FROM reindex_test WHERE val = 3;
 RESET enable_seqscan;
 DROP TABLE reindex_test;
 -- ----------------------------------------------------------------
+-- 11. Free-list recycling: repeated insert+vacuum cycles
+--
+-- Each VACUUM merges the pending chain and recycles the pending pages
+-- onto the free list.  The next round of inserts should reuse those
+-- pages.  This test verifies correctness after multiple recycling
+-- rounds: the recycled pages must not carry stale data.
+--
+-- Round A: insert 600 rows (val 1..6, 100 each).  Insert 600 more rows
+-- with val=99 all going to one shard, pushing that shard past
+-- ROARING_PENDING_PER_PAGE (508) so roaring_alloc_page is exercised on
+-- the next VACUUM's Step C allocation.
+-- ----------------------------------------------------------------
+CREATE TABLE recycle_test (id serial, val bigint);
+SET enable_seqscan = off;
+-- Round A
+INSERT INTO recycle_test (val) SELECT (i % 6) + 1 FROM generate_series(1, 600) i;
+VACUUM recycle_test;
+SELECT count(*) AS r_a_val1 FROM recycle_test WHERE val = 1;  -- expect 100
+ r_a_val1 
+----------
+      100
+(1 row)
+
+SELECT count(*) AS r_a_val6 FROM recycle_test WHERE val = 6;  -- expect 100
+ r_a_val6 
+----------
+      100
+(1 row)
+
+-- Round B: trigger a page extension in the shard for val=99 (509 inserts
+-- into one shard ensures roaring_alloc_page is called on the next VACUUM).
+INSERT INTO recycle_test (val) SELECT 99 FROM generate_series(1, 509);
+VACUUM recycle_test;
+SELECT count(*) AS r_b_val99 FROM recycle_test WHERE val = 99;  -- expect 509
+ r_b_val99 
+-----------
+       509
+(1 row)
+
+SELECT count(*) AS r_b_val1  FROM recycle_test WHERE val = 1;   -- expect 100
+ r_b_val1 
+----------
+      100
+(1 row)
+
+-- Round C: reuse recycled pages; verify no data corruption.
+INSERT INTO recycle_test (val) SELECT (i % 6) + 1 FROM generate_series(1, 300) i;
+VACUUM recycle_test;
+SELECT count(*) AS r_c_val1 FROM recycle_test WHERE val = 1;  -- expect 150
+ r_c_val1 
+----------
+      150
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE recycle_test;
+-- ----------------------------------------------------------------
 -- Cleanup
 -- ----------------------------------------------------------------
 RESET enable_seqscan;

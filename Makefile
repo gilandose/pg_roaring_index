@@ -7,6 +7,7 @@ OBJS = \
 	src/roaring_scan.o \
 	src/roaring_vacuum.o \
 	src/roaring_cost.o \
+	src/roaring_bgworker.o \
 	src/vendor/croaring/roaring.o
 
 EXTENSION = pg_roaring_index

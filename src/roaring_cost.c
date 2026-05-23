@@ -66,11 +66,21 @@ roaring_costestimate(struct PlannerInfo *root,
 			cache = (RoaringAmCache *)
 				MemoryContextAllocZero(CacheMemoryContext,
 									   sizeof(RoaringAmCache));
+			{
+				uint32 total = 0;
+				int    si;
+
+				for (si = 0; si < ROARING_PENDING_SHARDS; si++)
+				{
+					total += meta->shards[si].insert_count;
+					cache->insert_head[si]  = meta->shards[si].insert_head;
+					cache->merging_head[si] = meta->shards[si].merging_head;
+				}
+				cache->pending_count = total;
+			}
 			cache->root_blkno    = meta->root_directory_page;
 			cache->total_entries = meta->total_entries;
 			cache->meta_lsn      = PageGetLSN(BufferGetPage(metabuf));
-			cache->pending_count = meta->pending_insert_count;
-			cache->merging_head  = meta->pending_merging_head;
 			indexRel->rd_amcache = cache;
 
 			UnlockReleaseBuffer(metabuf);

@@ -134,6 +134,14 @@ roaring_validate_metapage(Relation index, const RoaringMetaPageData *meta)
 			 RelationGetRelationName(index),
 			 (unsigned) meta->croaring_format_version,
 			 (unsigned) ROARING_EXPECTED_FORMAT_VERSION);
+
+	if (meta->num_shards != ROARING_PENDING_SHARDS)
+		elog(ERROR,
+			 "pg_roaring_index: index \"%s\" has %u pending shards, "
+			 "but this build expects %u — REINDEX required",
+			 RelationGetRelationName(index),
+			 (unsigned) meta->num_shards,
+			 (unsigned) ROARING_PENDING_SHARDS);
 }
 
 /*
@@ -147,6 +155,48 @@ roaring_extend_page(Relation index)
 {
 	return ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
 							 EB_LOCK_FIRST);
+}
+
+/*
+ * roaring_alloc_page
+ *
+ * Allocate one page buffer, exclusively locked and ready to write.
+ *
+ * When the metapage's free list is non-empty (free_list_head != Invalid),
+ * the head page is popped and returned.  The caller MUST update the
+ * metapage image inside their GenericXLog record:
+ *
+ *   meta_img->free_list_head = *new_free_list_head_out;
+ *
+ * and MUST register the returned buffer with GENERIC_XLOG_FULL_IMAGE so
+ * the recycled page's stale content is replaced atomically.
+ *
+ * When the free list is empty, the index is extended as usual and
+ * *new_free_list_head_out is set to InvalidBlockNumber (no metapage
+ * update needed by the caller for free_list_head).
+ *
+ * Caller must hold metabuf EXCLUSIVE before calling.
+ */
+Buffer
+roaring_alloc_page(Relation index, Buffer metabuf,
+				   BlockNumber *new_free_list_head_out)
+{
+	RoaringMetaPageData *meta = RoaringPageGetMeta(BufferGetPage(metabuf));
+	BlockNumber			 head = meta->free_list_head;
+
+	if (head != InvalidBlockNumber)
+	{
+		Buffer				buf  = ReadBuffer(index, head);
+		RoaringFreeSpecial *spc;
+
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		spc = (RoaringFreeSpecial *) PageGetSpecialPointer(BufferGetPage(buf));
+		*new_free_list_head_out = spc->next_free;
+		return buf;
+	}
+
+	*new_free_list_head_out = InvalidBlockNumber;
+	return ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL, EB_LOCK_FIRST);
 }
 
 /*

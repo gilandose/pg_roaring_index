@@ -21,7 +21,7 @@
  * On-disk constants
  * ---------- */
 #define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
-#define ROARING_INDEX_VERSION       4   /* bumped when on-disk metapage layout changes */
+#define ROARING_INDEX_VERSION       5   /* bumped for pending-list sharding */
 
 /*
  * Expected CRoaring major version stored in the metapage.  If the index was
@@ -36,10 +36,21 @@
 #define ROARING_PAGE_LEAF           0x03
 #define ROARING_PAGE_OVERFLOW       0x04
 #define ROARING_PAGE_PENDING_INSERT 0x05
+#define ROARING_PAGE_FREE           0x06    /* recycled page on the free list */
 
 /* Metapage flags */
-#define ROARING_FLAG_EXACT          0x01
-#define ROARING_FLAG_LOSSY          0x02
+#define ROARING_FLAG_EXACT              0x01
+#define ROARING_FLAG_LOSSY              0x02
+/*
+ * ROARING_FLAG_BGMERGE_SPAWNED: set (under metapage EX, in the same WAL record
+ * as the page extension that crossed pending_merge_threshold) when a background
+ * merge worker has been spawned for this index.  Cleared by roaring_merge_pending
+ * Step D when the merge commits.  Allows roaring_pending_append to skip the
+ * inline back-pressure merge while the worker is running, eliminating
+ * multi-second INSERT latency spikes.  Hard cap (2× threshold) forces an
+ * inline fallback if the worker is too slow or crashed.
+ */
+#define ROARING_FLAG_BGMERGE_SPAWNED    0x04
 
 /* Leaf entry flags */
 #define ROARING_ENTRY_INLINE        0x00
@@ -65,6 +76,24 @@
 
 /* Pending list merge threshold (entries); override via storage param later */
 #define ROARING_PENDING_MERGE_THRESHOLD 10000
+
+/*
+ * Number of independent pending-list shards.  Writers pick a shard by
+ * ROARING_VALUE_SHARD(value) and compete only with other writers that hash
+ * to the same shard.  Must be a power-of-two so that modulo is a bitmask.
+ * Changing this constant requires a REINDEX (on-disk version bump covers it).
+ */
+#define ROARING_PENDING_SHARDS      8
+#define ROARING_SHARD_MASK          (ROARING_PENDING_SHARDS - 1)
+
+/*
+ * Shard selection: XOR the high and low 32 bits of the int64 key so that
+ * multi-column keys (attno packed in the high 32 bits) and sequential
+ * values both distribute across shards.
+ */
+#define ROARING_VALUE_SHARD(value) \
+    ((int) (((uint32)((uint64)(value) >> 32) ^ (uint32)(uint64)(value)) \
+            & ROARING_SHARD_MASK))
 
 /*
  * Per-column key encoding for multi-column indexes (natts > 1).
@@ -98,39 +127,41 @@
  * On-disk page structures
  * ---------- */
 
+/*
+ * Per-shard state stored in the metapage.  Each shard is an independent
+ * pending-insert chain; writers pick a shard via ROARING_VALUE_SHARD() and
+ * compete only with other writers mapping to the same shard.
+ *
+ * insert_head / insert_tail / insert_count: the live append chain.
+ * merging_head: set at merge start; acts as a mutex (second merger bails out).
+ *               Concurrent scans must walk both insert_head and merging_head.
+ * carry_head:   Case-2 crash-recovery anchor (set in Step B, cleared in Step C).
+ */
+typedef struct RoaringPendingShard
+{
+    BlockNumber insert_head;
+    BlockNumber insert_tail;
+    uint32      insert_count;   /* updated on page extension; approximate between */
+    BlockNumber merging_head;
+    BlockNumber carry_head;
+} RoaringPendingShard;          /* 20 bytes */
+
 typedef struct RoaringMetaPageData
 {
     uint32      magic;
     uint16      version;
     uint16      flags;
     uint16      croaring_format_version;  /* ROARING_EXPECTED_FORMAT_VERSION */
-    uint16      _reserved;               /* explicit pad; keep next field 4-byte aligned */
+    uint8       num_shards;              /* = ROARING_PENDING_SHARDS; validated on open */
+    uint8       _reserved;
 
     BlockNumber root_directory_page;
     BlockNumber leftmost_leaf_page;
     BlockNumber rightmost_leaf_page;
+    BlockNumber free_list_head;         /* head of recycled-page free list */
 
-    BlockNumber pending_insert_head;
-    BlockNumber pending_insert_tail;
-    uint32      pending_insert_count;
-
-    /*
-     * Set to the pending_insert_head at the start of a merge; cleared when
-     * the merge commits.  Crash recovery: if non-InvalidBlockNumber, a prior
-     * merge was interrupted; re-merge from this chain on next vacuum.
-     * Concurrent scans: amgetbitmap must walk both pending_insert_head and
-     * pending_merging_head chains to avoid stale-read gaps.
-     * Also acts as a mutex: a second merger that sees this set bails out.
-     */
-    BlockNumber pending_merging_head;
-
-    /*
-     * Set atomically with the first carry page in Step B of merge; cleared in
-     * Step C when the carry chain becomes the live pending_insert chain.
-     * If non-InvalidBlockNumber during Case 1 crash recovery, these carry pages
-     * are orphaned and will leak until REINDEX (no FSM yet).
-     */
-    BlockNumber pending_carry_head;
+    /* Per-shard pending-list state (ROARING_PENDING_SHARDS entries) */
+    RoaringPendingShard shards[ROARING_PENDING_SHARDS];
 
     /* Statistics (updated on merge) */
     uint32      total_entries;
@@ -240,6 +271,21 @@ typedef struct RoaringOverflowSpecial
     BlockNumber owner_page;
 } RoaringOverflowSpecial;   /* 16 bytes */
 
+/*
+ * RoaringFreeSpecial — special area for a recycled page on the free list.
+ *
+ * next_free sits at the same byte offset as RoaringPendingSpecial.next_page
+ * (offset 4), so we can read the link using either struct.  When a page is
+ * popped from the free list, the caller overwrites it entirely via
+ * GENERIC_XLOG_FULL_IMAGE before the WAL record commits.
+ */
+typedef struct RoaringFreeSpecial
+{
+    uint8       page_type;  /* ROARING_PAGE_FREE */
+    uint8       _pad[3];
+    BlockNumber next_free;  /* next page on free list, or InvalidBlockNumber */
+} RoaringFreeSpecial;   /* 8 bytes — fits inside any existing special area */
+
 /* ----------
  * Inline helpers
  * ---------- */
@@ -292,8 +338,10 @@ typedef struct RoaringAmCache
     BlockNumber root_blkno;
     uint32      total_entries;
     XLogRecPtr  meta_lsn;
-    uint32      pending_count;
-    BlockNumber merging_head;
+    uint32      pending_count;          /* sum across all shards */
+    /* Per-shard head pointers so scans can walk all chains without re-reading meta */
+    BlockNumber insert_head[ROARING_PENDING_SHARDS];
+    BlockNumber merging_head[ROARING_PENDING_SHARDS];
 } RoaringAmCache;
 
 /* ----------
@@ -313,6 +361,8 @@ typedef struct RoaringScanOpaque
 extern void   roaring_validate_metapage(Relation index,
 										const RoaringMetaPageData *meta);
 extern Buffer roaring_extend_page(Relation index);
+extern Buffer roaring_alloc_page(Relation index, Buffer metabuf,
+								 BlockNumber *new_free_list_head_out);
 extern void   roaring_wal_and_release(Relation index, Buffer buf);
 extern BlockNumber roaring_init_pending_page(Relation index, uint8 page_type);
 extern BlockNumber roaring_write_dir_page(Relation index,
@@ -341,6 +391,10 @@ extern int64  roaring_datum_to_key64(Datum d, Oid typid);
 
 /* roaring_vacuum.c — also called from roaring_insert for back-pressure */
 extern void roaring_merge_pending(Relation index);
+
+/* roaring_bgworker.c */
+extern PGDLLEXPORT void roaring_bgworker_main(Datum main_arg);
+extern void roaring_try_spawn_merge_worker(Relation index);
 
 /* roaring_build.c */
 extern IndexBuildResult *roaring_build(Relation heap, Relation index,
