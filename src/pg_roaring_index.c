@@ -26,7 +26,7 @@ _PG_init(void)
 	DefineCustomIntVariable(
 		"roaring.pending_merge_threshold",
 		"Number of pending entries before triggering a background merge.",
-		"Applied at index creation time; stored in the metapage.",
+		"Threshold for triggering a background merge of the pending insert list. Read live on each insert; the metapage stores the build-time value separately.",
 		&roaring_pending_merge_threshold_guc,
 		ROARING_PENDING_MERGE_THRESHOLD,
 		1000,
@@ -137,6 +137,15 @@ roaring_handler(PG_FUNCTION_ARGS)
 {
     IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
+    /*
+     * Integer/bool/date opclasses store true SQL equality keys and could in
+     * principle advertise consistent-equality semantics to the planner (for
+     * hash-join optimisations).  However, text/uuid opclasses store hash(key)
+     * rather than the key itself, so they do not satisfy true equality.
+     * Since the flag would need to be per-opclass rather than per-AM, we
+     * cannot set it globally.  Revisit if/when text/uuid moves to real-equality
+     * storage (e.g. a dictionary page).
+     */
     amroutine->amstrategies   = 1;      /* equality only */
     amroutine->amsupport      = 0;
     amroutine->amoptsprocnum  = 0;
@@ -192,9 +201,9 @@ roaring_handler(PG_FUNCTION_ARGS)
  *
  * Recheck: roaring_getbitmap_lossy calls tbm_add_page(), which causes
  * PG's TIDBitmap to mark every returned page as lossy — the executor
- * rechecks each heap tuple automatically.  amrecheck (IndexAmRoutine)
- * controls per-tuple recheck for exact-mode bitmaps only; it plays no
- * role in the lossy recheck path.
+ * rechecks each heap tuple automatically via the 'recheck' flag passed
+ * to tbm_add_tuples.  That per-tuple recheck path applies only to exact
+ * mode; it plays no role in the page-level lossy recheck.
  */
 Datum
 roaring_page_handler(PG_FUNCTION_ARGS)

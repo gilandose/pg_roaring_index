@@ -1,12 +1,9 @@
 #include "pg_roaring_index.h"
 
-#include <math.h>
-
 #include "access/generic_xlog.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
-#include "postmaster/bgworker.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
@@ -87,33 +84,53 @@ retry:
 				 * No background worker running (flag not set), OR pending list
 				 * has grown past the hard cap (2× threshold) — fall back to
 				 * synchronous merge to bound list growth.
+				 *
+				 * Skip if another backend already holds the merge lock (any
+				 * shard has merging_head set).  That backend's merge will drain
+				 * the list; piling in would just waste a metapage EX acquire.
 				 */
-				uint32 count_before = total;
+				bool   merge_in_flight = false;
+				uint32 count_before    = total;
+				int    k;
 
-				UnlockReleaseBuffer(metabuf);
-				roaring_merge_pending(index);
-
-				/*
-				 * Re-read to detect an unproductive merge (all pending entries
-				 * belong to in-progress transactions).  If so, skip the
-				 * threshold check on the next pass to avoid an infinite retry.
-				 */
+				for (k = 0; k < ROARING_PENDING_SHARDS; k++)
 				{
-					Buffer tmp;
-					uint32 total_after = 0;
-					int    j;
-
-					tmp = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-					LockBuffer(tmp, BUFFER_LOCK_SHARE);
-					meta = RoaringPageGetMeta(BufferGetPage(tmp));
-					for (j = 0; j < ROARING_PENDING_SHARDS; j++)
-						total_after += meta->shards[j].insert_count;
-					UnlockReleaseBuffer(tmp);
-
-					if (total_after >= count_before)
-						merged_unproductively = true;
+					if (meta->shards[k].merging_head != InvalidBlockNumber)
+					{
+						merge_in_flight = true;
+						break;
+					}
 				}
-				goto retry;
+
+				if (!merge_in_flight)
+				{
+					UnlockReleaseBuffer(metabuf);
+					roaring_merge_pending(index);
+
+					/*
+					 * Re-read to detect an unproductive merge (all pending
+					 * entries belong to in-progress transactions).  If so,
+					 * skip the threshold check on the next pass to avoid an
+					 * infinite retry.
+					 */
+					{
+						Buffer tmp;
+						uint32 total_after = 0;
+						int    j;
+
+						tmp = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+						LockBuffer(tmp, BUFFER_LOCK_SHARE);
+						meta = RoaringPageGetMeta(BufferGetPage(tmp));
+						for (j = 0; j < ROARING_PENDING_SHARDS; j++)
+							total_after += meta->shards[j].insert_count;
+						UnlockReleaseBuffer(tmp);
+
+						if (total_after >= count_before)
+							merged_unproductively = true;
+					}
+					goto retry;
+				}
+				/* merge_in_flight: another backend is draining — continue insert. */
 			}
 			/*
 			 * Background worker is running (flag set) and below the hard cap:

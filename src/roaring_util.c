@@ -296,7 +296,7 @@ roaring_write_dir_page(Relation index,
 	data = (RoaringDirEntry *) PageGetContents(page);
 	memcpy(data, entries, count * sizeof(RoaringDirEntry));
 	((PageHeader) page)->pd_lower =
-		(LocationIndex)(SizeOfPageHeaderData + count * sizeof(RoaringDirEntry));
+		(LocationIndex)(MAXALIGN(SizeOfPageHeaderData) + count * sizeof(RoaringDirEntry));
 
 	roaring_wal_and_release(index, buf);
 	return blkno;
@@ -363,7 +363,7 @@ roaring_write_overflow_chain(Relation index,
 		dp = PageGetContents(p);
 		memcpy(dp, chain_data + co, cl);
 		((PageHeader) p)->pd_lower =
-			(LocationIndex)(SizeOfPageHeaderData + cl);
+			(LocationIndex)(MAXALIGN(SizeOfPageHeaderData) + cl);
 
 		MarkBufferDirty(bufs[i]);
 	}

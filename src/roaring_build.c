@@ -10,6 +10,7 @@
 #include "storage/checksum.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 extern int maintenance_work_mem;
@@ -291,6 +292,8 @@ write_leaf_and_dir_pages(Relation index,
 
 	long i;
 
+	Assert(max_dir < PG_UINT16_MAX); /* entry_count is uint16 */
+
 	if (ntuples == 0)
 	{
 		*nentries_out  = 0;
@@ -329,7 +332,14 @@ write_leaf_and_dir_pages(Relation index,
 		size_t			   bitmap_size;
 		Size			   entry_size;
 		RoaringLeafEntry  *le;
-		/* Exactly one of bm64/bm32 is set, matching is_lossy. */
+		/*
+		 * volatile ensures PG_FINALLY sees the correct pointer after a
+		 * longjmp: the bitmaps are constructed before PG_TRY but may not
+		 * yet be freed (NULL'd) when an ERROR fires inside the try block.
+		 * Without volatile, the compiler may cache the NULL assignment in a
+		 * register that the longjmp clobbers, leaving PG_FINALLY with a
+		 * stale non-NULL or NULL value.
+		 */
 		roaring64_bitmap_t * volatile bm64 = NULL;
 		roaring_bitmap_t   * volatile bm32 = NULL;
 
@@ -484,6 +494,7 @@ write_leaf_and_dir_pages(Relation index,
 			pfree(le);
 		}
 
+		Assert(leaf_spc->entry_count < PG_UINT16_MAX);
 		leaf_spc->entry_count++;
 		if (is_lossy) { roaring_bitmap_free(bm32); bm32 = NULL; }
 		else		  { roaring64_bitmap_free(bm64); bm64 = NULL; }
@@ -626,8 +637,7 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 		Assert(BufferGetBlockNumber(buf) == ROARING_METAPAGE_BLKNO);
 		PageInit(BufferGetPage(buf), BLCKSZ, 0);
-		MarkBufferDirty(buf);
-		UnlockReleaseBuffer(buf);
+		roaring_wal_and_release(index, buf);
 	}
 
 	/*
@@ -635,14 +645,18 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	 * doesn't have to be repalloc'd on most builds.  Fall back to 1024 for
 	 * empty/unanalyzed tables.
 	 */
-	init_nalloc = (long) heap->rd_rel->reltuples;
-	if (init_nalloc < 1024)
-		init_nalloc = 1024;
 	{
 		/* Clamp initial allocation to maintenance_work_mem budget. */
 		long mem_nalloc = ((long) maintenance_work_mem * 1024L) /
 						  (long) sizeof(RoaringBuildTuple) /
 						  Max(index->rd_att->natts, 1);
+
+		/* Guard against implementation-defined cast when reltuples > LONG_MAX. */
+		init_nalloc = Min((long) heap->rd_rel->reltuples,
+						  (long) (MaxAllocHugeSize / sizeof(RoaringBuildTuple) /
+								  (Size) Max(index->rd_att->natts, 1)));
+		if (init_nalloc < 1024)
+			init_nalloc = 1024;
 		if (mem_nalloc > 1024 && init_nalloc > mem_nalloc)
 			init_nalloc = mem_nalloc;
 	}
@@ -890,13 +904,16 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 		roaring_wal_and_release(index, buf);
 	}
 
-	init_nalloc = (long) heap->rd_rel->reltuples;
-	if (init_nalloc < 1024)
-		init_nalloc = 1024;
 	{
 		long mem_nalloc = ((long) maintenance_work_mem * 1024L) /
 						  (long) sizeof(RoaringBuildTuple) /
 						  Max(index->rd_att->natts, 1);
+
+		init_nalloc = Min((long) heap->rd_rel->reltuples,
+						  (long) (MaxAllocHugeSize / sizeof(RoaringBuildTuple) /
+								  (Size) Max(index->rd_att->natts, 1)));
+		if (init_nalloc < 1024)
+			init_nalloc = 1024;
 		if (mem_nalloc > 1024 && init_nalloc > mem_nalloc)
 			init_nalloc = mem_nalloc;
 	}

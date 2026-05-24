@@ -37,13 +37,20 @@ cmp_collected(const void *a, const void *b)
 /* ----------------------------------------------------------------
  * collect_pending
  *
- * Walk the pending insert chain and collect all entries whose xmin is
- * committed or belongs to the current transaction.  Returns a sorted
- * palloc'd array; sets *nout to the element count.
+ * Vacuum-side reachability: walk the pending insert chain and collect
+ * all entries that have committed and are old enough to merge safely.
+ * Returns a sorted palloc'd array; sets *nout to the element count.
  *
- * horizon is GetOldestNonRemovableTransactionId() — when a page's xmin_low
- * is older than this, no entry on it can be in-progress or the current
- * transaction, so the per-entry check simplifies to DidCommit only.
+ * 'horizon' is GetOldestNonRemovableTransactionId().  Any entry whose
+ * xmin_low is older than the horizon cannot still be in-progress or
+ * belong to the current transaction, so the per-entry visibility check
+ * reduces to TransactionIdDidCommit() only — no XidInMVCCSnapshot().
+ *
+ * Contrast with roaring_pending_visible (roaring_scan.c), which applies
+ * the full snapshot protocol.  vacuum uses the horizon fast-path because
+ * it is not bound to any particular query snapshot; it only cares whether
+ * an entry is durable and old enough that no reader can still see it as
+ * in-progress.
  *
  * Called while holding no locks; reads each pending page with a share lock.
  * ---------------------------------------------------------------- */
@@ -1827,10 +1834,12 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 			 */
 			{
 				uint64	 bm_count = roaring64_bitmap_get_cardinality(bm);
-				uint64	*all_tids = (uint64 *) palloc_extended((size_t) bm_count * sizeof(uint64),
-																	MCXT_ALLOC_HUGE);
-				uint64	*dead_arr = (uint64 *) palloc_extended((size_t) bm_count * sizeof(uint64),
-																	MCXT_ALLOC_HUGE);
+				uint64	*all_tids = (uint64 *) palloc_extended(
+										mul_size((Size) bm_count, sizeof(uint64)),
+										MCXT_ALLOC_HUGE);
+				uint64	*dead_arr = (uint64 *) palloc_extended(
+										mul_size((Size) bm_count, sizeof(uint64)),
+										MCXT_ALLOC_HUGE);
 				uint64	 ndead    = 0;
 				uint64	 j;
 

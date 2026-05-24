@@ -4,6 +4,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
+#include "nodes/pathnodes.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -104,8 +105,36 @@ roaring_costestimate(struct PlannerInfo *root,
 		return;
 	}
 
-	/* Uniform-distribution selectivity: each value matches 1/nentries fraction. */
-	*indexSelectivity = 1.0 / nentries;
+	/*
+	 * Use clauselist_selectivity so the planner sees actual column statistics
+	 * (MCVs, histograms) rather than a uniform 1/nentries estimate.  This
+	 * prevents the index from being chosen for high-cardinality scans where
+	 * a seqscan would be cheaper.
+	 *
+	 * Clamp to [1/nentries, 1.0] so we never estimate more rows than the
+	 * uniform model would for a single distinct value.
+	 */
+	{
+		/*
+		 * path->indexclauses is a list of IndexClause nodes (PG12+), not
+		 * RestrictInfo directly.  Extract the rinfo pointers before calling
+		 * clauselist_selectivity, which expects RestrictInfo or plain exprs.
+		 */
+		List	   *rinfos = NIL;
+		ListCell   *lc;
+		Selectivity sel;
+
+		foreach(lc, path->indexclauses)
+		{
+			IndexClause *ic = lfirst_node(IndexClause, lc);
+			rinfos = lappend(rinfos, ic->rinfo);
+		}
+
+		sel = clauselist_selectivity(root, rinfos,
+									 index->rel->relid,
+									 JOIN_INNER, NULL);
+		*indexSelectivity = Max(1.0 / nentries, Min(sel, 1.0));
+	}
 	/*
 	 * Directory pages (metapage + root) stay in shared_buffers after first
 	 * access; only the leaf page costs a random read.

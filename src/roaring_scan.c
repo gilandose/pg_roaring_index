@@ -166,7 +166,16 @@ roaring_endscan(IndexScanDesc scan)
 /* ----------------------------------------------------------------
  * roaring_pending_visible
  *
- * GIN-style four-state MVCC visibility check for a pending entry's xmin.
+ * Scan-side MVCC visibility: is a pending entry visible to 'snapshot'?
+ * Uses the full snapshot protocol (XidInMVCCSnapshot) so the answer
+ * tracks the query's exact snapshot, including in-progress transactions
+ * that the snapshot already decided to exclude.
+ *
+ * Contrast with collect_pending (vacuum.c), which uses a horizon-based
+ * fast path: entries older than GetOldestNonRemovableTransactionId() skip
+ * the in-progress check entirely.  Both are correct for their callers;
+ * scan-side must use the snapshot because vacuum's horizon is not safe
+ * here (it could admit rows invisible to the querying transaction).
  * ---------------------------------------------------------------- */
 static bool
 roaring_pending_visible(TransactionId xmin, Snapshot snapshot)
