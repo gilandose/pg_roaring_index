@@ -193,8 +193,10 @@ CREATE FUNCTION roaring_index_health(regclass) RETURNS text
     AS $$
         SELECT
             CASE
-                WHEN bg_merge_running AND pending_count >= pending_threshold
+                WHEN NOT bg_merge_running AND pending_count >= pending_threshold
                     THEN 'merge overdue'
+                WHEN bg_merge_running AND pending_count >= pending_threshold
+                    THEN 'merge running (behind)'
                 WHEN bg_merge_running
                     THEN 'merge in progress'
                 WHEN pending_count > 0

@@ -99,8 +99,8 @@ check_metapage(Relation index, const RoaringMetaPageData *meta,
 static void
 check_directory(Relation index, BlockNumber root_dir, BlockNumber nblocks)
 {
-	BlockNumber cur      = root_dir;
-	int64       prev_key = PG_INT64_MIN;
+	BlockNumber cur       = root_dir;
+	int64       prev_key  = PG_INT64_MIN;
 	bool        have_prev = false;
 
 	while (cur != InvalidBlockNumber)
@@ -108,22 +108,28 @@ check_directory(Relation index, BlockNumber root_dir, BlockNumber nblocks)
 		Buffer			  buf;
 		Page			  page;
 		RoaringDirSpecial *spc;
-		RoaringDirEntry   *entries;
+		RoaringDirEntry   *raw_entries;
 		BlockNumber        right;
 		int                n, max_entries, i;
+		uint8              level;
+
+		/* Palloc'd copies of entries so we can read them after buffer release. */
+		int64       *high_keys;
+		BlockNumber *child_pages;
 
 		CHECK_FOR_INTERRUPTS();
 
 		if (cur >= nblocks)
 			ROARING_CHECK_ERROR("directory right_page %u is out of range", cur);
 
-		buf     = ReadBuffer(index, cur);
+		buf         = ReadBuffer(index, cur);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page    = BufferGetPage(buf);
-		spc     = (RoaringDirSpecial *) PageGetSpecialPointer(page);
-		entries = (RoaringDirEntry *) PageGetContents(page);
-		right   = spc->right_page;
-		n       = (int) spc->entry_count;
+		page        = BufferGetPage(buf);
+		spc         = (RoaringDirSpecial *) PageGetSpecialPointer(page);
+		raw_entries = (RoaringDirEntry *) PageGetContents(page);
+		right       = spc->right_page;
+		n           = (int) spc->entry_count;
+		level       = spc->level;
 
 		if (spc->page_type != ROARING_PAGE_DIRECTORY)
 		{
@@ -143,14 +149,23 @@ check_directory(Relation index, BlockNumber root_dir, BlockNumber nblocks)
 								cur, n, max_entries);
 		}
 
+		/*
+		 * Copy (high_key, child_page) pairs into palloc'd arrays before
+		 * releasing the buffer — raw_entries points into the shared buffer
+		 * page and becomes invalid after UnlockReleaseBuffer.
+		 */
+		high_keys   = (int64 *)       palloc(n * sizeof(int64));
+		child_pages = (BlockNumber *) palloc(n * sizeof(BlockNumber));
 		for (i = 0; i < n; i++)
 		{
-			int64       hk    = entries[i].high_key;
-			BlockNumber child = entries[i].child_page;
+			int64       hk    = raw_entries[i].high_key;
+			BlockNumber child = raw_entries[i].child_page;
 
 			if (have_prev && hk <= prev_key)
 			{
 				UnlockReleaseBuffer(buf);
+				pfree(high_keys);
+				pfree(child_pages);
 				ROARING_CHECK_ERROR("directory page %u: entry %d high_key " INT64_FORMAT
 									" not strictly above previous " INT64_FORMAT,
 									cur, i, hk, prev_key);
@@ -158,10 +173,14 @@ check_directory(Relation index, BlockNumber root_dir, BlockNumber nblocks)
 			if (child == InvalidBlockNumber || child >= nblocks)
 			{
 				UnlockReleaseBuffer(buf);
+				pfree(high_keys);
+				pfree(child_pages);
 				ROARING_CHECK_ERROR("directory page %u: entry %d child_page %u out of range",
 									cur, i, child);
 			}
 
+			high_keys[i]   = hk;
+			child_pages[i] = child;
 			prev_key  = hk;
 			have_prev = true;
 		}
@@ -169,30 +188,51 @@ check_directory(Relation index, BlockNumber root_dir, BlockNumber nblocks)
 		UnlockReleaseBuffer(buf);
 
 		/*
-		 * Verify each child is a leaf page.  Done after releasing the
-		 * directory buffer so we never hold two buffers simultaneously.
+		 * Verify each child has the expected page type.  If level > 0, children
+		 * are inner directory pages (recurse); if level == 0, children are leaves.
+		 * Done after releasing the directory buffer so we never hold two buffers
+		 * simultaneously.
 		 */
 		for (i = 0; i < n; i++)
 		{
-			BlockNumber        child = entries[i].child_page;
-			Buffer             cbuf;
-			RoaringLeafSpecial *cspc;
+			BlockNumber child = child_pages[i];
+			Buffer      cbuf;
+			uint8       child_page_type;
 
-			cbuf  = ReadBuffer(index, child);
+			cbuf            = ReadBuffer(index, child);
 			LockBuffer(cbuf, BUFFER_LOCK_SHARE);
-			cspc  = (RoaringLeafSpecial *)
-					PageGetSpecialPointer(BufferGetPage(cbuf));
-
-			if (cspc->page_type != ROARING_PAGE_LEAF)
-			{
-				UnlockReleaseBuffer(cbuf);
-				ROARING_CHECK_ERROR("directory page %u: entry %d child %u has "
-									"page_type 0x%02X, expected LEAF",
-									cur, i, child, cspc->page_type);
-			}
-
+			child_page_type = ((RoaringLeafSpecial *)
+								PageGetSpecialPointer(BufferGetPage(cbuf)))->page_type;
 			UnlockReleaseBuffer(cbuf);
+
+			if (level > 0)
+			{
+				if (child_page_type != ROARING_PAGE_DIRECTORY)
+				{
+					pfree(high_keys);
+					pfree(child_pages);
+					ROARING_CHECK_ERROR("directory page %u (level %u): entry %d child %u "
+										"has page_type 0x%02X, expected DIRECTORY",
+										cur, level, i, child, child_page_type);
+				}
+				/* Recurse into sub-directory. */
+				check_directory(index, child, nblocks);
+			}
+			else
+			{
+				if (child_page_type != ROARING_PAGE_LEAF)
+				{
+					pfree(high_keys);
+					pfree(child_pages);
+					ROARING_CHECK_ERROR("directory page %u: entry %d child %u has "
+										"page_type 0x%02X, expected LEAF",
+										cur, i, child, child_page_type);
+				}
+			}
 		}
+
+		pfree(high_keys);
+		pfree(child_pages);
 
 		cur = right;
 	}

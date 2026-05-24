@@ -146,10 +146,14 @@ roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 {
 	RoaringScanOpaque *so = (RoaringScanOpaque *) scan->opaque;
 
+	Assert(norderbys == 0);
+
 	so->bitmap_loaded = false;
 
 	if (keys && nkeys > 0)
 		memmove(scan->keyData, keys, nkeys * sizeof(ScanKeyData));
+
+	scan->numberOfKeys = nkeys;
 }
 
 void

@@ -2012,9 +2012,9 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
  * roaring_bulkdelete
  *
  * Walk all leaf pages; remove dead TIDs from bitmaps via the VACUUM callback.
- * Safe for parallel vacuum (VACUUM_OPTION_PARALLEL_BULKDEL): workers have
+ * Parallel vacuum is enabled (VACUUM_OPTION_PARALLEL_BULKDEL): workers have
  * disjoint dead-TID sets (different heap pages), and each leaf page is
- * modified under an exclusive buffer lock so serialisation is correct.
+ * modified under an exclusive buffer lock so concurrent writes are serialised.
  *
  * Pending list dead entries are NOT compacted here — they are merged into
  * leaf bitmaps during vacuumcleanup and removed from there on the next
