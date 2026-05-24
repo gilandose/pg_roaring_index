@@ -1718,8 +1718,10 @@ roaring_merge_pending(Relation index)
 	 * Step E: recycle the frozen pending chain pages.
 	 *
 	 * All active merging_heads were cleared in Step D, so the frozen chains
-	 * are no longer reachable from the metapage.  Re-acquire metapage EX
-	 * and push every page from each frozen chain onto the free list.
+	 * are no longer reachable from the metapage.  For each chain, acquire
+	 * metapage EX, walk the chain, then release.  Releasing between chains
+	 * bounds the contention window for concurrent insert page-extensions,
+	 * which also acquire metapage EX on overflow.
 	 *
 	 * Lock ordering: metapage (blk 0) before any frozen page — same as
 	 * every other path that locks metapage + another buffer.
@@ -1728,21 +1730,24 @@ roaring_merge_pending(Relation index)
 		int s;
 		int i;
 
-		metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-
 		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 		{
 			if (!shard_active[s] || frozen_heads[s] == InvalidBlockNumber)
 				continue;
+			metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 			recycle_chain(index, metabuf, frozen_heads[s]);
+			UnlockReleaseBuffer(metabuf);
 		}
 
 		/* Recycle old overflow chains replaced during Step 3. */
 		for (i = 0; i < old_ovf_ctx.n; i++)
+		{
+			metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 			recycle_chain(index, metabuf, old_ovf_ctx.heads[i]);
-
-		UnlockReleaseBuffer(metabuf);
+			UnlockReleaseBuffer(metabuf);
+		}
 	}
 
 	if (old_ovf_ctx.heads != NULL)
@@ -1755,10 +1760,10 @@ roaring_merge_pending(Relation index)
  * roaring_vacuum_one_leaf
  *
  * For every bitmap entry on a leaf page, call callback for each TID.
- * Remove dead TIDs by reserialing the bitmap in place using
- * PageIndexTupleOverwrite (which handles size shrinkage).  Empty bitmaps
- * are written back with cardinality=0 rather than deleted, so the sorted
- * order of line pointers stays intact for binary search in scan/merge.
+ * Remove dead TIDs by reserialising the bitmap in place using
+ * PageIndexTupleOverwrite (which handles size shrinkage).  Entries that
+ * reach cardinality 0 are deleted via PageIndexTupleDelete so they do not
+ * waste merge cycles; the scan/merge binary-search adjusts offsets normally.
  *
  * The caller must hold buf EXCLUSIVE.  GenericXLog is started lazily;
  * GenericXLogAbort is called if the page turns out to be clean.
