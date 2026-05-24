@@ -34,7 +34,6 @@ roaring_datum_to_key32(Datum d, Oid typid)
 		case OIDOID:
 			return (int32) DatumGetObjectId(d);
 		case TEXTOID:
-		case VARCHAROID:
 		{
 			text *t = DatumGetTextPP(d);
 			return (int32) hash_bytes((const unsigned char *) VARDATA_ANY(t),
@@ -81,7 +80,6 @@ roaring_datum_to_key64(Datum d, Oid typid)
 		case OIDOID:
 			return (int64)(uint32) DatumGetObjectId(d);
 		case TEXTOID:
-		case VARCHAROID:
 		{
 			text *t = DatumGetTextPP(d);
 			return (int64)(uint32) hash_bytes((const unsigned char *) VARDATA_ANY(t),
