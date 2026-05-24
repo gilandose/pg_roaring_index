@@ -392,6 +392,12 @@ roaring_overflow_read_bytes(Relation index, const RoaringOverflowEntry *oe)
 			 "pg_roaring_index: corrupt overflow entry: invalid total_len %zu",
 			 total_len);
 
+	if (oe->overflow_blkno >= RelationGetNumberOfBlocks(index))
+		elog(ERROR,
+			 "pg_roaring_index: corrupt overflow entry: "
+			 "overflow_blkno %u out of range (rel has %u blocks)",
+			 oe->overflow_blkno, RelationGetNumberOfBlocks(index));
+
 	buf = palloc(total_len);
 	off = 0;
 	cur = oe->overflow_blkno;
@@ -414,6 +420,15 @@ roaring_overflow_read_bytes(Relation index, const RoaringOverflowEntry *oe)
 		if (cur != InvalidBlockNumber)
 			PrefetchBuffer(index, MAIN_FORKNUM, cur);
 		UnlockReleaseBuffer(ovbuf);
+	}
+
+	if (off != total_len)
+	{
+		pfree(buf);
+		elog(ERROR,
+			 "pg_roaring_index: overflow chain short read: "
+			 "%zu of %zu bytes for value " INT64_FORMAT,
+			 off, total_len, oe->value);
 	}
 
 	return buf;

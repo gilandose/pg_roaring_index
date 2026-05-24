@@ -56,16 +56,19 @@ roaring_bgworker_main(Datum main_arg)
 	/* Connect to the target database. */
 	BackgroundWorkerInitializeConnectionByOid(args.db_oid, InvalidOid, 0);
 
-	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
-
 	PG_TRY();
 	{
-		Relation index = index_open(args.index_oid, ShareUpdateExclusiveLock);
+		Relation index;
 
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		index = index_open(args.index_oid, ShareUpdateExclusiveLock);
 		roaring_merge_pending(index);
-
 		index_close(index, ShareUpdateExclusiveLock);
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
 	}
 	PG_CATCH();
 	{
@@ -73,14 +76,15 @@ roaring_bgworker_main(Datum main_arg)
 		 * Log the error but don't propagate — a crash here would just
 		 * restart the postmaster.  The hard-cap fallback ensures the
 		 * pending list is eventually drained by an inserting backend.
+		 *
+		 * AbortCurrentTransaction rolls back properly; CommitTransactionCommand
+		 * on an aborted transaction is undefined behaviour.
 		 */
 		EmitErrorReport();
 		FlushErrorState();
+		AbortCurrentTransaction();
 	}
 	PG_END_TRY();
-
-	PopActiveSnapshot();
-	CommitTransactionCommand();
 
 	proc_exit(0);
 }

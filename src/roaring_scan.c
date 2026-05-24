@@ -510,6 +510,17 @@ pending_chain_as_bitmap(Relation index, BlockNumber start_blkno,
 		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
 		raw  = (RoaringPendingEntry *) PageGetContents(page);
 
+		/*
+		 * Guard against vacuum recycling a pending page between when we read
+		 * next_page from the previous page and when we re-acquire SHARE here.
+		 * A recycled page has a different page_type; stop the walk on mismatch.
+		 */
+		if (spc->page_type != ROARING_PAGE_PENDING_INSERT)
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+
 		if (spc->entry_count > ROARING_PENDING_PER_PAGE)
 		{
 			UnlockReleaseBuffer(buf);
@@ -675,6 +686,12 @@ pending_chain_as_bitmap_lossy(Relation index, BlockNumber start_blkno,
 		page = BufferGetPage(buf);
 		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
 		raw  = (RoaringPendingEntry *) PageGetContents(page);
+
+		if (spc->page_type != ROARING_PAGE_PENDING_INSERT)
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
 
 		if (spc->entry_count > ROARING_PENDING_PER_PAGE)
 		{

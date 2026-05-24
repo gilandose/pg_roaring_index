@@ -300,14 +300,17 @@ rebuild_directory(Relation index, BlockNumber leftmost_leaf)
  * roughly in half, places the updated entry on the correct half, and
  * wires both halves into the existing doubly-linked leaf chain.
  *
- * new_item / new_item_size: the replacement item to substitute at found_off.
+ * value: the index key whose entry is being replaced (used to re-locate
+ * the entry under the exclusive lock, avoiding the TOCTOU race with
+ * concurrent ambulkdelete).
+ * new_item / new_item_size: the replacement item to substitute.
  * On return *rightmost_leaf_io is updated if a new rightmost page was
  * created; *leaf_structure_changed is set to true.
  * ---------------------------------------------------------------- */
 static void
 leaf_split_and_update(Relation index,
 					   BlockNumber   leaf_blkno,
-					   OffsetNumber  found_off,
+					   int64		   value,
 					   const char   *new_item,
 					   Size		     new_item_size,
 					   BlockNumber  *rightmost_leaf_io,
@@ -317,6 +320,7 @@ leaf_split_and_update(Relation index,
 	Page				 leafpage;
 	RoaringLeafSpecial	*lspc;
 	OffsetNumber		 off, maxoff;
+	OffsetNumber		 found_off;
 	BlockNumber			 next_blkno;
 	int					 nentries, i, split_at;
 	char			   **items;
@@ -332,6 +336,23 @@ leaf_split_and_update(Relation index,
 	maxoff	   = PageGetMaxOffsetNumber(leafpage);
 	next_blkno = lspc->right_page;
 	nentries   = (int) maxoff;
+
+	/*
+	 * Re-locate the entry under EX to avoid TOCTOU with concurrent
+	 * ambulkdelete, which can shift offsets by calling PageIndexTupleDelete.
+	 */
+	{
+		bool		 found;
+		OffsetNumber fresh_off;
+
+		find_insert_offset(leafpage, value, &found, &fresh_off);
+		if (!found)
+			elog(ERROR,
+				 "pg_roaring_index: split: entry for value " INT64_FORMAT
+				 " not found on leaf page %u",
+				 value, leaf_blkno);
+		found_off = fresh_off;
+	}
 
 	items	   = (char **) palloc(nentries * sizeof(char *));
 	item_sizes = (Size *)  palloc(nentries * sizeof(Size));
@@ -623,6 +644,7 @@ roaring_merge_pending(Relation index)
 	BlockNumber			 rightmost_leaf;
 	uint32				 old_total_entries;
 	int					 ncarry			 = 0;
+	int					 carry_shard	 = -1; /* shard that will host carry chain */
 	BlockNumber			 carry_head		 = InvalidBlockNumber;
 	BlockNumber			 carry_tail_blkno = InvalidBlockNumber;
 	CollectedEntry		*entries;
@@ -682,6 +704,16 @@ roaring_merge_pending(Relation index)
 	rightmost_leaf	  = meta->rightmost_leaf_page;
 	old_total_entries = meta->total_entries;
 	is_lossy		  = (meta->flags & ROARING_FLAG_LOSSY) != 0;
+
+	/* Determine which shard will host the carry chain (lowest-numbered active). */
+	for (i = 0; i < ROARING_PENDING_SHARDS; i++)
+	{
+		if (shard_active[i])
+		{
+			carry_shard = i;
+			break;
+		}
+	}
 
 	/* Step A: atomically set merging_head for all active shards. */
 	{
@@ -784,6 +816,7 @@ roaring_merge_pending(Relation index)
 				cblknos[p] = BufferGetBlockNumber(cbufs[p]);
 			}
 
+			/* Phase 1: initialise all carry pages in memory. */
 			for (p = 0; p < npages; p++)
 			{
 				Page				   cp	   = BufferGetPage(cbufs[p]);
@@ -811,28 +844,29 @@ roaring_merge_pending(Relation index)
 					(LocationIndex)(SizeOfPageHeaderData +
 									pcount * sizeof(RoaringPendingEntry));
 
-				if (p == 0)
-				{
-					/*
-					 * Atomically record carry_head in shard 0's slot and WAL
-					 * the first carry page.  Crash recovery uses this to locate
-					 * orphaned carry pages before Step C's metapage swap.
-					 */
-					GenericXLogState *cstate = GenericXLogStart(index);
-					Page carry_img = GenericXLogRegisterBuffer(cstate, cbufs[0],
-															   GENERIC_XLOG_FULL_IMAGE);
-					Page meta_img  = GenericXLogRegisterBuffer(cstate, metabuf, 0);
-
-					memcpy(carry_img, cp, BLCKSZ);
-					RoaringPageGetMeta(meta_img)->shards[0].carry_head = cblknos[0];
-
-					GenericXLogFinish(cstate);
-					UnlockReleaseBuffer(cbufs[0]);
-				}
-				else
-				{
+				/* WAL and release pages 1..N-1 now (before page 0). */
+				if (p > 0)
 					roaring_wal_and_release(index, cbufs[p]);
-				}
+			}
+
+			/*
+			 * Phase 2: WAL page 0 together with the metapage carry_head update.
+			 *
+			 * Pages 1..N-1 were WAL'd first so that if we crash between this
+			 * record and Step C, crash recovery can walk the full chain starting
+			 * at carry_head without hitting uninitialised blocks.
+			 */
+			{
+				GenericXLogState *cstate = GenericXLogStart(index);
+				Page carry_img = GenericXLogRegisterBuffer(cstate, cbufs[0],
+														   GENERIC_XLOG_FULL_IMAGE);
+				Page meta_img  = GenericXLogRegisterBuffer(cstate, metabuf, 0);
+
+				memcpy(carry_img, BufferGetPage(cbufs[0]), BLCKSZ);
+				RoaringPageGetMeta(meta_img)->shards[carry_shard].carry_head = cblknos[0];
+
+				GenericXLogFinish(cstate);
+				UnlockReleaseBuffer(cbufs[0]);
 			}
 
 			carry_head		 = cblknos[0];
@@ -846,7 +880,7 @@ roaring_merge_pending(Relation index)
 
 	/*
 	 * Step C: for each active shard, swap its insert chain to the carry chain
-	 * (shard 0 only, if carry entries exist) or a fresh empty page.
+	 * (carry_shard only, if carry entries exist) or a fresh empty page.
 	 * Each shard gets its own WAL record (2 buffers: new page + metapage)
 	 * to stay within MAX_GENERIC_XLOG_PAGES = 4.
 	 */
@@ -862,16 +896,16 @@ roaring_merge_pending(Relation index)
 			if (!shard_active[s])
 				continue;
 
-			if (s == 0 && ncarry > 0)
+			if (s == carry_shard && ncarry > 0)
 			{
-				/* Shard 0 gets the carry chain (already WAL'd). */
+				/* carry_shard gets the carry chain (already WAL'd in Step B). */
 				state    = GenericXLogStart(index);
 				meta_img = GenericXLogRegisterBuffer(state, metabuf, 0);
 				m        = RoaringPageGetMeta(meta_img);
-				m->shards[0].insert_head  = carry_head;
-				m->shards[0].insert_tail  = carry_tail_blkno;
-				m->shards[0].insert_count = (uint32) ncarry;
-				m->shards[0].carry_head   = InvalidBlockNumber;
+				m->shards[s].insert_head  = carry_head;
+				m->shards[s].insert_tail  = carry_tail_blkno;
+				m->shards[s].insert_count = (uint32) ncarry;
+				m->shards[s].carry_head   = InvalidBlockNumber;
 				GenericXLogFinish(state);
 			}
 			else
@@ -1218,7 +1252,7 @@ roaring_merge_pending(Relation index)
 					new_le->flags		= ROARING_ENTRY_INLINE;
 					memcpy((char *)(new_le + 1), bm_data, new_size);
 
-					leaf_split_and_update(index, leaf_blkno, found_off,
+					leaf_split_and_update(index, leaf_blkno, cur_value,
 										  (const char *) new_le,
 										  sizeof(RoaringLeafEntry) + new_size,
 										  &rightmost_leaf,
@@ -1234,8 +1268,22 @@ roaring_merge_pending(Relation index)
 						GenericXLogState * volatile xstate = GenericXLogStart(index);
 						PG_TRY();
 						{
+							bool fresh_found;
 							Page img = GenericXLogRegisterBuffer(
 								(GenericXLogState *) xstate, leafbuf, 0);
+
+							/*
+							 * Re-locate entry under EX: concurrent ambulkdelete may
+							 * have called PageIndexTupleDelete in the gap between the
+							 * SHARE read and this EX acquisition, shifting offsets.
+							 */
+							find_insert_offset(img, cur_value,
+											   &fresh_found, &found_off);
+							if (!fresh_found)
+								elog(ERROR,
+									 "pg_roaring_index: merge: entry for value "
+									 INT64_FORMAT " not found on leaf page %u",
+									 cur_value, leaf_blkno);
 
 							/*
 							 * Compacting delete so no LP_UNUSED hole breaks binary search.
