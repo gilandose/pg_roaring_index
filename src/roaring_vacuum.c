@@ -512,6 +512,60 @@ recycle_chain(Relation index, Buffer metabuf, BlockNumber head_blkno)
 }
 
 /* ----------------------------------------------------------------
+ * OvfRecycleCtx
+ *
+ * Deferred list of old overflow chain heads to recycle after leaf writes
+ * are complete.  Recycle happens under a single metapage EX acquisition so
+ * we don't interleave with ongoing leaf updates.  Append via ovf_recycle_add;
+ * drain via recycle_chain (caller holds metabuf EX) or ovf_recycle_flush.
+ * ---------------------------------------------------------------- */
+typedef struct
+{
+	BlockNumber *heads;
+	int			 n;
+	int			 cap;
+} OvfRecycleCtx;
+
+static void
+ovf_recycle_add(OvfRecycleCtx *ctx, BlockNumber blkno)
+{
+	if (blkno == InvalidBlockNumber)
+		return;
+	if (ctx->n == ctx->cap)
+	{
+		ctx->cap = (ctx->cap == 0) ? 16 : ctx->cap * 2;
+		if (ctx->heads == NULL)
+			ctx->heads = (BlockNumber *) palloc(ctx->cap * sizeof(BlockNumber));
+		else
+			ctx->heads = (BlockNumber *) repalloc(ctx->heads,
+												   ctx->cap * sizeof(BlockNumber));
+	}
+	ctx->heads[ctx->n++] = blkno;
+}
+
+/* Drain ctx under a freshly acquired metapage EX lock, then free the list. */
+static void
+ovf_recycle_flush(Relation index, OvfRecycleCtx *ctx)
+{
+	int    i;
+	Buffer metabuf;
+
+	if (ctx->n == 0)
+		return;
+
+	metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	for (i = 0; i < ctx->n; i++)
+		recycle_chain(index, metabuf, ctx->heads[i]);
+	UnlockReleaseBuffer(metabuf);
+
+	pfree(ctx->heads);
+	ctx->heads = NULL;
+	ctx->n     = 0;
+	ctx->cap   = 0;
+}
+
+/* ----------------------------------------------------------------
  * roaring_merge_pending
  *
  * Merge all pending inserts into the main leaf pages.
@@ -920,6 +974,14 @@ roaring_merge_pending(Relation index)
 
 	new_total_entries = old_total_entries;
 
+	/* Deferred list of old overflow chain heads replaced during Step 3. */
+	{
+		OvfRecycleCtx old_ovf_ctx;
+
+		old_ovf_ctx.heads = NULL;
+		old_ovf_ctx.n     = 0;
+		old_ovf_ctx.cap   = 0;
+
 	/* ---- Step 3: process each value group. ---- */
 	i = 0;
 	while (i < nentries)
@@ -987,6 +1049,7 @@ roaring_merge_pending(Relation index)
 				bool				needs_split;
 				char			   *bm_data;
 				BlockNumber			new_ovf_blkno;
+				BlockNumber			old_ovf_blkno;
 				char				pfx_buf[ROARING_OVERFLOW_INLINE_BYTES];
 				size_t				pfx_len;
 
@@ -994,6 +1057,7 @@ roaring_merge_pending(Relation index)
 							PageGetItem(leafpage, PageGetItemId(leafpage, found_off));
 				item_len  = ItemIdGetLength(PageGetItemId(leafpage, found_off));
 				was_overflow = (le->flags & ROARING_ENTRY_OVERFLOW) != 0;
+				old_ovf_blkno = InvalidBlockNumber;
 				/* Save free space before releasing the buffer — pointer goes stale. */
 				leaf_free = PageGetFreeSpace(leafpage);
 
@@ -1004,6 +1068,7 @@ roaring_merge_pending(Relation index)
 						RoaringOverflowEntry oe_copy;
 
 						memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+						old_ovf_blkno = oe_copy.overflow_blkno;
 						UnlockReleaseBuffer(leafbuf);
 						bm32 = roaring_read_overflow_bitmap_lossy(index, &oe_copy);
 					}
@@ -1040,6 +1105,7 @@ roaring_merge_pending(Relation index)
 						RoaringOverflowEntry oe_copy;
 
 						memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+						old_ovf_blkno = oe_copy.overflow_blkno;
 						UnlockReleaseBuffer(leafbuf);
 						bm64 = roaring_read_overflow_bitmap(index, &oe_copy);
 					}
@@ -1204,6 +1270,10 @@ roaring_merge_pending(Relation index)
 
 				pfree(bm_data);
 				found_in_index = true;
+
+				/* Queue old overflow chain for deferred recycle in Step E. */
+				if (was_overflow)
+					ovf_recycle_add(&old_ovf_ctx, old_ovf_blkno);
 			}
 			else
 				UnlockReleaseBuffer(leafbuf);
@@ -1572,6 +1642,7 @@ roaring_merge_pending(Relation index)
 	 */
 	{
 		int s;
+		int i;
 
 		metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
 		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
@@ -1583,8 +1654,17 @@ roaring_merge_pending(Relation index)
 			recycle_chain(index, metabuf, frozen_heads[s]);
 		}
 
+		/* Recycle old overflow chains replaced during Step 3. */
+		for (i = 0; i < old_ovf_ctx.n; i++)
+			recycle_chain(index, metabuf, old_ovf_ctx.heads[i]);
+
 		UnlockReleaseBuffer(metabuf);
 	}
+
+	if (old_ovf_ctx.heads != NULL)
+		pfree(old_ovf_ctx.heads);
+
+	} /* end old_ovf_ctx scope */
 }
 
 /* ----------------------------------------------------------------
@@ -1605,7 +1685,8 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 						IndexBulkDeleteCallback callback,
 						void *callback_state,
 						Relation heaprel,
-						Buffer *vmbuf)
+						Buffer *vmbuf,
+						OvfRecycleCtx *recycle_ctx)
 {
 	GenericXLogState * volatile state = NULL;
 	Page			  img;
@@ -1627,6 +1708,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 		roaring64_bitmap_t *dead_bm = NULL;
 		bool				has_dead;
 		bool				was_overflow;
+		BlockNumber			old_ovf_blkno;
 
 		iid = PageGetItemId(img, off);
 		if (!ItemIdIsUsed(iid))
@@ -1634,6 +1716,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 
 		le = (RoaringLeafEntry *) PageGetItem(img, iid);
 		was_overflow = (le->flags & ROARING_ENTRY_OVERFLOW) != 0;
+		old_ovf_blkno = InvalidBlockNumber;
 		bm = NULL;
 
 		if (was_overflow)
@@ -1641,6 +1724,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 			RoaringOverflowEntry oe_copy;
 
 			memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+			old_ovf_blkno = oe_copy.overflow_blkno;
 			bm = roaring_read_overflow_bitmap(index, &oe_copy);
 		}
 		else
@@ -1802,6 +1886,14 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 					roaring64_bitmap_free(bm);
 					bm = NULL;
 				}
+
+				/*
+				 * Old overflow chain is now unreachable (leaf updated to point
+				 * to new chain or inline data, or entry deleted entirely).
+				 * Queue for recycle after all leaf writes are committed.
+				 */
+				if (was_overflow)
+					ovf_recycle_add(recycle_ctx, old_ovf_blkno);
 			}
 			else
 			{
@@ -1868,6 +1960,11 @@ roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	BlockNumber			 leftmost;
 	BlockNumber			 cur;
 	Buffer				 vmbuf = InvalidBuffer;
+	OvfRecycleCtx		 recycle_ctx;
+
+	recycle_ctx.heads = NULL;
+	recycle_ctx.n     = 0;
+	recycle_ctx.cap   = 0;
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
@@ -1896,7 +1993,7 @@ roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		next = spc->right_page;
 
 		roaring_vacuum_one_leaf(index, buf, stats, callback, callback_state,
-								info->heaprel, &vmbuf);
+								info->heaprel, &vmbuf, &recycle_ctx);
 
 		UnlockReleaseBuffer(buf);
 		cur = next;
@@ -1904,6 +2001,9 @@ roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	if (BufferIsValid(vmbuf))
 		ReleaseBuffer(vmbuf);
+
+	/* Recycle old overflow chains replaced during this VACUUM pass. */
+	ovf_recycle_flush(index, &recycle_ctx);
 
 	return stats;
 }
@@ -2013,6 +2113,13 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	leftmost = RoaringPageGetMeta(BufferGetPage(metabuf))->leftmost_leaf_page;
 	UnlockReleaseBuffer(metabuf);
 
+	{
+	OvfRecycleCtx recycle_ctx;
+
+	recycle_ctx.heads = NULL;
+	recycle_ctx.n     = 0;
+	recycle_ctx.cap   = 0;
+
 	for (cur = leftmost; cur != InvalidBlockNumber; )
 	{
 		Buffer				 leafbuf;
@@ -2042,6 +2149,7 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 				RoaringLeafEntry *le;
 				int64             value;
 				bool              was_overflow;
+				BlockNumber       old_ovf_blkno;
 				roaring_bitmap_t * volatile bm    = NULL;
 				roaring_bitmap_t * volatile new_bm = NULL;
 				uint32            old_card, new_card;
@@ -2050,9 +2158,10 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 				if (!ItemIdIsUsed(iid))
 					continue;
 
-				le           = (RoaringLeafEntry *) PageGetItem(img, iid);
-				value        = le->value;
-				was_overflow = (le->flags & ROARING_ENTRY_OVERFLOW) != 0;
+				le            = (RoaringLeafEntry *) PageGetItem(img, iid);
+				value         = le->value;
+				was_overflow  = (le->flags & ROARING_ENTRY_OVERFLOW) != 0;
+				old_ovf_blkno = InvalidBlockNumber;
 
 				PG_TRY();
 				{
@@ -2061,6 +2170,7 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 						RoaringOverflowEntry oe_copy;
 
 						memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+						old_ovf_blkno = oe_copy.overflow_blkno;
 						/*
 						 * roaring_read_overflow_bitmap_lossy takes share locks on
 						 * overflow pages.  We hold leafbuf exclusive — safe
@@ -2228,6 +2338,12 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 								}
 							}
 						}
+						/*
+						 * Queue old overflow chain for deferred recycle.  Done
+						 * inside bm != NULL so new_card is guaranteed to be set.
+						 */
+						if (was_overflow && new_card != old_card)
+							ovf_recycle_add(&recycle_ctx, old_ovf_blkno);
 					} /* bm != NULL */
 				}
 				PG_FINALLY();
@@ -2255,6 +2371,11 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		UnlockReleaseBuffer(leafbuf);
 		cur = next;
 	}
+
+	/* Recycle old overflow chains replaced during the resummarize pass. */
+	ovf_recycle_flush(index, &recycle_ctx);
+
+	} /* end recycle_ctx scope */
 }
 
 /* ----------------------------------------------------------------
@@ -2293,6 +2414,7 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	RoaringMetaPageData *meta;
 	BlockNumber			 merging_heads[ROARING_PENDING_SHARDS];
 	BlockNumber			 insert_heads[ROARING_PENDING_SHARDS];
+	BlockNumber			 carry_heads[ROARING_PENDING_SHARDS];
 	uint32				 insert_counts[ROARING_PENDING_SHARDS];
 	uint16				 flags;
 	bool				 any_stuck = false;
@@ -2310,6 +2432,7 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	{
 		merging_heads[s]  = meta->shards[s].merging_head;
 		insert_heads[s]   = meta->shards[s].insert_head;
+		carry_heads[s]    = meta->shards[s].carry_head;
 		insert_counts[s]  = meta->shards[s].insert_count;
 		if (merging_heads[s] != InvalidBlockNumber)
 			any_stuck = true;
@@ -2365,6 +2488,20 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 					}
 				}
 				GenericXLogFinish(state);
+			}
+
+			/*
+			 * Recycle any stranded carry-chain pages from the aborted merge.
+			 * The carry chain was allocated in Step B but never installed as
+			 * the insert head (crash happened before Step C).  The metapage
+			 * entry was cleared above, so the pages are now unreachable.
+			 */
+			for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+			{
+				if (merging_heads[s] != InvalidBlockNumber &&
+					insert_heads[s] == merging_heads[s] &&
+					carry_heads[s] != InvalidBlockNumber)
+					recycle_chain(index, metabuf, carry_heads[s]);
 			}
 			UnlockReleaseBuffer(metabuf);
 		}
