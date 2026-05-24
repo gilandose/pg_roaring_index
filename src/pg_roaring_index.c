@@ -100,7 +100,7 @@ roaring_handler(PG_FUNCTION_ARGS)
     amroutine->amcanparallel  = false;
     amroutine->amcaninclude   = false;
     amroutine->amusemaintenanceworkmem = false;
-    amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
+    amroutine->amparallelvacuumoptions = VACUUM_OPTION_NO_PARALLEL;
     amroutine->amkeytype      = InvalidOid;
 
     amroutine->ambuild           = roaring_build;
@@ -159,7 +159,7 @@ roaring_page_handler(PG_FUNCTION_ARGS)
     amroutine->amcanparallel  = false;
     amroutine->amcaninclude   = false;
     amroutine->amusemaintenanceworkmem = false;
-    amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
+    amroutine->amparallelvacuumoptions = VACUUM_OPTION_NO_PARALLEL;
     amroutine->amkeytype      = InvalidOid;
 
     amroutine->ambuild           = roaring_build_lossy;

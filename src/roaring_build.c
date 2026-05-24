@@ -69,8 +69,9 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 			{
 				bstate->nalloc *= 2;
 				bstate->tuples  = (RoaringBuildTuple *)
-								  repalloc(bstate->tuples,
-										   bstate->nalloc * sizeof(RoaringBuildTuple));
+								  repalloc_extended(bstate->tuples,
+													bstate->nalloc * sizeof(RoaringBuildTuple),
+													MCXT_ALLOC_HUGE);
 			}
 
 			bstate->tuples[bstate->ntuples].value = value;
@@ -551,7 +552,8 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	bstate.nalloc      = init_nalloc * index->rd_att->natts; /* natts entries per row */
 	bstate.ntuples     = 0;
 	bstate.tuples      = (RoaringBuildTuple *)
-						 palloc(bstate.nalloc * sizeof(RoaringBuildTuple));
+						 palloc_extended(bstate.nalloc * sizeof(RoaringBuildTuple),
+										 MCXT_ALLOC_HUGE);
 
 	reltuples = table_index_build_scan(heap, index, indexInfo,
 									   true, true,
@@ -708,8 +710,9 @@ roaring_build_callback_lossy(Relation index, ItemPointer tid, Datum *values,
 			{
 				bstate->nalloc *= 2;
 				bstate->tuples  = (RoaringBuildTuple *)
-								  repalloc(bstate->tuples,
-										   bstate->nalloc * sizeof(RoaringBuildTuple));
+								  repalloc_extended(bstate->tuples,
+													bstate->nalloc * sizeof(RoaringBuildTuple),
+													MCXT_ALLOC_HUGE);
 			}
 
 			bstate->tuples[bstate->ntuples].value = value;
@@ -781,7 +784,8 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	bstate.nalloc      = init_nalloc * index->rd_att->natts;
 	bstate.ntuples     = 0;
 	bstate.tuples      = (RoaringBuildTuple *)
-						 palloc(bstate.nalloc * sizeof(RoaringBuildTuple));
+						 palloc_extended(bstate.nalloc * sizeof(RoaringBuildTuple),
+										 MCXT_ALLOC_HUGE);
 
 	reltuples = table_index_build_scan(heap, index, indexInfo,
 									   true, true,
