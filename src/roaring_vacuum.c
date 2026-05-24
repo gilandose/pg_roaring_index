@@ -1750,8 +1750,10 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 			 */
 			{
 				uint64	 bm_count = roaring64_bitmap_get_cardinality(bm);
-				uint64	*all_tids = (uint64 *) palloc((size_t) bm_count * sizeof(uint64));
-				uint64	*dead_arr = (uint64 *) palloc((size_t) bm_count * sizeof(uint64));
+				uint64	*all_tids = (uint64 *) palloc_extended((size_t) bm_count * sizeof(uint64),
+																	MCXT_ALLOC_HUGE);
+				uint64	*dead_arr = (uint64 *) palloc_extended((size_t) bm_count * sizeof(uint64),
+																	MCXT_ALLOC_HUGE);
 				uint64	 ndead    = 0;
 				uint64	 j;
 
@@ -2070,9 +2072,9 @@ roaring_bulkdelete_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
  *
  * This is the BRIN-style dead-block cleanup: O(bitmap_pages) not O(heap).
  *
- * Holding index leaf EXCLUSIVE while reading heap pages is safe: amgetbitmap
- * releases all index locks before touching heap, so no deadlock is possible
- * with concurrent index scans.
+ * Holding index leaf EXCLUSIVE while reading heap pages is safe: concurrent
+ * scans that have already returned their bitmap hold no index locks, so the
+ * lock sets are disjoint and no deadlock is possible.
  *
  * Liveness check: any LP_NORMAL heap tuple with a valid xmin and the indexed
  * value counts as "live enough" to retain the block.  Conservative (we may

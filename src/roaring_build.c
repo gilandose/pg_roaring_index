@@ -535,7 +535,8 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 		Assert(BufferGetBlockNumber(buf) == ROARING_METAPAGE_BLKNO);
 		PageInit(BufferGetPage(buf), BLCKSZ, 0);
-		roaring_wal_and_release(index, buf);
+		MarkBufferDirty(buf);
+		UnlockReleaseBuffer(buf);
 	}
 
 	/*

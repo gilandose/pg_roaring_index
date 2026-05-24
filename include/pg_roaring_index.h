@@ -324,7 +324,8 @@ roaring_cardinality32(const roaring_bitmap_t *bm)
 {
 	uint64_t card = roaring_bitmap_get_cardinality(bm);
 
-	Assert(card <= (uint64_t) UINT32_MAX);
+	if (card > (uint64_t) UINT32_MAX)
+		elog(ERROR, "roaring bitmap cardinality exceeds uint32 max");
 	return (uint32) card;
 }
 
@@ -340,7 +341,8 @@ roaring64_cardinality32(const roaring64_bitmap_t *bm)
 {
 	uint64_t card = roaring64_bitmap_get_cardinality(bm);
 
-	Assert(card <= (uint64_t) UINT32_MAX);
+	if (card > (uint64_t) UINT32_MAX)
+		elog(ERROR, "roaring bitmap cardinality exceeds uint32 max");
 	return (uint32) card;
 }
 

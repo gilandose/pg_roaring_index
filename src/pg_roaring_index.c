@@ -67,7 +67,7 @@ roaring_validate(Oid opclassoid)
                  errdetail("Type %s is not supported.  Supported types: "
                            "bigint, integer, smallint, boolean, date, real, oid, "
                            "text, uuid (text/uuid use hash keys — "
-                           "prototype quality, collisions theoretically possible).",
+                           "hash collisions produce false-positive rechecks, not wrong results).",
                            format_type_be(opcintype))));
 
     return true;
@@ -133,9 +133,14 @@ roaring_handler(PG_FUNCTION_ARGS)
  * roaring_page_handler
  *
  * Lossy (page-level) variant.  Bitmaps store block numbers instead of
- * linearized TIDs.  amrecheck=true tells the executor to recheck every
- * heap tuple on each matched page.  Index is 10-100x smaller than the
- * exact variant at low cardinality; best for multi-column AND queries.
+ * linearized TIDs.  Index is 10-100x smaller than the exact variant at
+ * low cardinality; best for multi-column AND queries.
+ *
+ * Recheck: roaring_getbitmap_lossy calls tbm_add_page(), which causes
+ * PG's TIDBitmap to mark every returned page as lossy — the executor
+ * rechecks each heap tuple automatically.  amrecheck (IndexAmRoutine)
+ * controls per-tuple recheck for exact-mode bitmaps only; it plays no
+ * role in the lossy recheck path.
  */
 Datum
 roaring_page_handler(PG_FUNCTION_ARGS)
