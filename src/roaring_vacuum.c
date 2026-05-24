@@ -8,6 +8,7 @@
 #include "catalog/pg_type_d.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/procarray.h"
 #include "access/visibilitymap.h"
 #include "utils/rel.h"
 
@@ -39,10 +40,15 @@ cmp_collected(const void *a, const void *b)
  * committed or belongs to the current transaction.  Returns a sorted
  * palloc'd array; sets *nout to the element count.
  *
+ * horizon is GetOldestNonRemovableTransactionId() — when a page's xmin_low
+ * is older than this, no entry on it can be in-progress or the current
+ * transaction, so the per-entry check simplifies to DidCommit only.
+ *
  * Called while holding no locks; reads each pending page with a share lock.
  * ---------------------------------------------------------------- */
 static CollectedEntry *
-collect_pending(Relation index, BlockNumber head_blkno, int *nout)
+collect_pending(Relation index, BlockNumber head_blkno, int *nout,
+				TransactionId horizon)
 {
 	CollectedEntry *entries;
 	int				n		 = 0;
@@ -73,15 +79,26 @@ collect_pending(Relation index, BlockNumber head_blkno, int *nout)
 				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
 		}
 
-		for (i = 0; i < spc->entry_count; i++)
+		/*
+		 * If every xmin on this page is older than the oldest non-removable
+		 * xid, no entry can be the current transaction or still in-progress.
+		 * Skip the IsCurrentTransactionId call and treat non-committed as gone.
+		 */
 		{
-			TransactionId xmin = raw[i].xmin;
+			bool all_old = (TransactionIdIsValid(spc->xmin_low) &&
+							TransactionIdPrecedes(spc->xmin_low, horizon));
 
-			if (!TransactionIdIsValid(xmin))
-				continue;
-			if (!TransactionIdIsCurrentTransactionId(xmin) &&
-				!TransactionIdDidCommit(xmin))
-				continue;	/* in-progress (carried forward) or aborted (discarded) */
+			for (i = 0; i < spc->entry_count; i++)
+			{
+				TransactionId xmin = raw[i].xmin;
+
+				if (!TransactionIdIsValid(xmin))
+					continue;
+				if (all_old
+					? !TransactionIdDidCommit(xmin)
+					: (!TransactionIdIsCurrentTransactionId(xmin) &&
+					   !TransactionIdDidCommit(xmin)))
+					continue;	/* in-progress/aborted (discarded) */
 
 			if ((Size) n == capacity)
 			{
@@ -93,7 +110,8 @@ collect_pending(Relation index, BlockNumber head_blkno, int *nout)
 			entries[n].value      = raw[i].value;
 			entries[n].linear_tid = raw[i].linear_tid;
 			n++;
-		}
+			}
+		}  /* all_old scope */
 
 		cur = spc->next_page;
 		UnlockReleaseBuffer(buf);
@@ -688,6 +706,7 @@ roaring_merge_pending(Relation index)
 	{
 		RoaringPendingEntry *carry     = NULL;
 		int					 carry_cap = 0;
+		TransactionId		 horizon   = GetOldestNonRemovableTransactionId(index);
 		int					 s;
 
 		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
@@ -710,6 +729,19 @@ roaring_merge_pending(Relation index)
 				pp   = BufferGetPage(pb);
 				pspc = (RoaringPendingSpecial *) PageGetSpecialPointer(pp);
 				praw = (RoaringPendingEntry *)   PageGetContents(pp);
+
+				/*
+				 * xmin_low page-skip: if every xmin on this page predates the
+				 * oldest non-removable xid, no entry can be in-progress.
+				 * Nothing to carry forward — skip the per-entry loop entirely.
+				 */
+				if (TransactionIdIsValid(pspc->xmin_low) &&
+					TransactionIdPrecedes(pspc->xmin_low, horizon))
+				{
+					cscan = pspc->next_page;
+					UnlockReleaseBuffer(pb);
+					continue;
+				}
 
 				for (k = 0; k < pspc->entry_count; k++)
 				{
@@ -888,9 +920,10 @@ roaring_merge_pending(Relation index)
 
 	/* ---- Step 2: collect entries from all frozen shard chains, sort. ---- */
 	{
-		int			 s;
-		Size		 cap		= 256;
-		int			 ntotal		= 0;
+		int				 s;
+		Size			 cap		= 256;
+		int				 ntotal		= 0;
+		TransactionId	 horizon	= GetOldestNonRemovableTransactionId(index);
 		CollectedEntry *all_entries = (CollectedEntry *)
 									  palloc(cap * sizeof(CollectedEntry));
 
@@ -902,7 +935,7 @@ roaring_merge_pending(Relation index)
 			if (!shard_active[s])
 				continue;
 
-			shard_e = collect_pending(index, frozen_heads[s], &shard_n);
+			shard_e = collect_pending(index, frozen_heads[s], &shard_n, horizon);
 			if (ntotal + shard_n > (int) cap)
 			{
 				while (ntotal + shard_n > (int) cap)
