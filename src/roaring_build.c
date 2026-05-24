@@ -9,7 +9,10 @@
 #include "pgstat.h"
 #include "storage/checksum.h"
 #include "storage/smgr.h"
+#include "utils/guc.h"
 #include "utils/rel.h"
+
+extern int maintenance_work_mem;
 
 /* ----------------------------------------------------------------
  * Internal types
@@ -34,6 +37,26 @@ typedef struct RoaringBuildState
 	long				ntuples;
 	RoaringBuildTuple  *tuples;
 } RoaringBuildState;
+
+/*
+ * Abort the build if doubling the tuple array would exceed maintenance_work_mem.
+ * maintenance_work_mem is in kB; sizeof(RoaringBuildTuple) == 16 bytes.
+ */
+static void
+check_build_mem_limit(long new_nalloc)
+{
+	long max_nalloc = ((long) maintenance_work_mem * 1024L) /
+					  (long) sizeof(RoaringBuildTuple);
+
+	if (new_nalloc > max_nalloc)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("roaring_build: index build exceeds maintenance_work_mem"),
+				 errdetail("Tuple array requires %ld entries (%zu bytes each) but "
+						   "maintenance_work_mem limits the build to %ld entries.",
+						   new_nalloc, sizeof(RoaringBuildTuple), max_nalloc),
+				 errhint("Increase maintenance_work_mem and retry.")));
+}
 
 /* ----------------------------------------------------------------
  * roaring_build_callback
@@ -67,7 +90,9 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 
 			if (bstate->ntuples == bstate->nalloc)
 			{
-				bstate->nalloc *= 2;
+				long new_nalloc = bstate->nalloc * 2;
+				check_build_mem_limit(new_nalloc);
+				bstate->nalloc = new_nalloc;
 				bstate->tuples  = (RoaringBuildTuple *)
 								  repalloc_extended(bstate->tuples,
 													bstate->nalloc * sizeof(RoaringBuildTuple),
@@ -97,7 +122,9 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 
 		if (bstate->ntuples == bstate->nalloc)
 		{
-			bstate->nalloc *= 2;
+			long new_nalloc = bstate->nalloc * 2;
+			check_build_mem_limit(new_nalloc);
+			bstate->nalloc = new_nalloc;
 			bstate->tuples  = (RoaringBuildTuple *)
 							  repalloc_extended(bstate->tuples,
 												bstate->nalloc * sizeof(RoaringBuildTuple),
@@ -271,6 +298,8 @@ write_leaf_and_dir_pages(Relation index,
 		/* Exactly one of bm64/bm32 is set, matching is_lossy. */
 		roaring64_bitmap_t * volatile bm64 = NULL;
 		roaring_bitmap_t   * volatile bm32 = NULL;
+
+		CHECK_FOR_INTERRUPTS();
 
 		while (group_end < ntuples && tuples[group_end].value == cur_value)
 			group_end++;
@@ -560,6 +589,14 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	init_nalloc = (long) heap->rd_rel->reltuples;
 	if (init_nalloc < 1024)
 		init_nalloc = 1024;
+	{
+		/* Clamp initial allocation to maintenance_work_mem budget. */
+		long mem_nalloc = ((long) maintenance_work_mem * 1024L) /
+						  (long) sizeof(RoaringBuildTuple) /
+						  Max(index->rd_att->natts, 1);
+		if (mem_nalloc > 1024 && init_nalloc > mem_nalloc)
+			init_nalloc = mem_nalloc;
+	}
 
 	bstate.heap_tuples = 0;
 	bstate.atttypid    = TupleDescAttr(index->rd_att, 0)->atttypid;
@@ -569,16 +606,24 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 						 palloc_extended(bstate.nalloc * sizeof(RoaringBuildTuple),
 										 MCXT_ALLOC_HUGE);
 
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_TOTAL,
+								 (int64) heap->rd_rel->reltuples);
+
 	reltuples = table_index_build_scan(heap, index, indexInfo,
 									   true, true,
 									   roaring_build_callback,
 									   &bstate, NULL);
 
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+								 (int64) bstate.ntuples);
+
 	/* Sort flat array by (value, tid). */
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE, 2); /* sorting */
 	qsort(bstate.tuples, bstate.ntuples, sizeof(RoaringBuildTuple),
 		  cmp_build_tuple);
 
 	/* Write leaf pages + directory; counts distinct values into nentries. */
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE, 3); /* writing pages */
 	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples, false,
 							 &nentries, &root_dir, &leftmost_leaf, &rightmost_leaf);
 
@@ -722,7 +767,9 @@ roaring_build_callback_lossy(Relation index, ItemPointer tid, Datum *values,
 
 			if (bstate->ntuples == bstate->nalloc)
 			{
-				bstate->nalloc *= 2;
+				long new_nalloc = bstate->nalloc * 2;
+				check_build_mem_limit(new_nalloc);
+				bstate->nalloc = new_nalloc;
 				bstate->tuples  = (RoaringBuildTuple *)
 								  repalloc_extended(bstate->tuples,
 													bstate->nalloc * sizeof(RoaringBuildTuple),
@@ -751,7 +798,9 @@ roaring_build_callback_lossy(Relation index, ItemPointer tid, Datum *values,
 
 		if (bstate->ntuples == bstate->nalloc)
 		{
-			bstate->nalloc *= 2;
+			long new_nalloc = bstate->nalloc * 2;
+			check_build_mem_limit(new_nalloc);
+			bstate->nalloc = new_nalloc;
 			bstate->tuples  = (RoaringBuildTuple *)
 							  repalloc_extended(bstate->tuples,
 												bstate->nalloc * sizeof(RoaringBuildTuple),
@@ -793,6 +842,13 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	init_nalloc = (long) heap->rd_rel->reltuples;
 	if (init_nalloc < 1024)
 		init_nalloc = 1024;
+	{
+		long mem_nalloc = ((long) maintenance_work_mem * 1024L) /
+						  (long) sizeof(RoaringBuildTuple) /
+						  Max(index->rd_att->natts, 1);
+		if (mem_nalloc > 1024 && init_nalloc > mem_nalloc)
+			init_nalloc = mem_nalloc;
+	}
 
 	bstate.heap_tuples = 0;
 	bstate.atttypid    = TupleDescAttr(index->rd_att, 0)->atttypid;
@@ -802,12 +858,19 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 						 palloc_extended(bstate.nalloc * sizeof(RoaringBuildTuple),
 										 MCXT_ALLOC_HUGE);
 
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_TOTAL,
+								 (int64) heap->rd_rel->reltuples);
+
 	reltuples = table_index_build_scan(heap, index, indexInfo,
 									   true, true,
 									   roaring_build_callback_lossy,
 									   &bstate, NULL);
 
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+								 (int64) bstate.ntuples);
+
 	/* Sort by (value, blkno). */
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE, 2); /* sorting */
 	qsort(bstate.tuples, bstate.ntuples, sizeof(RoaringBuildTuple),
 		  cmp_build_tuple);
 
@@ -828,6 +891,7 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 		bstate.ntuples = out;
 	}
 
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE, 3); /* writing pages */
 	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples, true,
 							 &nentries, &root_dir, &leftmost_leaf, &rightmost_leaf);
 

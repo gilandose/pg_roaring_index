@@ -1,6 +1,7 @@
 #include "pg_roaring_index.h"
 
 #include "access/generic_xlog.h"
+#include "miscadmin.h"
 #include "access/htup_details.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -1059,6 +1060,8 @@ roaring_merge_pending(Relation index)
 		uint64		*group_tids  = NULL;
 		BlockNumber	 leaf_blkno;
 		bool		 found_in_index;
+
+		CHECK_FOR_INTERRUPTS();
 
 		while (group_end < nentries && entries[group_end].value == cur_value)
 			group_end++;

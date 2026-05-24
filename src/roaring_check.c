@@ -4,6 +4,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 PG_FUNCTION_INFO_V1(roaring_index_check);
@@ -51,6 +52,10 @@ check_metapage(Relation index, const RoaringMetaPageData *meta,
 	if (meta->num_shards != ROARING_PENDING_SHARDS)
 		ROARING_CHECK_ERROR("num_shards %u != compiled-in %d",
 							meta->num_shards, ROARING_PENDING_SHARDS);
+	if (meta->croaring_format_version != ROARING_EXPECTED_FORMAT_VERSION)
+		ROARING_CHECK_ERROR("croaring_format_version %u != expected %u",
+							meta->croaring_format_version,
+							ROARING_EXPECTED_FORMAT_VERSION);
 	if (meta->root_directory_page == InvalidBlockNumber ||
 		meta->root_directory_page >= nblocks)
 		ROARING_CHECK_ERROR("root_directory_page %u is out of range (nblocks %u)",
@@ -102,6 +107,7 @@ check_directory(Relation index, BlockNumber root_dir, BlockNumber nblocks)
 	BlockNumber cur       = root_dir;
 	int64       prev_key  = PG_INT64_MIN;
 	bool        have_prev = false;
+	uint32      steps     = 0;
 
 	while (cur != InvalidBlockNumber)
 	{
@@ -116,6 +122,10 @@ check_directory(Relation index, BlockNumber root_dir, BlockNumber nblocks)
 		/* Palloc'd copies of entries so we can read them after buffer release. */
 		int64       *high_keys;
 		BlockNumber *child_pages;
+
+		if (++steps > nblocks)
+			ROARING_CHECK_ERROR("directory chain has more pages than the relation "
+								"(%u); possible cycle", nblocks);
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -265,6 +275,7 @@ check_leaf_chain(Relation index,
 	int          novf       = 0;
 	int          ovf_cap    = 32;
 	DeferredOvf *ovf        = (DeferredOvf *) palloc(ovf_cap * sizeof(DeferredOvf));
+	uint32       steps      = 0;
 
 	while (cur != InvalidBlockNumber)
 	{
@@ -277,6 +288,10 @@ check_leaf_chain(Relation index,
 		int64              prev_val = PG_INT64_MIN;
 		bool               have_prev_val = false;
 		BlockNumber        right;
+
+		if (++steps > nblocks)
+			ROARING_CHECK_ERROR("leaf chain has more pages than the relation "
+								"(%u); possible cycle", nblocks);
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -373,6 +388,12 @@ check_leaf_chain(Relation index,
 					ROARING_CHECK_ERROR("leaf page %u: overflow item %d: total_len is zero",
 										cur, i);
 				}
+				if ((Size) oe->total_len > MaxAllocSize)
+				{
+					UnlockReleaseBuffer(buf);
+					ROARING_CHECK_ERROR("leaf page %u: overflow item %d: total_len %u "
+										"exceeds MaxAllocSize", cur, i, oe->total_len);
+				}
 
 				if (novf == ovf_cap)
 				{
@@ -417,6 +438,28 @@ check_leaf_chain(Relation index,
 		UnlockReleaseBuffer(buf);
 	}
 
+	/* F4: rightmost leaf must terminate the chain with right_page == Invalid.
+	 * The loop exits only when cur (= right_page of last leaf) is Invalid, so
+	 * this is a loop invariant — assert it explicitly for clarity. */
+	if (prev_blkno != InvalidBlockNumber)
+	{
+		Buffer				  rbuf;
+		RoaringLeafSpecial	 *rspc;
+
+		rbuf = ReadBuffer(index, prev_blkno);
+		LockBuffer(rbuf, BUFFER_LOCK_SHARE);
+		rspc = (RoaringLeafSpecial *)
+			   PageGetSpecialPointer(BufferGetPage(rbuf));
+		if (rspc->right_page != InvalidBlockNumber)
+		{
+			BlockNumber bad = rspc->right_page;
+			UnlockReleaseBuffer(rbuf);
+			ROARING_CHECK_ERROR("rightmost leaf page %u: right_page %u is not "
+								"InvalidBlockNumber", prev_blkno, bad);
+		}
+		UnlockReleaseBuffer(rbuf);
+	}
+
 	*ovf_out  = ovf;
 	*novf_out = novf;
 	return prev_blkno;
@@ -444,6 +487,8 @@ check_overflow_chains(Relation index, const DeferredOvf *ovf, int novf,
 		uint32      expected = ovf[oi].total_len;
 		size_t      seen     = 0;
 		uint16      seq      = 0;
+		uint32      osteps   = 0;
+		uint32      max_ovf_steps = (uint32)((expected + cap - 1) / cap) + 1;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -452,6 +497,12 @@ check_overflow_chains(Relation index, const DeferredOvf *ovf, int novf,
 			Buffer				   ovbuf;
 			RoaringOverflowSpecial *ospc;
 			size_t				   cl;
+
+			if (++osteps > max_ovf_steps)
+				ROARING_CHECK_ERROR("leaf page %u item %d: overflow chain length "
+									"exceeds expected page count (%u); possible cycle",
+									ovf[oi].leaf_blkno, ovf[oi].leaf_off,
+									max_ovf_steps);
 
 			if (chain >= nblocks)
 				ROARING_CHECK_ERROR("leaf page %u item %d: overflow chain page %u out of range",
@@ -506,7 +557,8 @@ static void
 check_pending_chain(Relation index, BlockNumber head,
 					const char *label, BlockNumber nblocks)
 {
-	BlockNumber cur = head;
+	BlockNumber cur   = head;
+	uint32      steps = 0;
 
 	while (cur != InvalidBlockNumber)
 	{
@@ -515,6 +567,10 @@ check_pending_chain(Relation index, BlockNumber head,
 		RoaringPendingSpecial *spc;
 		RoaringPendingEntry   *raw;
 		uint16                k;
+
+		if (++steps > nblocks)
+			ROARING_CHECK_ERROR("pending chain \"%s\" has more pages than the "
+								"relation (%u); possible cycle", label, nblocks);
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -540,6 +596,17 @@ check_pending_chain(Relation index, BlockNumber head,
 			UnlockReleaseBuffer(buf);
 			ROARING_CHECK_ERROR("pending chain \"%s\" page %u: entry_count %u > max %d",
 								label, cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
+		}
+
+		/* F8: empty page must have sentinel min/max values. */
+		if (spc->entry_count == 0 &&
+			(spc->value_min != PG_INT64_MAX || spc->value_max != PG_INT64_MIN))
+		{
+			UnlockReleaseBuffer(buf);
+			ROARING_CHECK_ERROR("pending chain \"%s\" page %u: entry_count 0 but "
+								"value_min/value_max are not sentinels "
+								"(" INT64_FORMAT " / " INT64_FORMAT ")",
+								label, cur, spc->value_min, spc->value_max);
 		}
 
 		for (k = 0; k < spc->entry_count; k++)
@@ -569,6 +636,53 @@ check_pending_chain(Relation index, BlockNumber head,
 
 		cur = spc->next_page;
 		UnlockReleaseBuffer(buf);
+	}
+}
+
+/* ----------------------------------------------------------------
+ * check_free_list
+ *
+ * Walk the free-page list.  Verify:
+ *   - every page within range
+ *   - page_type == ROARING_PAGE_FREE on each page
+ *   - no cycle (capped at nblocks steps)
+ * ---------------------------------------------------------------- */
+static void
+check_free_list(Relation index, BlockNumber head, BlockNumber nblocks)
+{
+	BlockNumber cur   = head;
+	uint32      steps = 0;
+
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				buf;
+		RoaringLeafSpecial *spc;
+		BlockNumber			next;
+
+		if (++steps > nblocks)
+			ROARING_CHECK_ERROR("free list has more pages than the relation "
+								"(%u); possible cycle", nblocks);
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (cur >= nblocks)
+			ROARING_CHECK_ERROR("free list: page %u is out of range", cur);
+
+		buf  = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		spc  = (RoaringLeafSpecial *) PageGetSpecialPointer(BufferGetPage(buf));
+
+		if (spc->page_type != ROARING_PAGE_FREE)
+		{
+			uint8 got = spc->page_type;
+			UnlockReleaseBuffer(buf);
+			ROARING_CHECK_ERROR("free list page %u: page_type 0x%02X, expected FREE",
+								cur, got);
+		}
+
+		next = ((RoaringFreeSpecial *) spc)->next_free;
+		UnlockReleaseBuffer(buf);
+		cur = next;
 	}
 }
 
@@ -653,6 +767,10 @@ roaring_index_check(PG_FUNCTION_ARGS)
 								label, nblocks);
 		}
 	}
+
+	/* ---- Free list (F3) ---- */
+	if (meta_copy.free_list_head != InvalidBlockNumber)
+		check_free_list(index, meta_copy.free_list_head, nblocks);
 
 	relation_close(index, AccessShareLock);
 	PG_RETURN_VOID();

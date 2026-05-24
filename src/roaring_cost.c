@@ -45,14 +45,23 @@ roaring_costestimate(struct PlannerInfo *root,
 	 * A slightly stale total_entries is fine for selectivity estimation.
 	 */
 	{
-		Relation		indexRel = index_open(index->indexoid, AccessShareLock);
-		RoaringAmCache *cache   = (RoaringAmCache *) indexRel->rd_amcache;
+		Relation		indexRel   = index_open(index->indexoid, AccessShareLock);
+		RoaringAmCache *cache    = (RoaringAmCache *) indexRel->rd_amcache;
+		bool		    cache_ok = false;
 
 		if (cache != NULL && cache->total_entries > 0)
 		{
-			nentries = (double) cache->total_entries;
+			Buffer     tmp     = ReadBuffer(indexRel, ROARING_METAPAGE_BLKNO);
+			XLogRecPtr cur_lsn = BufferGetLSNAtomic(tmp);
+			ReleaseBuffer(tmp);
+			if (cur_lsn == cache->meta_lsn)
+			{
+				nentries = (double) cache->total_entries;
+				cache_ok = true;
+			}
 		}
-		else
+
+		if (!cache_ok)
 		{
 			Buffer				metabuf;
 			RoaringMetaPageData *meta;

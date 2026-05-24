@@ -39,8 +39,6 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 	meta    = RoaringPageGetMeta(BufferGetPage(metabuf));
 
-	roaring_validate_metapage(index, meta);
-
 	for (i = 0; i < ROARING_PENDING_SHARDS; i++)
 		pending_count += meta->shards[i].insert_count;
 
