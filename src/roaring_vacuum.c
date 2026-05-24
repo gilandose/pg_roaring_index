@@ -8,6 +8,7 @@
 #include "catalog/pg_type_d.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "access/visibilitymap.h"
 #include "utils/rel.h"
 
 /* ----------------------------------------------------------------
@@ -1602,7 +1603,9 @@ static bool
 roaring_vacuum_one_leaf(Relation index, Buffer buf,
 						IndexBulkDeleteResult *stats,
 						IndexBulkDeleteCallback callback,
-						void *callback_state)
+						void *callback_state,
+						Relation heaprel,
+						Buffer *vmbuf)
 {
 	GenericXLogState * volatile state = NULL;
 	Page			  img;
@@ -1670,18 +1673,49 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 
 				roaring64_bitmap_to_uint64_array(bm, all_tids);
 
-				for (j = 0; j < bm_count; j++)
 				{
-					uint64			ltid = all_tids[j];
-					ItemPointerData	tid;
+					BlockNumber prev_hblk      = InvalidBlockNumber;
+					bool		blk_all_visible = false;
 
-					ItemPointerSetBlockNumber(&tid, (BlockNumber)(ltid >> 9));
-					ItemPointerSetOffsetNumber(&tid, (OffsetNumber)((ltid & 0x1FF) + 1));
-
-					if (callback(&tid, callback_state))
+					for (j = 0; j < bm_count; j++)
 					{
-						dead_arr[ndead++] = ltid;
-						stats->tuples_removed++;
+						uint64		ltid   = all_tids[j];
+						BlockNumber hblkno = (BlockNumber)(ltid >> 9);
+
+						/*
+						 * roaring64 stores values in sorted order, so TIDs from
+						 * the same heap block are contiguous.  Check the VM once
+						 * per block transition; skip callback on all-visible pages
+						 * (no dead TIDs possible).
+						 */
+						if (hblkno != prev_hblk)
+						{
+							if (heaprel)
+							{
+								uint8 vm_status =
+									visibilitymap_get_status(heaprel, hblkno, vmbuf);
+								blk_all_visible =
+									(vm_status & VISIBILITYMAP_ALL_VISIBLE) != 0;
+							}
+							else
+								blk_all_visible = false;
+							prev_hblk = hblkno;
+						}
+						if (blk_all_visible)
+							continue;
+
+						{
+							ItemPointerData tid;
+
+							ItemPointerSetBlockNumber(&tid, hblkno);
+							ItemPointerSetOffsetNumber(&tid,
+								(OffsetNumber)((ltid & 0x1FF) + 1));
+							if (callback(&tid, callback_state))
+							{
+								dead_arr[ndead++] = ltid;
+								stats->tuples_removed++;
+							}
+						}
 					}
 				}
 				pfree(all_tids);
@@ -1833,6 +1867,7 @@ roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	RoaringMetaPageData *meta;
 	BlockNumber			 leftmost;
 	BlockNumber			 cur;
+	Buffer				 vmbuf = InvalidBuffer;
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
@@ -1860,11 +1895,15 @@ roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		spc  = (RoaringLeafSpecial *) PageGetSpecialPointer(page);
 		next = spc->right_page;
 
-		roaring_vacuum_one_leaf(index, buf, stats, callback, callback_state);
+		roaring_vacuum_one_leaf(index, buf, stats, callback, callback_state,
+								info->heaprel, &vmbuf);
 
 		UnlockReleaseBuffer(buf);
 		cur = next;
 	}
+
+	if (BufferIsValid(vmbuf))
+		ReleaseBuffer(vmbuf);
 
 	return stats;
 }
