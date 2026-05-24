@@ -99,8 +99,9 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 		{
 			bstate->nalloc *= 2;
 			bstate->tuples  = (RoaringBuildTuple *)
-							  repalloc(bstate->tuples,
-									   bstate->nalloc * sizeof(RoaringBuildTuple));
+							  repalloc_extended(bstate->tuples,
+												bstate->nalloc * sizeof(RoaringBuildTuple),
+												MCXT_ALLOC_HUGE);
 		}
 
 		bstate->tuples[bstate->ntuples].value = value;
@@ -238,8 +239,23 @@ write_leaf_and_dir_pages(Relation index,
 		return;
 	}
 
+	/*
+	 * Pre-check: worst case is one leaf page per distinct value.  If ntuples
+	 * (an upper bound on distinct values) already exceeds the three-level
+	 * directory capacity, fail now before paying the full build cost.
+	 */
+	if (ntuples > (long) max_dir * (long) max_dir * (long) max_dir)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("roaring_build: index too large for three-level directory"),
+				 errdetail("Distinct-value estimate %ld exceeds capacity %ld.",
+						   ntuples, (long) max_dir * (long) max_dir * (long) max_dir),
+				 errhint("Reduce the number of indexed distinct values, "
+						 "or use REINDEX after reducing cardinality.")));
+
 	/* Worst case: one leaf page per distinct value (≤ ntuples). */
-	leaf_entries = palloc(ntuples * sizeof(RoaringDirEntry));
+	leaf_entries = palloc_extended(ntuples * sizeof(RoaringDirEntry),
+								   MCXT_ALLOC_HUGE);
 
 	/* ---- Phase A: write leaf pages ---- */
 	i = 0;
@@ -737,8 +753,9 @@ roaring_build_callback_lossy(Relation index, ItemPointer tid, Datum *values,
 		{
 			bstate->nalloc *= 2;
 			bstate->tuples  = (RoaringBuildTuple *)
-							  repalloc(bstate->tuples,
-									   bstate->nalloc * sizeof(RoaringBuildTuple));
+							  repalloc_extended(bstate->tuples,
+												bstate->nalloc * sizeof(RoaringBuildTuple),
+												MCXT_ALLOC_HUGE);
 		}
 
 		bstate->tuples[bstate->ntuples].value = value;

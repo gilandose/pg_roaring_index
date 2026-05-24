@@ -302,6 +302,8 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 {
 	RoaringPendingEntry entry;
 
+	memset(&entry, 0, sizeof(entry));
+
 	if (isnull[0])
 		return false;
 
@@ -364,6 +366,8 @@ roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
 					 struct IndexInfo *indexInfo)
 {
 	RoaringPendingEntry entry;
+
+	memset(&entry, 0, sizeof(entry));
 
 	if (isnull[0])
 		return false;

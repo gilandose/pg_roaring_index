@@ -1387,8 +1387,15 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 					if (nkeys > 0)
 					{
-						roaring64_bitmap_t **pbms = NULL;
-						int				     j, m;
+						/*
+						 * pbms and vbms are declared volatile so the nested PG_CATCH
+						 * can free them safely on error (T15).  palloc0 ensures
+						 * uninitialized slots are NULL so catch-side iteration is safe
+						 * even if roaring64_bitmap_create() throws mid-loop (T16).
+						 */
+						roaring64_bitmap_t ** volatile pbms_v = NULL;
+						roaring64_bitmap_t ** volatile vbms_v = NULL;
+						int j, m;
 
 						qsort(col_keys, nkeys, sizeof(int64), int64_cmp_for_sort);
 						for (j = 1, m = 1; j < nkeys; j++)
@@ -1396,43 +1403,71 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 								col_keys[m++] = col_keys[j];
 						nkeys = m;
 
-						if (any_pending)
+						PG_TRY();
 						{
-							int s;
-
-							pbms = palloc(nkeys * sizeof(roaring64_bitmap_t *));
-							for (j = 0; j < nkeys; j++)
-								pbms[j] = roaring64_bitmap_create();
-							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+							if (any_pending)
 							{
-								pending_chain_fill_values_exact(index, insert_heads[s],
-																col_keys, pbms, nkeys, snapshot);
-								if (merging_heads[s] != InvalidBlockNumber)
-									pending_chain_fill_values_exact(index, merging_heads[s],
-																	col_keys, pbms, nkeys, snapshot);
-							}
-						}
+								int s;
 
-						{
-							roaring64_bitmap_t **vbms =
-								palloc(nkeys * sizeof(roaring64_bitmap_t *));
-
-							lookup_values_as_bitmaps_leaf_walk(
-								index, root_blkno, col_keys, vbms, nkeys);
-							for (j = 0; j < nkeys; j++)
-							{
-								if (pbms != NULL)
+								pbms_v = palloc0(nkeys * sizeof(roaring64_bitmap_t *));
+								for (j = 0; j < nkeys; j++)
+									pbms_v[j] = roaring64_bitmap_create();
+								for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 								{
-									roaring64_bitmap_or_inplace(vbms[j], pbms[j]);
-									roaring64_bitmap_free(pbms[j]);
+									pending_chain_fill_values_exact(
+										index, insert_heads[s],
+										col_keys, (roaring64_bitmap_t **) pbms_v,
+										nkeys, snapshot);
+									if (merging_heads[s] != InvalidBlockNumber)
+										pending_chain_fill_values_exact(
+											index, merging_heads[s],
+											col_keys, (roaring64_bitmap_t **) pbms_v,
+											nkeys, snapshot);
 								}
-								roaring64_bitmap_or_inplace(col_bm, vbms[j]);
-								roaring64_bitmap_free(vbms[j]);
 							}
-							pfree(vbms);
+
+							vbms_v = palloc0(nkeys * sizeof(roaring64_bitmap_t *));
+							lookup_values_as_bitmaps_leaf_walk(
+								index, root_blkno, col_keys,
+								(roaring64_bitmap_t **) vbms_v, nkeys);
+							for (j = 0; j < nkeys; j++)
+							{
+								if (pbms_v != NULL)
+								{
+									roaring64_bitmap_or_inplace(vbms_v[j], pbms_v[j]);
+									roaring64_bitmap_free(pbms_v[j]);
+								}
+								roaring64_bitmap_or_inplace(col_bm, vbms_v[j]);
+								roaring64_bitmap_free(vbms_v[j]);
+							}
+							pfree((void *) vbms_v);
+							vbms_v = NULL;
+							if (pbms_v != NULL)
+							{
+								pfree((void *) pbms_v);
+								pbms_v = NULL;
+							}
 						}
-						if (pbms != NULL)
-							pfree(pbms);
+						PG_CATCH();
+						{
+							if (vbms_v)
+							{
+								for (j = 0; j < nkeys; j++)
+									if (vbms_v[j])
+										roaring64_bitmap_free(vbms_v[j]);
+								pfree((void *) vbms_v);
+							}
+							if (pbms_v)
+							{
+								for (j = 0; j < nkeys; j++)
+									if (pbms_v[j])
+										roaring64_bitmap_free(pbms_v[j]);
+								pfree((void *) pbms_v);
+							}
+							pfree(col_keys);
+							PG_RE_THROW();
+						}
+						PG_END_TRY();
 					}
 					pfree(col_keys);
 				}
@@ -1572,7 +1607,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					{
 						int s;
 
-						pbms = palloc(nvals * sizeof(roaring64_bitmap_t *));
+						pbms = palloc0(nvals * sizeof(roaring64_bitmap_t *));
 						for (j = 0; j < nvals; j++)
 							pbms[j] = roaring64_bitmap_create();
 						for (s = 0; s < ROARING_PENDING_SHARDS; s++)
@@ -1587,7 +1622,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						}
 					}
 
-					bms = palloc(nvals * sizeof(roaring64_bitmap_t *));
+					bms = palloc0(nvals * sizeof(roaring64_bitmap_t *));
 					lookup_values_as_bitmaps_leaf_walk(index, root_blkno,
 													   vals, (roaring64_bitmap_t **) bms,
 													   nvals);
@@ -1902,8 +1937,9 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 
 					if (nkeys > 0)
 					{
-						roaring_bitmap_t **pbms = NULL;
-						int				   j, m;
+						roaring_bitmap_t ** volatile pbms_v = NULL;
+						roaring_bitmap_t ** volatile vbms_v = NULL;
+						int j, m;
 
 						qsort(col_keys, nkeys, sizeof(int64), int64_cmp_for_sort);
 						for (j = 1, m = 1; j < nkeys; j++)
@@ -1911,44 +1947,72 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 								col_keys[m++] = col_keys[j];
 						nkeys = m;
 
-						if (any_pending)
+						PG_TRY();
 						{
-							int s;
-
-							pbms = palloc(nkeys * sizeof(roaring_bitmap_t *));
-							for (j = 0; j < nkeys; j++)
-								pbms[j] = roaring_bitmap_create();
-							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+							if (any_pending)
 							{
-								pending_chain_fill_values_lossy(index, insert_heads[s],
-																col_keys, pbms, nkeys, snapshot);
-								if (merging_heads[s] != InvalidBlockNumber)
-									pending_chain_fill_values_lossy(index, merging_heads[s],
-																	col_keys, pbms, nkeys, snapshot);
-							}
-						}
+								int s;
 
-						{
-							roaring_bitmap_t **vbms =
-								palloc(nkeys * sizeof(roaring_bitmap_t *));
-
-							lookup_values_as_bitmaps_leaf_walk_lossy(
-								index, root_blkno, col_keys, vbms, nkeys);
-							for (j = 0; j < nkeys; j++)
-							{
-								if (pbms != NULL)
+								pbms_v = palloc0(nkeys * sizeof(roaring_bitmap_t *));
+								for (j = 0; j < nkeys; j++)
+									pbms_v[j] = roaring_bitmap_create();
+								for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 								{
-									roaring_bitmap_or_inplace(vbms[j], pbms[j]);
-									roaring_bitmap_free(pbms[j]);
+									pending_chain_fill_values_lossy(
+										index, insert_heads[s],
+										col_keys, (roaring_bitmap_t **) pbms_v,
+										nkeys, snapshot);
+									if (merging_heads[s] != InvalidBlockNumber)
+										pending_chain_fill_values_lossy(
+											index, merging_heads[s],
+											col_keys, (roaring_bitmap_t **) pbms_v,
+											nkeys, snapshot);
+								}
+							}
+
+							vbms_v = palloc0(nkeys * sizeof(roaring_bitmap_t *));
+							lookup_values_as_bitmaps_leaf_walk_lossy(
+								index, root_blkno, col_keys,
+								(roaring_bitmap_t **) vbms_v, nkeys);
+							for (j = 0; j < nkeys; j++)
+							{
+								if (pbms_v != NULL)
+								{
+									roaring_bitmap_or_inplace(vbms_v[j], pbms_v[j]);
+									roaring_bitmap_free(pbms_v[j]);
 								}
 								roaring_bitmap_or_inplace(
-									(roaring_bitmap_t *) col_bm, vbms[j]);
-								roaring_bitmap_free(vbms[j]);
+									(roaring_bitmap_t *) col_bm, vbms_v[j]);
+								roaring_bitmap_free(vbms_v[j]);
 							}
-							pfree(vbms);
+							pfree((void *) vbms_v);
+							vbms_v = NULL;
+							if (pbms_v != NULL)
+							{
+								pfree((void *) pbms_v);
+								pbms_v = NULL;
+							}
 						}
-						if (pbms != NULL)
-							pfree(pbms);
+						PG_CATCH();
+						{
+							if (vbms_v)
+							{
+								for (j = 0; j < nkeys; j++)
+									if (vbms_v[j])
+										roaring_bitmap_free(vbms_v[j]);
+								pfree((void *) vbms_v);
+							}
+							if (pbms_v)
+							{
+								for (j = 0; j < nkeys; j++)
+									if (pbms_v[j])
+										roaring_bitmap_free(pbms_v[j]);
+								pfree((void *) pbms_v);
+							}
+							pfree(col_keys);
+							PG_RE_THROW();
+						}
+						PG_END_TRY();
 					}
 					pfree(col_keys);
 				}
@@ -2083,7 +2147,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 					{
 						int s;
 
-						pbms = palloc(nvals * sizeof(roaring_bitmap_t *));
+						pbms = palloc0(nvals * sizeof(roaring_bitmap_t *));
 						for (j = 0; j < nvals; j++)
 							pbms[j] = roaring_bitmap_create();
 						for (s = 0; s < ROARING_PENDING_SHARDS; s++)
@@ -2098,7 +2162,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 						}
 					}
 
-					bms = palloc(nvals * sizeof(roaring_bitmap_t *));
+					bms = palloc0(nvals * sizeof(roaring_bitmap_t *));
 					lookup_values_as_bitmaps_leaf_walk_lossy(index, root_blkno,
 															  vals, bms, nvals);
 					for (j = 0; j < nvals; j++)
