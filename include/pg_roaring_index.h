@@ -21,7 +21,7 @@
  * On-disk constants
  * ---------- */
 #define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
-#define ROARING_INDEX_VERSION       5   /* bumped for pending-list sharding */
+#define ROARING_INDEX_VERSION       6   /* bumped for roaring64 exact-mode bitmaps */
 
 /*
  * Expected CRoaring major version stored in the metapage.  If the index was
@@ -59,8 +59,8 @@
 /* Capacities derived from 8KB page size */
 #define ROARING_PAGE_SIZE           BLCKSZ
 #define ROARING_DIR_ENTRY_SIZE      16      /* int64 high_key + BlockNumber + 4-byte pad */
-#define ROARING_PENDING_ENTRY_SIZE  16      /* int64 + uint32 + TransactionId */
-#define ROARING_PENDING_PER_PAGE    508     /* (8192-24-32)/16; special is 32 bytes */
+#define ROARING_PENDING_ENTRY_SIZE  24      /* int64 + uint64 + TransactionId + pad */
+#define ROARING_PENDING_PER_PAGE    339     /* (8192-24-32)/24; special is 32 bytes */
 
 /*
  * Overflow pages: bitmap bytes that don't fit on a single leaf page are
@@ -231,22 +231,28 @@ typedef struct RoaringLeafSpecial
 } RoaringLeafSpecial;   /* 16 bytes */
 
 /*
- * Fixed-size pending entry — 16 bytes, 510 per page.
- * Linearization: (blkno << 9) | (offset - 1)
- *   9 bits for offset: up to 511 tuples/page (MaxHeapTuplesPerPage ≈ 255)
- *   23 bits for blkno: up to 2^23 blocks = 64 GiB table
- *   Container key = linear_tid >> 16 = blkno >> 7: 128 blocks per container
- * Reverse: blkno = linear_tid >> 9; offset = (linear_tid & 0x1FF) + 1
+ * Fixed-size pending entry — 24 bytes, 339 per page.
+ * Linearization: ((uint64)blkno << 9) | (offset - 1)
+ *   9 bits for offset: up to 511 tuples/page (safe for default 8KB pages)
+ *   55 bits for blkno: full uint32 block space + 23 spare bits (32 TiB table)
+ *   roaring64 shard key = blkno >> 23 (one shard per 64 GiB range)
+ *   roaring32 container key = (blkno & 0x7FFFFF) >> 7: 128 blocks per container
+ * Reverse: blkno = (BlockNumber)(linear_tid >> 9);
+ *          offset = (OffsetNumber)((linear_tid & 0x1FF) + 1)
+ *
+ * Exact mode uses roaring64_bitmap_t; lossy mode keeps roaring_bitmap_t (uint32
+ * block numbers fit comfortably in roaring32).
  */
 typedef struct RoaringPendingEntry
 {
     int64           value;
-    uint32          linear_tid;     /* (blkno << 9) | (offset - 1) */
+    uint64          linear_tid;     /* ((uint64)blkno << 9) | (offset - 1) */
     TransactionId   xmin;
+    uint32          _pad;           /* keep sizeof == 24 and array alignment happy */
 } RoaringPendingEntry;
 
 StaticAssertDecl(sizeof(RoaringPendingEntry) == ROARING_PENDING_ENTRY_SIZE,
-                 "RoaringPendingEntry must be 16 bytes");
+                 "RoaringPendingEntry must be 24 bytes");
 StaticAssertDecl(MaxHeapTuplesPerPage <= 511,
                  "offset field too narrow — rebuild with larger BLCKSZ or extend linearization");
 
@@ -310,16 +316,29 @@ roaring_float4_to_key32(float4 f)
 }
 
 /*
- * roaring_cardinality32 — return bitmap cardinality as uint32.
- * Assert it fits: a roaring32 bitmap can theoretically hold all 2^32 values,
- * which is UINT32_MAX+1 and would silently truncate.  In practice our TID
- * encoding limits cardinality well below 2^32, so this fires only on
- * corruption.
+ * roaring_cardinality32 — return a roaring32 bitmap's cardinality as uint32.
+ * Used by the lossy path (block-number bitmaps stay roaring32).
  */
 static inline uint32
 roaring_cardinality32(const roaring_bitmap_t *bm)
 {
 	uint64_t card = roaring_bitmap_get_cardinality(bm);
+
+	Assert(card <= (uint64_t) UINT32_MAX);
+	return (uint32) card;
+}
+
+/*
+ * roaring64_cardinality32 — return a roaring64 bitmap's cardinality as uint32.
+ * Used by the exact path.  Asserts the count fits in uint32; the stored leaf
+ * cardinality field is uint32 and is used only for cost estimation, so an
+ * assertion failure indicates a pathologically large value (> 4B matching rows
+ * for a single indexed value), not a correctness concern.
+ */
+static inline uint32
+roaring64_cardinality32(const roaring64_bitmap_t *bm)
+{
+	uint64_t card = roaring64_bitmap_get_cardinality(bm);
 
 	Assert(card <= (uint64_t) UINT32_MAX);
 	return (uint32) card;
@@ -372,7 +391,9 @@ extern BlockNumber roaring_write_overflow_chain(Relation index,
                                                 const char *data,
                                                 size_t total_len,
                                                 size_t prefix_len);
-extern roaring_bitmap_t *roaring_read_overflow_bitmap(
+extern roaring64_bitmap_t *roaring_read_overflow_bitmap(
+    Relation index, const RoaringOverflowEntry *oe);
+extern roaring_bitmap_t *roaring_read_overflow_bitmap_lossy(
     Relation index, const RoaringOverflowEntry *oe);
 
 /*
