@@ -21,7 +21,7 @@
  * On-disk constants
  * ---------- */
 #define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
-#define ROARING_INDEX_VERSION       6   /* bumped for roaring64 exact-mode bitmaps */
+#define ROARING_INDEX_VERSION       1   /* dev reset: removed unused stat fields */
 
 /*
  * Expected CRoaring major version stored in the metapage.  If the index was
@@ -165,10 +165,6 @@ typedef struct RoaringMetaPageData
 
     /* Statistics (updated on merge) */
     uint32      total_entries;
-    uint32      total_heap_pages;
-    uint32      avg_cardinality;
-    uint32      max_cardinality;
-    uint32      min_cardinality;
     uint32      pending_merge_threshold;
 } RoaringMetaPageData;
 
