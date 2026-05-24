@@ -2408,10 +2408,10 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 				tail_blkno = next;
 			}
 
-			pb      = ReadBuffer(index, tail_blkno);
 			metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-			LockBuffer(pb,      BUFFER_LOCK_EXCLUSIVE);
+			pb      = ReadBuffer(index, tail_blkno);
 			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+			LockBuffer(pb,      BUFFER_LOCK_EXCLUSIVE);
 
 			state    = GenericXLogStart(index);
 			pb_img   = GenericXLogRegisterBuffer(state, pb,      0);

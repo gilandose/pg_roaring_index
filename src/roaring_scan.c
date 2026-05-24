@@ -999,41 +999,75 @@ static uint32
 peek_value_cardinality(Relation index, BlockNumber root_blkno, int64 value)
 {
 	BlockNumber		  leaf_blkno;
-	Buffer			  leafbuf;
-	Page			  leafpage;
-	OffsetNumber	  lo, hi;
-	uint32			  card = 0;
 
 	leaf_blkno = roaring_dir_lookup(index, root_blkno, value);
 	if (leaf_blkno == InvalidBlockNumber)
 		return 0;
 
-	leafbuf  = ReadBuffer(index, leaf_blkno);
-	LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
-	leafpage = BufferGetPage(leafbuf);
-
-	lo = 1;
-	hi = PageGetMaxOffsetNumber(leafpage);
-	while (lo <= hi)
+	for (;;)
 	{
-		OffsetNumber	  mid = (lo + hi) / 2;
-		RoaringLeafEntry *e   = (RoaringLeafEntry *)
-								 PageGetItem(leafpage,
-											 PageGetItemId(leafpage, mid));
+		Buffer			   leafbuf;
+		Page			   leafpage;
+		RoaringLeafSpecial *lspc;
+		OffsetNumber	   lo,
+						   hi;
 
-		if (e->value == value)
+		leafbuf  = ReadBuffer(index, leaf_blkno);
+		LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
+		leafpage = BufferGetPage(leafbuf);
+
+		lo = 1;
+		hi = PageGetMaxOffsetNumber(leafpage);
+		while (lo <= hi)
 		{
-			card = e->cardinality;
-			break;
-		}
-		else if (e->value < value)
-			lo = mid + 1;
-		else
-			hi = mid - 1;
-	}
+			OffsetNumber	  mid = (lo + hi) / 2;
+			RoaringLeafEntry *e   = (RoaringLeafEntry *)
+									 PageGetItem(leafpage,
+												 PageGetItemId(leafpage, mid));
 
-	UnlockReleaseBuffer(leafbuf);
-	return card;
+			if (e->value == value)
+			{
+				uint32 card = e->cardinality;
+
+				UnlockReleaseBuffer(leafbuf);
+				return card;
+			}
+			else if (e->value < value)
+				lo = mid + 1;
+			else
+				hi = mid - 1;
+		}
+
+		/*
+		 * Binary search miss.  A concurrent merge may have split this leaf
+		 * after our directory lookup, moving the target value to the right
+		 * sibling.  Follow the right link if the target is beyond this
+		 * leaf's max key (_bt_moveright pattern).
+		 */
+		lspc = (RoaringLeafSpecial *) PageGetSpecialPointer(leafpage);
+		if (lspc->right_page != InvalidBlockNumber)
+		{
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(leafpage);
+
+			if (maxoff >= 1)
+			{
+				RoaringLeafEntry *last = (RoaringLeafEntry *)
+					PageGetItem(leafpage, PageGetItemId(leafpage, maxoff));
+
+				if (last->value < value)
+				{
+					BlockNumber right = lspc->right_page;
+
+					UnlockReleaseBuffer(leafbuf);
+					leaf_blkno = right;
+					continue;
+				}
+			}
+		}
+
+		UnlockReleaseBuffer(leafbuf);
+		return 0;
+	}
 }
 
 typedef struct
