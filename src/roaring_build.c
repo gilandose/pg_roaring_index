@@ -211,6 +211,35 @@ write_metapage(Relation index,
 }
 
 
+/*
+ * Leaf pages are WAL-logged in batches of ROARING_BUILD_WAL_BATCH rather
+ * than one log_newpage_buffer per page.  One log_newpages record covers the
+ * whole batch, giving ~32× WAL reduction on large builds.
+ */
+#define ROARING_BUILD_WAL_BATCH 32
+
+static void
+flush_leaf_wal_batch(Relation index, Buffer *bufs, BlockNumber *blknos, int n)
+{
+	int i;
+
+	if (n == 0)
+		return;
+
+	if (RelationNeedsWAL(index))
+	{
+		Page *pages = (Page *) palloc(n * sizeof(Page));
+
+		for (i = 0; i < n; i++)
+			pages[i] = BufferGetPage(bufs[i]);
+		log_newpages(&index->rd_locator, MAIN_FORKNUM, n, blknos, pages, true);
+		pfree(pages);
+	}
+
+	for (i = 0; i < n; i++)
+		UnlockReleaseBuffer(bufs[i]);
+}
+
 /* ----------------------------------------------------------------
  * write_leaf_and_dir_pages
  *
@@ -254,6 +283,11 @@ write_leaf_and_dir_pages(Relation index,
 	RoaringLeafSpecial *leaf_spc  = NULL;
 	BlockNumber			leftmost  = InvalidBlockNumber;
 	BlockNumber			rightmost = InvalidBlockNumber;
+
+	/* WAL batch for completed leaf pages */
+	Buffer		leaf_batch_bufs[ROARING_BUILD_WAL_BATCH];
+	BlockNumber	leaf_batch_blknos[ROARING_BUILD_WAL_BATCH];
+	int			leaf_batch_n = 0;
 
 	long i;
 
@@ -363,7 +397,16 @@ write_leaf_and_dir_pages(Relation index,
 				new_blkno = BufferGetBlockNumber(new_buf);
 
 				leaf_spc->right_page = new_blkno;
-				roaring_wal_and_release(index, leaf_buf);
+				MarkBufferDirty(leaf_buf);
+				leaf_batch_bufs[leaf_batch_n]   = leaf_buf;
+				leaf_batch_blknos[leaf_batch_n] = old_blkno;
+				leaf_batch_n++;
+				if (leaf_batch_n == ROARING_BUILD_WAL_BATCH)
+				{
+					flush_leaf_wal_batch(index, leaf_batch_bufs,
+										 leaf_batch_blknos, leaf_batch_n);
+					leaf_batch_n = 0;
+				}
 
 				leaf_buf  = new_buf;
 				leaf_page = BufferGetPage(leaf_buf);
@@ -472,7 +515,13 @@ write_leaf_and_dir_pages(Relation index,
 		leaf_count++;
 
 		rightmost = blkno;
-		roaring_wal_and_release(index, leaf_buf);
+		MarkBufferDirty(leaf_buf);
+		leaf_batch_bufs[leaf_batch_n]   = leaf_buf;
+		leaf_batch_blknos[leaf_batch_n] = blkno;
+		leaf_batch_n++;
+		flush_leaf_wal_batch(index, leaf_batch_bufs,
+							 leaf_batch_blknos, leaf_batch_n);
+		leaf_batch_n = 0;
 	}
 
 	/* ---- Phase B: build directory ---- */
@@ -631,11 +680,13 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	{
 		BlockNumber pending_blknos[ROARING_PENDING_SHARDS];
+		BlockNumber dummy_head;
 		int			i;
 
 		for (i = 0; i < ROARING_PENDING_SHARDS; i++)
 			pending_blknos[i] =
-				roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
+				roaring_init_pending_page(index, InvalidBuffer, &dummy_head,
+										 ROARING_PAGE_PENDING_INSERT);
 
 		write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
 					   pending_blknos, (uint32) nentries,
@@ -899,11 +950,13 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	{
 		BlockNumber pending_blknos[ROARING_PENDING_SHARDS];
+		BlockNumber dummy_head;
 		int			i;
 
 		for (i = 0; i < ROARING_PENDING_SHARDS; i++)
 			pending_blknos[i] =
-				roaring_init_pending_page(index, ROARING_PAGE_PENDING_INSERT);
+				roaring_init_pending_page(index, InvalidBuffer, &dummy_head,
+										 ROARING_PAGE_PENDING_INSERT);
 
 		write_metapage(index, root_dir, leftmost_leaf, rightmost_leaf,
 					   pending_blknos, (uint32) nentries,

@@ -189,6 +189,7 @@ roaring_alloc_page(Relation index, Buffer metabuf,
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		spc = (RoaringFreeSpecial *) PageGetSpecialPointer(BufferGetPage(buf));
+		Assert(spc->page_type == ROARING_PAGE_FREE);
 		*new_free_list_head_out = spc->next_free;
 		return buf;
 	}
@@ -216,18 +217,33 @@ roaring_wal_and_release(Relation index, Buffer buf)
 /*
  * roaring_init_pending_page
  *
- * Extend the index by one page, initialise it as an empty pending-list page
- * of the given type, WAL-log it, and return its block number.
+ * Allocate one page (from the free list if metabuf is valid and the list is
+ * non-empty, otherwise by extending the relation), initialise it as an empty
+ * pending-list page, WAL-log it, and return its block number.
+ *
+ * When metabuf is valid (BUFFER_LOCK_EXCLUSIVE held by caller):
+ *   - pops from the free list via roaring_alloc_page
+ *   - caller must update meta_img->free_list_head in their WAL record
+ *     (the returned *new_free_head_out value)
+ * When metabuf == InvalidBuffer (build path; free list is always empty):
+ *   - always extends the relation; *new_free_head_out is set to Invalid.
  */
 BlockNumber
-roaring_init_pending_page(Relation index, uint8 page_type)
+roaring_init_pending_page(Relation index, Buffer metabuf,
+						   BlockNumber *new_free_head_out, uint8 page_type)
 {
 	Buffer				  buf;
 	Page				  page;
 	RoaringPendingSpecial *spc;
 	BlockNumber			  blkno;
 
-	buf   = roaring_extend_page(index);
+	if (BufferIsValid(metabuf))
+		buf = roaring_alloc_page(index, metabuf, new_free_head_out);
+	else
+	{
+		*new_free_head_out = InvalidBlockNumber;
+		buf = roaring_extend_page(index);
+	}
 	blkno = BufferGetBlockNumber(buf);
 	page  = BufferGetPage(buf);
 
@@ -310,6 +326,12 @@ roaring_write_overflow_chain(Relation index,
 
 	if (chain_len == 0)
 		return InvalidBlockNumber;
+
+	if (chain_len > MaxAllocSize)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("pg_roaring_index: bitmap too large to store in overflow chain"),
+				 errdetail("Bitmap size %zu bytes exceeds MaxAllocSize.", chain_len)));
 
 	npages = (int)((chain_len + cap - 1) / cap);
 	bufs   = palloc(npages * sizeof(Buffer));

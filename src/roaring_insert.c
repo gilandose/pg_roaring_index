@@ -41,7 +41,7 @@
  *
  * Back-pressure: total = sum(shards[i].insert_count) under SHARE.
  * Counts are updated only on page extension, so max undercount is
- * ROARING_PENDING_SHARDS * ROARING_PENDING_PER_PAGE = 4064 entries.
+ * ROARING_PENDING_SHARDS * ROARING_PENDING_PER_PAGE = 8 × 339 = 2712 entries.
  *
  * pd_lower note: pending pages store data starting at SizeOfPageHeaderData
  * but do not advance pd_lower via PageAddItem.  We set pd_lower explicitly
@@ -290,6 +290,37 @@ retry:
 	}
 }
 
+/*
+ * roaring_insert_multicolumn
+ *
+ * Shared multi-column pending append loop.  Shared between exact (linear_tid
+ * = (blkno<<9)|(offset-1)) and lossy (linear_tid = blkno) paths.
+ */
+static void
+roaring_insert_multicolumn(Relation index, Datum *values, bool *isnull,
+						   uint64 linear_tid, TransactionId xmin)
+{
+	RoaringPendingEntry entry;
+	int					i;
+
+	memset(&entry, 0, sizeof(entry));
+
+	for (i = 0; i < index->rd_att->natts; i++)
+	{
+		Oid typid = TupleDescAttr(index->rd_att, i)->atttypid;
+
+		if (isnull[i])
+			continue;
+		if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
+			continue;
+		entry.value      = ROARING_COL_KEY(i + 1,
+										   roaring_datum_to_key32(values[i], typid));
+		entry.linear_tid = linear_tid;
+		entry.xmin       = xmin;
+		roaring_pending_append(index, &entry);
+	}
+}
+
 /* ----------------------------------------------------------------
  * roaring_insert
  * ---------------------------------------------------------------- */
@@ -313,26 +344,11 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 
 	if (index->rd_att->natts > 1)
 	{
-		/* Multi-column: one pending entry per non-null column. */
-		uint64		linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
-							   (uint64)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
-		TransactionId xmin = GetCurrentTransactionId();
-		int			  i;
+		uint64		  linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
+								 (uint64)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
 
-		for (i = 0; i < index->rd_att->natts; i++)
-		{
-			Oid typid = TupleDescAttr(index->rd_att, i)->atttypid;
-
-			if (isnull[i])
-				continue;
-			if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
-				continue;
-			entry.value      = ROARING_COL_KEY(i + 1,
-											   roaring_datum_to_key32(values[i], typid));
-			entry.linear_tid = linear_tid;
-			entry.xmin       = xmin;
-			roaring_pending_append(index, &entry);
-		}
+		roaring_insert_multicolumn(index, values, isnull, linear_tid,
+								   GetCurrentTransactionId());
 		return false;
 	}
 
@@ -377,25 +393,9 @@ roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
 
 	if (index->rd_att->natts > 1)
 	{
-		/* Multi-column lossy: one pending entry per non-null column. */
-		uint32		  blkno = (uint32) ItemPointerGetBlockNumber(ht_ctid);
-		TransactionId xmin  = GetCurrentTransactionId();
-		int			  i;
-
-		for (i = 0; i < index->rd_att->natts; i++)
-		{
-			Oid typid = TupleDescAttr(index->rd_att, i)->atttypid;
-
-			if (isnull[i])
-				continue;
-			if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
-				continue;
-			entry.value      = ROARING_COL_KEY(i + 1,
-											   roaring_datum_to_key32(values[i], typid));
-			entry.linear_tid = blkno;
-			entry.xmin       = xmin;
-			roaring_pending_append(index, &entry);
-		}
+		roaring_insert_multicolumn(index, values, isnull,
+								   (uint64) ItemPointerGetBlockNumber(ht_ctid),
+								   GetCurrentTransactionId());
 		return false;
 	}
 

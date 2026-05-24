@@ -378,7 +378,9 @@ extern Buffer roaring_extend_page(Relation index);
 extern Buffer roaring_alloc_page(Relation index, Buffer metabuf,
 								 BlockNumber *new_free_list_head_out);
 extern void   roaring_wal_and_release(Relation index, Buffer buf);
-extern BlockNumber roaring_init_pending_page(Relation index, uint8 page_type);
+extern BlockNumber roaring_init_pending_page(Relation index, Buffer metabuf,
+											  BlockNumber *new_free_head_out,
+											  uint8 page_type);
 extern BlockNumber roaring_write_dir_page(Relation index,
                                            RoaringDirEntry *entries,
                                            uint32 count, uint8 level);

@@ -3,10 +3,12 @@
 #include "access/amapi.h"
 #include "access/reloptions.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_amop.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_type_d.h"
 #include "commands/vacuum.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -40,20 +42,29 @@ _PG_init(void)
  * roaring_validate
  *
  * Validate an operator class for use with this AM.  Called by CREATE INDEX.
- * For now accept any operator class associated with our AM.
+ * Checks:
+ *   1. opcintype is in the supported set.
+ *   2. The opfamily has a strategy-1 (equality) entry with
+ *      amoplefttype = amoprighttype = opcintype.
+ *   3. That operator's return type is bool.
  */
 bool
 roaring_validate(Oid opclassoid)
 {
-    HeapTuple       ht;
-    Form_pg_opclass opcform;
-    Oid             opcintype;
+    HeapTuple        ht;
+    Form_pg_opclass  opcform;
+    Oid              opcintype;
+    Oid              opfamilyoid;
+    CatCList        *catlist;
+    int              i;
+    bool             found_equality;
 
     ht = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclassoid));
     if (!HeapTupleIsValid(ht))
         elog(ERROR, "cache lookup failed for operator class %u", opclassoid);
-    opcform   = (Form_pg_opclass) GETSTRUCT(ht);
-    opcintype = opcform->opcintype;
+    opcform     = (Form_pg_opclass) GETSTRUCT(ht);
+    opcintype   = opcform->opcintype;
+    opfamilyoid = opcform->opcfamily;
     ReleaseSysCache(ht);
 
     if (opcintype != INT8OID  && opcintype != INT4OID  &&
@@ -69,6 +80,49 @@ roaring_validate(Oid opclassoid)
                            "text, uuid (text/uuid use hash keys — "
                            "hash collisions produce false-positive rechecks, not wrong results).",
                            format_type_be(opcintype))));
+
+    /*
+     * Verify that strategy 1 (equality) exists for opcintype in the opfamily,
+     * and that its operator returns boolean.
+     */
+    found_equality = false;
+    catlist = SearchSysCacheList1(AMOPSTRATEGY,
+                                   ObjectIdGetDatum(opfamilyoid));
+    for (i = 0; i < catlist->n_members; i++)
+    {
+        Form_pg_amop amopform;
+
+        ht       = &catlist->members[i]->tuple;
+        amopform = (Form_pg_amop) GETSTRUCT(ht);
+
+        if (amopform->amopstrategy != 1)
+            continue;
+        if (amopform->amoplefttype  != opcintype)
+            continue;
+        if (amopform->amoprighttype != opcintype)
+            continue;
+
+        if (get_op_rettype(amopform->amopopr) != BOOLOID)
+        {
+            ReleaseSysCacheList(catlist);
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                     errmsg("roaring: strategy 1 operator for type %s "
+                            "must return boolean",
+                            format_type_be(opcintype))));
+        }
+
+        found_equality = true;
+        break;
+    }
+    ReleaseSysCacheList(catlist);
+
+    if (!found_equality)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                 errmsg("roaring index operator class for type %s "
+                        "does not define a strategy 1 (equality) operator",
+                        format_type_be(opcintype))));
 
     return true;
 }

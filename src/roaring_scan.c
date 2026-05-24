@@ -487,11 +487,11 @@ fill_empty:
 }
 
 /* ----------------------------------------------------------------
- * pending_chain_as_bitmap
+ * pending_chain_as_bitmap / pending_chain_as_bitmap_lossy
  *
- * Walk one pending list chain, collecting visible TIDs for scan_value
- * into a roaring bitmap of linearized TIDs.  Returns an empty bitmap
- * (not NULL) if nothing matches.  Caller frees with roaring64_bitmap_free().
+ * Walk one pending list chain, collecting visible TIDs for scan_value.
+ * The two variants differ only in bitmap type (roaring64 vs roaring32)
+ * and the add call.  If you fix a bug in one, fix the other too.
  * ---------------------------------------------------------------- */
 static roaring64_bitmap_t *
 pending_chain_as_bitmap(Relation index, BlockNumber start_blkno,
@@ -1160,9 +1160,15 @@ emit_lossy_bitmap_to_tbm(roaring_bitmap_t *bm, TIDBitmap *tbm)
 }
 
 /* ----------------------------------------------------------------
- * roaring_getbitmap
+ * roaring_getbitmap / roaring_getbitmap_lossy
  *
- * Equality scan using the per-column namespace encoding.
+ * Near-verbatim counterparts differing in bitmap type (roaring64 vs
+ * roaring32), TBM addition (tbm_add_tuples vs tbm_add_page), and
+ * linear_tid encoding (TID vs block number).
+ *
+ * IMPORTANT: if you fix a bug in one function, apply the same fix to
+ * the other.  See also pending_chain_as_bitmap / _lossy and
+ * lookup_value_as_bitmap / _lossy which share the same duality.
  *
  * Single-column (natts==1): raw int8/int4 value lookup.
  * Multi-column (natts>1): one bitmap per scan key (index + pending),
@@ -1730,7 +1736,9 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
  * roaring_getbitmap_lossy
  *
  * Lossy (page-level) scan.  Identical structure to roaring_getbitmap
- * but uses block-number bitmaps and tbm_add_page.
+ * (see its comment above) but uses roaring32 bitmaps and tbm_add_page.
+ * IMPORTANT: if you fix a bug here, apply the same fix to
+ * roaring_getbitmap and the _lossy helper functions above.
  * ---------------------------------------------------------------- */
 int64
 roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)

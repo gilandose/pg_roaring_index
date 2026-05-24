@@ -118,7 +118,6 @@ collect_pending(Relation index, BlockNumber head_blkno, int *nout,
 		UnlockReleaseBuffer(buf);
 	}
 
-	qsort(entries, n, sizeof(CollectedEntry), cmp_collected);
 	*nout = n;
 	return entries;
 }
