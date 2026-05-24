@@ -1050,8 +1050,6 @@ roaring_merge_pending(Relation index)
 				char			   *bm_data;
 				BlockNumber			new_ovf_blkno;
 				BlockNumber			old_ovf_blkno;
-				char				pfx_buf[ROARING_OVERFLOW_INLINE_BYTES];
-				size_t				pfx_len;
 
 				le		  = (RoaringLeafEntry *)
 							PageGetItem(leafpage, PageGetItemId(leafpage, found_off));
@@ -1146,7 +1144,6 @@ roaring_merge_pending(Relation index)
 				{
 					bm_data		  = (char *) palloc(new_size);
 					new_ovf_blkno = InvalidBlockNumber;
-					pfx_len		  = 0;
 					if (is_lossy)
 					{
 						roaring_bitmap_portable_serialize(bm32, bm_data);
@@ -1169,10 +1166,8 @@ roaring_merge_pending(Relation index)
 
 				if (write_ovf)
 				{
-					pfx_len		  = Min(ROARING_OVERFLOW_INLINE_BYTES, new_size);
-					memcpy(pfx_buf, bm_data, pfx_len);
 					new_ovf_blkno = roaring_write_overflow_chain(index, bm_data,
-																  new_size, pfx_len);
+																  new_size);
 				}
 
 				if (needs_split)
@@ -1223,7 +1218,6 @@ roaring_merge_pending(Relation index)
 								new_oe.flags		  = ROARING_ENTRY_OVERFLOW;
 								new_oe.total_len	  = (uint32) new_size;
 								new_oe.overflow_blkno = new_ovf_blkno;
-								memcpy(new_oe.inline_prefix, pfx_buf, pfx_len);
 
 								if (PageAddItem(img, (Item) &new_oe,
 												sizeof(RoaringOverflowEntry),
@@ -1845,8 +1839,6 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 					if (was_overflow)
 					{
 						char				 *bm_data  = (char *) palloc(new_bm_bytes);
-						size_t				  pfx_len  = Min(ROARING_OVERFLOW_INLINE_BYTES,
-															 new_bm_bytes);
 						RoaringOverflowEntry  new_oe;
 
 						roaring64_bitmap_portable_serialize(bm, bm_data);
@@ -1856,9 +1848,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 						new_oe.total_len	  = (uint32) new_bm_bytes;
 						new_oe.overflow_blkno = roaring_write_overflow_chain(index,
 																			  bm_data,
-																			  new_bm_bytes,
-																			  pfx_len);
-						memcpy(new_oe.inline_prefix, bm_data, pfx_len);
+																			  new_bm_bytes);
 						pfree(bm_data);
 
 						if (!PageIndexTupleOverwrite(img, off, (Item) &new_oe,
@@ -2287,8 +2277,6 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 									new_bytes > (size_t) max_inline)
 								{
 									/* Still overflow: write a new chain. */
-									size_t pfx_len = Min(
-										ROARING_OVERFLOW_INLINE_BYTES, new_bytes);
 									char  *bm_data = (char *) palloc(new_bytes);
 									RoaringOverflowEntry new_oe;
 
@@ -2300,8 +2288,7 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 									new_oe.total_len    = (uint32) new_bytes;
 									new_oe.overflow_blkno =
 										roaring_write_overflow_chain(
-											index, bm_data, new_bytes, pfx_len);
-									memcpy(new_oe.inline_prefix, bm_data, pfx_len);
+											index, bm_data, new_bytes);
 									pfree(bm_data);
 
 									if (!PageIndexTupleOverwrite(

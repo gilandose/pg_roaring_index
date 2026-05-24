@@ -291,22 +291,19 @@ roaring_write_dir_page(Relation index,
 /*
  * roaring_write_overflow_chain
  *
- * Write the portion of a serialized bitmap that exceeds the inline capacity
- * to a chain of ROARING_PAGE_OVERFLOW pages.  Only bytes [prefix_len..total_len)
- * go to overflow pages; the first prefix_len bytes are stored by the caller
- * inside the RoaringOverflowEntry on the leaf page.
+ * Write all bytes of a serialized bitmap to a chain of ROARING_PAGE_OVERFLOW
+ * pages.
  *
  * Returns the block number of the first overflow page, or InvalidBlockNumber
- * if chain_len == 0.  Uses roaring_wal_and_release (full-page WAL) for
+ * if total_len == 0.  Uses roaring_wal_and_release (full-page WAL) for
  * each new page — safe for both build and merge paths.
  */
 BlockNumber
 roaring_write_overflow_chain(Relation index,
-							 const char *data, size_t total_len,
-							 size_t prefix_len)
+							 const char *data, size_t total_len)
 {
-	const char *chain_data  = data + prefix_len;
-	size_t		chain_len   = total_len - prefix_len;
+	const char *chain_data  = data;
+	size_t		chain_len   = total_len;
 	Size		cap			= ROARING_OVERFLOW_PAGE_CAP;
 	int			npages, i;
 	Buffer	   *bufs;
@@ -398,10 +395,7 @@ roaring_overflow_read_bytes(Relation index, const RoaringOverflowEntry *oe)
 			 total_len);
 
 	buf = palloc(total_len);
-
-	off = Min(sizeof(oe->inline_prefix), total_len);
-	memcpy(buf, oe->inline_prefix, off);
-
+	off = 0;
 	cur = oe->overflow_blkno;
 	while (cur != InvalidBlockNumber && off < total_len)
 	{

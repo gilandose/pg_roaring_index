@@ -21,7 +21,7 @@
  * On-disk constants
  * ---------- */
 #define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
-#define ROARING_INDEX_VERSION       1   /* dev reset: removed unused stat fields */
+#define ROARING_INDEX_VERSION       2   /* removed inline_prefix from RoaringOverflowEntry */
 
 /*
  * Expected CRoaring major version stored in the metapage.  If the index was
@@ -64,11 +64,9 @@
 
 /*
  * Overflow pages: bitmap bytes that don't fit on a single leaf page are
- * chained via ROARING_PAGE_OVERFLOW pages.  The first ROARING_OVERFLOW_INLINE_BYTES
- * of the serialized bitmap are stored in the RoaringOverflowEntry itself;
- * the remainder occupies the chain.
+ * chained via ROARING_PAGE_OVERFLOW pages.  All serialized bytes go to the
+ * chain; the leaf-side RoaringOverflowEntry holds only the header metadata.
  */
-#define ROARING_OVERFLOW_INLINE_BYTES   64
 /* Usable data area per overflow page */
 #define ROARING_OVERFLOW_PAGE_CAP \
     ((Size)(BLCKSZ - SizeOfPageHeaderData \
@@ -211,7 +209,6 @@ typedef struct RoaringOverflowEntry
     uint8       flags;          /* ROARING_ENTRY_OVERFLOW */
     BlockNumber overflow_blkno;
     uint32      total_len;
-    char        inline_prefix[64];
 } RoaringOverflowEntry;
 
 #define RoaringLeafEntryDataOffset  \
@@ -387,8 +384,7 @@ extern BlockNumber roaring_write_dir_page(Relation index,
                                            uint32 count, uint8 level);
 extern BlockNumber roaring_write_overflow_chain(Relation index,
                                                 const char *data,
-                                                size_t total_len,
-                                                size_t prefix_len);
+                                                size_t total_len);
 extern roaring64_bitmap_t *roaring_read_overflow_bitmap(
     Relation index, const RoaringOverflowEntry *oe);
 extern roaring_bitmap_t *roaring_read_overflow_bitmap_lossy(
