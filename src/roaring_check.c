@@ -147,6 +147,22 @@ check_directory(Relation index, BlockNumber root_dir, BlockNumber nblocks)
 			ROARING_CHECK_ERROR("block %u: expected page_type DIRECTORY (0x%02X), got 0x%02X",
 								cur, ROARING_PAGE_DIRECTORY, spc->page_type);
 		}
+		/* T37: level must be ≤ 2 (max three-level directory); reserved must be 0. */
+		if (spc->level > 2)
+		{
+			uint8 bad_level = spc->level;
+
+			UnlockReleaseBuffer(buf);
+			ROARING_CHECK_ERROR("directory page %u: level %u > 2", cur, bad_level);
+		}
+		if (spc->reserved != 0)
+		{
+			uint32 bad_reserved = spc->reserved;
+
+			UnlockReleaseBuffer(buf);
+			ROARING_CHECK_ERROR("directory page %u: reserved field is %u (expected 0)",
+								cur, bad_reserved);
+		}
 
 		max_entries = (int) ((PageGetPageSize(page)
 							  - SizeOfPageHeaderData
@@ -327,8 +343,9 @@ check_leaf_chain(Relation index,
 								cur, spc->entry_count, noff);
 		}
 
-		/* Overlap next page's I/O with processing this one. */
-		if (right != InvalidBlockNumber)
+		/* Overlap next page's I/O with processing this one.
+		 * T40: guard against corrupt right_page before passing to prefetch. */
+		if (right != InvalidBlockNumber && right < nblocks)
 			PrefetchBuffer(index, MAIN_FORKNUM, right);
 
 		for (i = 1; i <= noff; i++)
@@ -406,7 +423,17 @@ check_leaf_chain(Relation index,
 				ovf[novf].total_len   = oe->total_len;
 				novf++;
 			}
-			else if (le->flags != ROARING_ENTRY_INLINE)
+			else if (le->flags == ROARING_ENTRY_INLINE)
+			{
+				/* T41: inline entries must have non-zero cardinality. */
+				if (le->cardinality == 0)
+				{
+					UnlockReleaseBuffer(buf);
+					ROARING_CHECK_ERROR("leaf page %u: inline item %d has cardinality 0",
+										cur, i);
+				}
+			}
+			else
 			{
 				UnlockReleaseBuffer(buf);
 				ROARING_CHECK_ERROR("leaf page %u: item %d has unknown flags 0x%02X",
@@ -528,6 +555,17 @@ check_overflow_chains(Relation index, const DeferredOvf *ovf, int novf,
 									"sequence %u, expected %u",
 									ovf[oi].leaf_blkno, ovf[oi].leaf_off,
 									chain, ospc->sequence, seq);
+			}
+			/* T38: owner_page is always written as InvalidBlockNumber. */
+			if (ospc->owner_page != InvalidBlockNumber)
+			{
+				BlockNumber bad_owner = ospc->owner_page;
+
+				UnlockReleaseBuffer(ovbuf);
+				ROARING_CHECK_ERROR("leaf page %u item %d: overflow block %u has "
+									"owner_page %u (expected InvalidBlockNumber)",
+									ovf[oi].leaf_blkno, ovf[oi].leaf_off,
+									chain, bad_owner);
 			}
 
 			cl    = Min(cap, (size_t) expected - seen);
@@ -709,9 +747,11 @@ roaring_index_check(PG_FUNCTION_ARGS)
 	int					  s;
 
 	if (heapallindexed)
-		ereport(NOTICE,
-				(errmsg("pg_roaring_index: heapallindexed is not yet implemented; "
-						"structural check only")));
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_roaring_index: heapallindexed is not yet implemented"),
+				 errhint("Call roaring_index_check(index) without heapallindexed, "
+						 "or pass heapallindexed => false.")));
 
 	index   = relation_open(indexoid, AccessShareLock);
 	nblocks = RelationGetNumberOfBlocks(index);

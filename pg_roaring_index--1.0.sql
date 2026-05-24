@@ -191,8 +191,15 @@ CREATE VIEW pg_stat_roaring_indexes AS
       AND c.relkind = 'i';
 
 -- roaring_index_check: structural integrity check (amcheck equivalent).
--- Pass heapallindexed => true to also verify every index entry has a live
--- heap tuple (not yet implemented; currently raises a NOTICE).
+-- Verifies page types, sort order, overflow chains, pending lists, and the
+-- free list.  heapallindexed is not yet implemented; passing true raises
+-- ERROR (feature_not_supported).  Only call with the default false.
+--
+-- Concurrent-writer caveat: the check holds only AccessShareLock, so
+-- concurrent inserts and merges can advance pointer fields between the
+-- metapage snapshot and the chain walks, potentially causing spurious
+-- errors on a heavily-written index.  Run on a quiesced or read-only index
+-- for a definitive result.
 CREATE FUNCTION roaring_index_check(
     index           regclass,
     heapallindexed  boolean DEFAULT false

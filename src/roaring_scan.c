@@ -534,6 +534,20 @@ pending_chain_as_bitmap(Relation index, BlockNumber start_blkno,
 				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
 		}
 
+		/*
+		 * T44: a non-sentinel page with value_min > value_max is corrupt and
+		 * would produce false-negative results via the range-skip predicate.
+		 */
+		if (spc->entry_count > 0 && spc->value_min > spc->value_max)
+		{
+			UnlockReleaseBuffer(buf);
+			roaring64_bitmap_free(bm);
+			elog(ERROR,
+				 "pg_roaring_index: corrupt pending page %u: "
+				 "value_min " INT64_FORMAT " > value_max " INT64_FORMAT,
+				 cur, spc->value_min, spc->value_max);
+		}
+
 		if (scan_value >= spc->value_min && scan_value <= spc->value_max)
 		{
 			for (k = 0; k < spc->entry_count; k++)
@@ -704,6 +718,16 @@ pending_chain_as_bitmap_lossy(Relation index, BlockNumber start_blkno,
 			elog(ERROR,
 				 "pg_roaring_index: corrupt pending page %u: entry_count %u > max %d",
 				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
+		}
+
+		if (spc->entry_count > 0 && spc->value_min > spc->value_max)
+		{
+			UnlockReleaseBuffer(buf);
+			roaring_bitmap_free(bm);
+			elog(ERROR,
+				 "pg_roaring_index: corrupt pending page %u: "
+				 "value_min " INT64_FORMAT " > value_max " INT64_FORMAT,
+				 cur, spc->value_min, spc->value_max);
 		}
 
 		if (scan_value >= spc->value_min && scan_value <= spc->value_max)
