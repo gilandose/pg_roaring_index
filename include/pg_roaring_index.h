@@ -471,4 +471,7 @@ extern int roaring_pending_merge_threshold_guc;
 /* roaring_stats.c */
 extern Datum roaring_index_stats(struct FunctionCallInfoBaseData *fcinfo);
 
+/* roaring_check.c */
+extern Datum roaring_index_check(struct FunctionCallInfoBaseData *fcinfo);
+
 #endif /* PG_ROARING_INDEX_H */

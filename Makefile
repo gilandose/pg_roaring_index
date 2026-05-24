@@ -7,6 +7,7 @@ OBJS = \
 	src/roaring_scan.o \
 	src/roaring_vacuum.o \
 	src/roaring_cost.o \
+	src/roaring_check.o \
 	src/roaring_bgworker.o \
 	src/roaring_stats.o \
 	src/vendor/croaring/roaring.o

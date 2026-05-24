@@ -176,6 +176,17 @@ CREATE VIEW pg_stat_roaring_indexes AS
     WHERE am.amname IN ('roaring', 'roaring_lossy')
       AND c.relkind = 'i';
 
+-- roaring_index_check: structural integrity check (amcheck equivalent).
+-- Pass heapallindexed => true to also verify every index entry has a live
+-- heap tuple (not yet implemented; currently raises a NOTICE).
+CREATE FUNCTION roaring_index_check(
+    index           regclass,
+    heapallindexed  boolean DEFAULT false
+) RETURNS void
+    STRICT
+    LANGUAGE C
+    AS 'MODULE_PATHNAME', 'roaring_index_check';
+
 -- roaring_index_health: simple textual health probe.
 CREATE FUNCTION roaring_index_health(regclass) RETURNS text
     LANGUAGE sql STRICT
