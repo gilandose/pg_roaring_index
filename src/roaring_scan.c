@@ -188,9 +188,9 @@ roaring_pending_visible(TransactionId xmin, Snapshot snapshot)
  *
  * Look up one value in the main index and return its deserialized roaring
  * bitmap.  Returns an empty (but valid) bitmap if the value is not found.
- * Caller must free the result with roaring_bitmap_free().
+ * Caller must free the result with roaring64_bitmap_free().
  * ---------------------------------------------------------------- */
-static roaring_bitmap_t *
+static roaring64_bitmap_t *
 lookup_value_as_bitmap(Relation index, BlockNumber root_blkno, int64 value)
 {
 	BlockNumber		 leaf_blkno;
@@ -198,11 +198,11 @@ lookup_value_as_bitmap(Relation index, BlockNumber root_blkno, int64 value)
 	Page			 leafpage;
 	OffsetNumber	 found_off;
 	RoaringLeafEntry *le;
-	roaring_bitmap_t *bm;
+	roaring64_bitmap_t *bm;
 
 	leaf_blkno = roaring_dir_lookup(index, root_blkno, value);
 	if (leaf_blkno == InvalidBlockNumber)
-		return roaring_bitmap_create();
+		return roaring64_bitmap_create();
 
 	for (;;)
 	{
@@ -268,13 +268,13 @@ lookup_value_as_bitmap(Relation index, BlockNumber root_blkno, int64 value)
 		}
 
 		UnlockReleaseBuffer(leafbuf);
-		return roaring_bitmap_create();
+		return roaring64_bitmap_create();
 	}
 
 	if (le->cardinality == 0)
 	{
 		UnlockReleaseBuffer(leafbuf);
-		return roaring_bitmap_create();
+		return roaring64_bitmap_create();
 	}
 
 	if (le->flags & ROARING_ENTRY_OVERFLOW)
@@ -296,7 +296,7 @@ lookup_value_as_bitmap(Relation index, BlockNumber root_blkno, int64 value)
 					 errmsg("pg_roaring_index: leaf entry at offset %u is too short",
 							found_off)));
 		bitmap_len = item_len - sizeof(RoaringLeafEntry);
-		bm = roaring_bitmap_portable_deserialize_safe(
+		bm = roaring64_bitmap_portable_deserialize_safe(
 				(const char *)(le + 1), bitmap_len);
 		UnlockReleaseBuffer(leafbuf);
 	}
@@ -323,7 +323,7 @@ lookup_value_as_bitmap(Relation index, BlockNumber root_blkno, int64 value)
  * ---------------------------------------------------------------- */
 static void
 lookup_values_as_bitmaps_leaf_walk(Relation index, BlockNumber root_blkno,
-								   const int64 *vals, roaring_bitmap_t **bitmaps,
+								   const int64 *vals, roaring64_bitmap_t **bitmaps,
 								   int nvals)
 {
 	BlockNumber	cur;
@@ -347,7 +347,7 @@ lookup_values_as_bitmaps_leaf_walk(Relation index, BlockNumber root_blkno,
 	 * are back-filled with empty bitmaps at the end.  This avoids an
 	 * up-front create+free cycle for every hit value.
 	 */
-	memset(bitmaps, 0, (size_t) nvals * sizeof(roaring_bitmap_t *));
+	memset(bitmaps, 0, (size_t) nvals * sizeof(roaring64_bitmap_t *));
 
 	cur = roaring_dir_lookup(index, root_blkno, vals[0]);
 	if (cur == InvalidBlockNumber)
@@ -451,7 +451,7 @@ lookup_values_as_bitmaps_leaf_walk(Relation index, BlockNumber root_blkno,
 											"offset %u is too short",
 											found_off)));
 						bitmap_len = item_len - sizeof(RoaringLeafEntry);
-						bitmaps[vi] = roaring_bitmap_portable_deserialize_safe(
+						bitmaps[vi] = roaring64_bitmap_portable_deserialize_safe(
 								(const char *)(le + 1), bitmap_len);
 						if (bitmaps[vi] == NULL)
 							elog(ERROR,
@@ -479,7 +479,7 @@ fill_empty:
 	/* Back-fill any remaining NULL slots (values not found) with empty bitmaps. */
 	for (j = 0; j < nvals; j++)
 		if (bitmaps[j] == NULL)
-			bitmaps[j] = roaring_bitmap_create();
+			bitmaps[j] = roaring64_bitmap_create();
 }
 
 /* ----------------------------------------------------------------
@@ -487,13 +487,13 @@ fill_empty:
  *
  * Walk one pending list chain, collecting visible TIDs for scan_value
  * into a roaring bitmap of linearized TIDs.  Returns an empty bitmap
- * (not NULL) if nothing matches.  Caller frees with roaring_bitmap_free().
+ * (not NULL) if nothing matches.  Caller frees with roaring64_bitmap_free().
  * ---------------------------------------------------------------- */
-static roaring_bitmap_t *
+static roaring64_bitmap_t *
 pending_chain_as_bitmap(Relation index, BlockNumber start_blkno,
 						int64 scan_value, Snapshot snapshot)
 {
-	roaring_bitmap_t *bm  = roaring_bitmap_create();
+	roaring64_bitmap_t *bm  = roaring64_bitmap_create();
 	BlockNumber		  cur = start_blkno;
 
 	while (cur != InvalidBlockNumber)
@@ -513,7 +513,7 @@ pending_chain_as_bitmap(Relation index, BlockNumber start_blkno,
 		if (spc->entry_count > ROARING_PENDING_PER_PAGE)
 		{
 			UnlockReleaseBuffer(buf);
-			roaring_bitmap_free(bm);
+			roaring64_bitmap_free(bm);
 			elog(ERROR,
 				 "pg_roaring_index: corrupt pending page %u: entry_count %u > max %d",
 				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
@@ -527,171 +527,7 @@ pending_chain_as_bitmap(Relation index, BlockNumber start_blkno,
 					continue;
 				if (!roaring_pending_visible(raw[k].xmin, snapshot))
 					continue;
-				roaring_bitmap_add(bm, raw[k].linear_tid);
-			}
-		}
-
-		cur = spc->next_page;
-		UnlockReleaseBuffer(buf);
-	}
-	return bm;
-}
-
-/* ----------------------------------------------------------------
- * Lossy variants: bitmaps contain heap block numbers, not TID linearizations.
- * ---------------------------------------------------------------- */
-static roaring_bitmap_t *
-lookup_value_as_bitmap_lossy(Relation index, BlockNumber root_blkno, int64 value)
-{
-	BlockNumber		 leaf_blkno;
-	Buffer			 leafbuf;
-	Page			 leafpage;
-	OffsetNumber	 found_off;
-	RoaringLeafEntry *le;
-	roaring_bitmap_t *bm;
-
-	leaf_blkno = roaring_dir_lookup(index, root_blkno, value);
-	if (leaf_blkno == InvalidBlockNumber)
-		return roaring_bitmap_create();
-
-	for (;;)
-	{
-		OffsetNumber		lo,
-							hi;
-		RoaringLeafSpecial *lspc;
-
-		leafbuf   = ReadBuffer(index, leaf_blkno);
-		LockBuffer(leafbuf, BUFFER_LOCK_SHARE);
-		leafpage  = BufferGetPage(leafbuf);
-		found_off = InvalidOffsetNumber;
-		le		  = NULL;
-
-		lo = 1;
-		hi = PageGetMaxOffsetNumber(leafpage);
-		while (lo <= hi)
-		{
-			OffsetNumber	  mid = (lo + hi) / 2;
-			RoaringLeafEntry *e   = (RoaringLeafEntry *)
-									PageGetItem(leafpage,
-												PageGetItemId(leafpage, mid));
-
-			if (e->value == value)
-			{
-				le		  = e;
-				found_off = mid;
-				break;
-			}
-			else if (e->value < value)
-				lo = mid + 1;
-			else
-				hi = mid - 1;
-		}
-
-		if (le != NULL)
-			break;
-
-		lspc = (RoaringLeafSpecial *) PageGetSpecialPointer(leafpage);
-		if (lspc->right_page != InvalidBlockNumber)
-		{
-			OffsetNumber maxoff = PageGetMaxOffsetNumber(leafpage);
-
-			if (maxoff >= 1)
-			{
-				RoaringLeafEntry *last = (RoaringLeafEntry *)
-					PageGetItem(leafpage, PageGetItemId(leafpage, maxoff));
-
-				if (last->value < value)
-				{
-					BlockNumber right = lspc->right_page;
-
-					UnlockReleaseBuffer(leafbuf);
-					leaf_blkno = right;
-					continue;
-				}
-			}
-		}
-
-		UnlockReleaseBuffer(leafbuf);
-		return roaring_bitmap_create();
-	}
-
-	if (le->cardinality == 0)
-	{
-		UnlockReleaseBuffer(leafbuf);
-		return roaring_bitmap_create();
-	}
-
-	if (le->flags & ROARING_ENTRY_OVERFLOW)
-	{
-		RoaringOverflowEntry oe_copy;
-
-		memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
-		UnlockReleaseBuffer(leafbuf);
-		bm = roaring_read_overflow_bitmap(index, &oe_copy);
-	}
-	else
-	{
-		Size item_len = ItemIdGetLength(PageGetItemId(leafpage, found_off));
-		Size bitmap_len;
-
-		if (item_len < sizeof(RoaringLeafEntry))
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("pg_roaring_index: leaf entry at offset %u is too short",
-							found_off)));
-		bitmap_len = item_len - sizeof(RoaringLeafEntry);
-		bm = roaring_bitmap_portable_deserialize_safe(
-				(const char *)(le + 1), bitmap_len);
-		UnlockReleaseBuffer(leafbuf);
-	}
-
-	if (bm == NULL)
-		elog(ERROR,
-			 "pg_roaring_index: failed to deserialize bitmap "
-			 "for value " INT64_FORMAT, value);
-
-	return bm;
-}
-
-static roaring_bitmap_t *
-pending_chain_as_bitmap_lossy(Relation index, BlockNumber start_blkno,
-							   int64 scan_value, Snapshot snapshot)
-{
-	roaring_bitmap_t *bm  = roaring_bitmap_create();
-	BlockNumber		  cur = start_blkno;
-
-	while (cur != InvalidBlockNumber)
-	{
-		Buffer				  buf;
-		Page				  page;
-		RoaringPendingSpecial *spc;
-		RoaringPendingEntry	  *raw;
-		uint16				  k;
-
-		buf  = ReadBuffer(index, cur);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
-		raw  = (RoaringPendingEntry *) PageGetContents(page);
-
-		if (spc->entry_count > ROARING_PENDING_PER_PAGE)
-		{
-			UnlockReleaseBuffer(buf);
-			roaring_bitmap_free(bm);
-			elog(ERROR,
-				 "pg_roaring_index: corrupt pending page %u: entry_count %u > max %d",
-				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
-		}
-
-		if (scan_value >= spc->value_min && scan_value <= spc->value_max)
-		{
-			for (k = 0; k < spc->entry_count; k++)
-			{
-				if (raw[k].value != scan_value)
-					continue;
-				if (!roaring_pending_visible(raw[k].xmin, snapshot))
-					continue;
-				roaring_bitmap_add(bm, raw[k].linear_tid);
+				roaring64_bitmap_add(bm, raw[k].linear_tid);
 			}
 		}
 
@@ -721,16 +557,15 @@ int64_cmp_for_sort(const void *a, const void *b)
  * Walk one pending list chain once, adding visible TIDs into bitmaps[i]
  * for every pending entry whose value equals values[i].
  * values[] must be sorted ascending with no duplicates; bitmaps[] must
- * be pre-allocated (roaring_bitmap_create).  Caller frees each bitmap.
+ * be pre-allocated.  Caller frees each bitmap.
  *
- * Used by SK_SEARCHARRAY paths to reduce N pending-chain walks to 1.
- * Works for both exact (linear_tid = linearized TID) and lossy
- * (linear_tid = block number) pending chains — same on-disk format.
+ * Two variants: exact (roaring64, linearized TIDs) and lossy (roaring32,
+ * block numbers).  Both share identical chain-walk logic.
  * ---------------------------------------------------------------- */
 static void
-pending_chain_fill_values(Relation index, BlockNumber start_blkno,
-						   const int64 *values, roaring_bitmap_t **bitmaps,
-						   int nvalues, Snapshot snapshot)
+pending_chain_fill_values_exact(Relation index, BlockNumber start_blkno,
+								const int64 *values, roaring64_bitmap_t **bitmaps,
+								int nvalues, Snapshot snapshot)
 {
 	BlockNumber cur = start_blkno;
 
@@ -756,7 +591,6 @@ pending_chain_fill_values(Relation index, BlockNumber start_blkno,
 				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
 		}
 
-		/* Page-level skip: none of our values fall in this page's range. */
 		if (values[0] <= spc->value_max && values[nvalues - 1] >= spc->value_min)
 		{
 			for (k = 0; k < spc->entry_count; k++)
@@ -765,7 +599,6 @@ pending_chain_fill_values(Relation index, BlockNumber start_blkno,
 				int   lo = 0;
 				int   hi = nvalues - 1;
 
-				/* Binary search first; MVCC check only on match. */
 				while (lo <= hi)
 				{
 					int mid = (lo + hi) / 2;
@@ -773,7 +606,7 @@ pending_chain_fill_values(Relation index, BlockNumber start_blkno,
 					if (values[mid] == v)
 					{
 						if (roaring_pending_visible(raw[k].xmin, snapshot))
-							roaring_bitmap_add(bitmaps[mid], raw[k].linear_tid);
+							roaring64_bitmap_add(bitmaps[mid], raw[k].linear_tid);
 						break;
 					}
 					else if (values[mid] < v)
@@ -861,17 +694,17 @@ scankey_order_cmp(const void *a, const void *b)
  * Returns TID count.
  * ---------------------------------------------------------------- */
 static int64
-emit_exact_bitmap_to_tbm(roaring_bitmap_t *bm, TIDBitmap *tbm,
+emit_exact_bitmap_to_tbm(roaring64_bitmap_t *bm, TIDBitmap *tbm,
 						  ItemPointerData *tid_buf, int *tid_count_p,
 						  bool recheck)
 {
-	roaring_uint32_iterator_t it;
-	int64				ntids = 0;
+	roaring64_iterator_t *it;
+	int64				  ntids = 0;
 
-	roaring_iterator_init(bm, &it);
-	while (it.has_value)
+	it = roaring64_iterator_create(bm);
+	while (roaring64_iterator_has_value(it))
 	{
-		uint32		 linear = it.current_value;
+		uint64		 linear = roaring64_iterator_value(it);
 		BlockNumber  block  = (BlockNumber)(linear >> 9);
 		OffsetNumber off    = (OffsetNumber)((linear & 0x1FF) + 1);
 
@@ -882,25 +715,27 @@ emit_exact_bitmap_to_tbm(roaring_bitmap_t *bm, TIDBitmap *tbm,
 		}
 		ItemPointerSet(&tid_buf[(*tid_count_p)++], block, off);
 		ntids++;
-		roaring_uint32_iterator_advance(&it);
+		roaring64_iterator_advance(it);
 	}
+	roaring64_iterator_free(it);
 	return ntids;
 }
 
 /* emit block numbers from bm to tbm via tbm_add_page */
 static int64
-emit_lossy_bitmap_to_tbm(roaring_bitmap_t *bm, TIDBitmap *tbm)
+emit_lossy_bitmap_to_tbm(roaring64_bitmap_t *bm, TIDBitmap *tbm)
 {
-	roaring_uint32_iterator_t it;
+	roaring64_iterator_t *it;
 	int64 npages = 0;
 
-	roaring_iterator_init(bm, &it);
-	while (it.has_value)
+	it = roaring64_iterator_create(bm);
+	while (roaring64_iterator_has_value(it))
 	{
-		tbm_add_page(tbm, (BlockNumber) it.current_value);
+		tbm_add_page(tbm, (BlockNumber) roaring64_iterator_value(it));
 		npages++;
-		roaring_uint32_iterator_advance(&it);
+		roaring64_iterator_advance(it);
 	}
+	roaring64_iterator_free(it);
 	return npages;
 }
 
@@ -1048,8 +883,8 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	 */
 	if (index->rd_att->natts > 1)
 	{
-		roaring_bitmap_t * volatile result = NULL;
-		roaring_bitmap_t * volatile col_bm = NULL;
+		roaring64_bitmap_t * volatile result = NULL;
+		roaring64_bitmap_t * volatile col_bm = NULL;
 		ScanKeyOrder	   *order;
 		int ki;
 
@@ -1113,7 +948,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					get_typlenbyvalalign(col_typid, &typlen, &typbyval, &typalign);
 					deconstruct_array(arr, col_typid, typlen, typbyval, typalign,
 									  &elems, &nulls, &nelems);
-					col_bm	 = roaring_bitmap_create();
+					col_bm	 = roaring64_bitmap_create();
 					col_keys = palloc(nelems * sizeof(int64));
 
 					for (i = 0; i < nelems; i++)
@@ -1132,8 +967,8 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 					if (nkeys > 0)
 					{
-						roaring_bitmap_t **pbms = NULL;
-						int				   j, m;
+						roaring64_bitmap_t **pbms = NULL;
+						int				     j, m;
 
 						qsort(col_keys, nkeys, sizeof(int64), int64_cmp_for_sort);
 						for (j = 1, m = 1; j < nkeys; j++)
@@ -1145,22 +980,22 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						{
 							int s;
 
-							pbms = palloc(nkeys * sizeof(roaring_bitmap_t *));
+							pbms = palloc(nkeys * sizeof(roaring64_bitmap_t *));
 							for (j = 0; j < nkeys; j++)
-								pbms[j] = roaring_bitmap_create();
+								pbms[j] = roaring64_bitmap_create();
 							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 							{
-								pending_chain_fill_values(index, insert_heads[s],
-														  col_keys, pbms, nkeys, snapshot);
+								pending_chain_fill_values_exact(index, insert_heads[s],
+																col_keys, pbms, nkeys, snapshot);
 								if (merging_heads[s] != InvalidBlockNumber)
-									pending_chain_fill_values(index, merging_heads[s],
-															  col_keys, pbms, nkeys, snapshot);
+									pending_chain_fill_values_exact(index, merging_heads[s],
+																	col_keys, pbms, nkeys, snapshot);
 							}
 						}
 
 						{
-							roaring_bitmap_t **vbms =
-								palloc(nkeys * sizeof(roaring_bitmap_t *));
+							roaring64_bitmap_t **vbms =
+								palloc(nkeys * sizeof(roaring64_bitmap_t *));
 
 							lookup_values_as_bitmaps_leaf_walk(
 								index, root_blkno, col_keys, vbms, nkeys);
@@ -1168,12 +1003,11 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 							{
 								if (pbms != NULL)
 								{
-									roaring_bitmap_or_inplace(vbms[j], pbms[j]);
-									roaring_bitmap_free(pbms[j]);
+									roaring64_bitmap_or_inplace(vbms[j], pbms[j]);
+									roaring64_bitmap_free(pbms[j]);
 								}
-								roaring_bitmap_or_inplace(
-									(roaring_bitmap_t *) col_bm, vbms[j]);
-								roaring_bitmap_free(vbms[j]);
+								roaring64_bitmap_or_inplace(col_bm, vbms[j]);
+								roaring64_bitmap_free(vbms[j]);
 							}
 							pfree(vbms);
 						}
@@ -1191,7 +1025,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					if (col_typid == FLOAT4OID &&
 						isnan(DatumGetFloat4(k->sk_argument)))
 					{
-						col_bm = roaring_bitmap_create();
+						col_bm = roaring64_bitmap_create();
 					}
 					else
 					{
@@ -1205,17 +1039,17 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						{
 							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 							{
-								roaring_bitmap_t *pbm =
+								roaring64_bitmap_t *pbm =
 									pending_chain_as_bitmap(index, insert_heads[s],
 															 col_key, snapshot);
-								roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
-								roaring_bitmap_free(pbm);
+								roaring64_bitmap_or_inplace(col_bm, pbm);
+								roaring64_bitmap_free(pbm);
 								if (merging_heads[s] != InvalidBlockNumber)
 								{
 									pbm = pending_chain_as_bitmap(index, merging_heads[s],
 																   col_key, snapshot);
-									roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
-									roaring_bitmap_free(pbm);
+									roaring64_bitmap_or_inplace(col_bm, pbm);
+									roaring64_bitmap_free(pbm);
 								}
 							}
 						}
@@ -1226,11 +1060,10 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					result = col_bm;
 				else
 				{
-					roaring_bitmap_and_inplace((roaring_bitmap_t *) result,
-											   (roaring_bitmap_t *) col_bm);
-					roaring_bitmap_free((roaring_bitmap_t *) col_bm);
+					roaring64_bitmap_and_inplace(result, col_bm);
+					roaring64_bitmap_free(col_bm);
 					/* Early exit: no rows can match. */
-					if (roaring_bitmap_is_empty((roaring_bitmap_t *) result))
+					if (roaring64_bitmap_is_empty(result))
 					{
 						col_bm = NULL;
 						break;
@@ -1241,10 +1074,9 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 			if (result != NULL)
 			{
-				ntids = emit_exact_bitmap_to_tbm((roaring_bitmap_t *) result,
-												  tbm, tid_buf, &tid_count,
+				ntids = emit_exact_bitmap_to_tbm(result, tbm, tid_buf, &tid_count,
 												  so->needs_recheck);
-				roaring_bitmap_free((roaring_bitmap_t *) result);
+				roaring64_bitmap_free(result);
 				result = NULL;
 			}
 		}
@@ -1252,9 +1084,9 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		{
 			pfree(order);
 			if (col_bm)
-				roaring_bitmap_free((roaring_bitmap_t *) col_bm);
+				roaring64_bitmap_free(col_bm);
 			if (result)
-				roaring_bitmap_free((roaring_bitmap_t *) result);
+				roaring64_bitmap_free(result);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -1285,8 +1117,8 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			char	   typalign;
 			int64	  *vals;
 			int		   nvals = 0;
-			roaring_bitmap_t ** volatile bms  = NULL;
-			roaring_bitmap_t ** volatile pbms = NULL;
+			roaring64_bitmap_t ** volatile bms  = NULL;
+			roaring64_bitmap_t ** volatile pbms = NULL;
 
 			get_typlenbyvalalign(atttypid, &typlen, &typbyval, &typalign);
 			deconstruct_array(arr, atttypid, typlen, typbyval, typalign,
@@ -1320,36 +1152,37 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					{
 						int s;
 
-						pbms = palloc(nvals * sizeof(roaring_bitmap_t *));
+						pbms = palloc(nvals * sizeof(roaring64_bitmap_t *));
 						for (j = 0; j < nvals; j++)
-							pbms[j] = roaring_bitmap_create();
+							pbms[j] = roaring64_bitmap_create();
 						for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 						{
-							pending_chain_fill_values(index, insert_heads[s],
-													  vals, (roaring_bitmap_t **) pbms,
-													  nvals, snapshot);
+							pending_chain_fill_values_exact(index, insert_heads[s],
+															vals, (roaring64_bitmap_t **) pbms,
+															nvals, snapshot);
 							if (merging_heads[s] != InvalidBlockNumber)
-								pending_chain_fill_values(index, merging_heads[s],
-														  vals, (roaring_bitmap_t **) pbms,
-														  nvals, snapshot);
+								pending_chain_fill_values_exact(index, merging_heads[s],
+																vals, (roaring64_bitmap_t **) pbms,
+																nvals, snapshot);
 						}
 					}
 
-					bms = palloc(nvals * sizeof(roaring_bitmap_t *));
+					bms = palloc(nvals * sizeof(roaring64_bitmap_t *));
 					lookup_values_as_bitmaps_leaf_walk(index, root_blkno,
-													   vals, bms, nvals);
+													   vals, (roaring64_bitmap_t **) bms,
+													   nvals);
 					for (j = 0; j < nvals; j++)
 					{
 						if (pbms != NULL)
 						{
-							roaring_bitmap_or_inplace(bms[j], pbms[j]);
-							roaring_bitmap_free(pbms[j]);
+							roaring64_bitmap_or_inplace(bms[j], pbms[j]);
+							roaring64_bitmap_free(pbms[j]);
 							pbms[j] = NULL;
 						}
 						ntids += emit_exact_bitmap_to_tbm(bms[j], tbm, tid_buf,
 														  &tid_count,
 														  so->needs_recheck);
-						roaring_bitmap_free(bms[j]);
+						roaring64_bitmap_free(bms[j]);
 						bms[j] = NULL;
 					}
 					pfree((void *) bms);
@@ -1366,14 +1199,14 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					{
 						for (j = 0; j < nvals; j++)
 							if (bms[j])
-								roaring_bitmap_free(bms[j]);
+								roaring64_bitmap_free(bms[j]);
 						pfree((void *) bms);
 					}
 					if (pbms)
 					{
 						for (j = 0; j < nvals; j++)
 							if (pbms[j])
-								roaring_bitmap_free(pbms[j]);
+								roaring64_bitmap_free(pbms[j]);
 						pfree((void *) pbms);
 					}
 					PG_RE_THROW();
@@ -1385,7 +1218,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		}
 		else
 		{
-			roaring_bitmap_t * volatile bm = NULL;
+			roaring64_bitmap_t * volatile bm = NULL;
 			int64 scan_value;
 
 			if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(key->sk_argument)))
@@ -1402,29 +1235,29 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 					for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 					{
-						roaring_bitmap_t *pbm =
+						roaring64_bitmap_t *pbm =
 							pending_chain_as_bitmap(index, insert_heads[s],
 													scan_value, snapshot);
-						roaring_bitmap_or_inplace(bm, pbm);
-						roaring_bitmap_free(pbm);
+						roaring64_bitmap_or_inplace(bm, pbm);
+						roaring64_bitmap_free(pbm);
 						if (merging_heads[s] != InvalidBlockNumber)
 						{
 							pbm = pending_chain_as_bitmap(index, merging_heads[s],
 														  scan_value, snapshot);
-							roaring_bitmap_or_inplace(bm, pbm);
-							roaring_bitmap_free(pbm);
+							roaring64_bitmap_or_inplace(bm, pbm);
+							roaring64_bitmap_free(pbm);
 						}
 					}
 				}
 				ntids = emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count,
 												 so->needs_recheck);
-				roaring_bitmap_free(bm);
+				roaring64_bitmap_free(bm);
 				bm = NULL;
 			}
 			PG_CATCH();
 			{
 				if (bm)
-					roaring_bitmap_free(bm);
+					roaring64_bitmap_free(bm);
 				PG_RE_THROW();
 			}
 			PG_END_TRY();
@@ -1570,8 +1403,8 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 	/* Multi-column: AND bitmaps across scan keys (block-number bitmaps). */
 	if (index->rd_att->natts > 1)
 	{
-		roaring_bitmap_t * volatile result = NULL;
-		roaring_bitmap_t * volatile col_bm = NULL;
+		roaring64_bitmap_t * volatile result = NULL;
+		roaring64_bitmap_t * volatile col_bm = NULL;
 		ScanKeyOrder	   *order;
 		int ki;
 
@@ -1630,7 +1463,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 					get_typlenbyvalalign(col_typid, &typlen, &typbyval, &typalign);
 					deconstruct_array(arr, col_typid, typlen, typbyval, typalign,
 									  &elems, &nulls, &nelems);
-					col_bm	 = roaring_bitmap_create();
+					col_bm	 = roaring64_bitmap_create();
 					col_keys = palloc(nelems * sizeof(int64));
 
 					for (i = 0; i < nelems; i++)
@@ -1649,8 +1482,8 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 
 					if (nkeys > 0)
 					{
-						roaring_bitmap_t **pbms = NULL;
-						int				   j, m;
+						roaring64_bitmap_t **pbms = NULL;
+						int				     j, m;
 
 						qsort(col_keys, nkeys, sizeof(int64), int64_cmp_for_sort);
 						for (j = 1, m = 1; j < nkeys; j++)
@@ -1662,22 +1495,22 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 						{
 							int s;
 
-							pbms = palloc(nkeys * sizeof(roaring_bitmap_t *));
+							pbms = palloc(nkeys * sizeof(roaring64_bitmap_t *));
 							for (j = 0; j < nkeys; j++)
-								pbms[j] = roaring_bitmap_create();
+								pbms[j] = roaring64_bitmap_create();
 							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 							{
-								pending_chain_fill_values(index, insert_heads[s],
-														  col_keys, pbms, nkeys, snapshot);
+								pending_chain_fill_values_exact(index, insert_heads[s],
+																col_keys, pbms, nkeys, snapshot);
 								if (merging_heads[s] != InvalidBlockNumber)
-									pending_chain_fill_values(index, merging_heads[s],
-															  col_keys, pbms, nkeys, snapshot);
+									pending_chain_fill_values_exact(index, merging_heads[s],
+																	col_keys, pbms, nkeys, snapshot);
 							}
 						}
 
 						{
-							roaring_bitmap_t **vbms =
-								palloc(nkeys * sizeof(roaring_bitmap_t *));
+							roaring64_bitmap_t **vbms =
+								palloc(nkeys * sizeof(roaring64_bitmap_t *));
 
 							lookup_values_as_bitmaps_leaf_walk(
 								index, root_blkno, col_keys, vbms, nkeys);
@@ -1685,12 +1518,11 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 							{
 								if (pbms != NULL)
 								{
-									roaring_bitmap_or_inplace(vbms[j], pbms[j]);
-									roaring_bitmap_free(pbms[j]);
+									roaring64_bitmap_or_inplace(vbms[j], pbms[j]);
+									roaring64_bitmap_free(pbms[j]);
 								}
-								roaring_bitmap_or_inplace(
-									(roaring_bitmap_t *) col_bm, vbms[j]);
-								roaring_bitmap_free(vbms[j]);
+								roaring64_bitmap_or_inplace(col_bm, vbms[j]);
+								roaring64_bitmap_free(vbms[j]);
 							}
 							pfree(vbms);
 						}
@@ -1708,31 +1540,31 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 					if (col_typid == FLOAT4OID &&
 						isnan(DatumGetFloat4(k->sk_argument)))
 					{
-						col_bm = roaring_bitmap_create();
+						col_bm = roaring64_bitmap_create();
 					}
 					else
 					{
 						col_key = ROARING_COL_KEY(k->sk_attno,
 												   roaring_datum_to_key32(k->sk_argument,
 																		   col_typid));
-						col_bm = lookup_value_as_bitmap_lossy(index, root_blkno, col_key);
+						col_bm = lookup_value_as_bitmap(index, root_blkno, col_key);
 						if (any_pending)
 						{
 							int s;
 
 							for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 							{
-								roaring_bitmap_t *pbm =
-									pending_chain_as_bitmap_lossy(index, insert_heads[s],
-																   col_key, snapshot);
-								roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
-								roaring_bitmap_free(pbm);
+								roaring64_bitmap_t *pbm =
+									pending_chain_as_bitmap(index, insert_heads[s],
+															col_key, snapshot);
+								roaring64_bitmap_or_inplace(col_bm, pbm);
+								roaring64_bitmap_free(pbm);
 								if (merging_heads[s] != InvalidBlockNumber)
 								{
-									pbm = pending_chain_as_bitmap_lossy(
+									pbm = pending_chain_as_bitmap(
 										index, merging_heads[s], col_key, snapshot);
-									roaring_bitmap_or_inplace((roaring_bitmap_t *) col_bm, pbm);
-									roaring_bitmap_free(pbm);
+									roaring64_bitmap_or_inplace(col_bm, pbm);
+									roaring64_bitmap_free(pbm);
 								}
 							}
 						}
@@ -1743,11 +1575,10 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 					result = col_bm;
 				else
 				{
-					roaring_bitmap_and_inplace((roaring_bitmap_t *) result,
-											   (roaring_bitmap_t *) col_bm);
-					roaring_bitmap_free((roaring_bitmap_t *) col_bm);
+					roaring64_bitmap_and_inplace(result, col_bm);
+					roaring64_bitmap_free(col_bm);
 					/* Early exit: no pages can match. */
-					if (roaring_bitmap_is_empty((roaring_bitmap_t *) result))
+					if (roaring64_bitmap_is_empty(result))
 					{
 						col_bm = NULL;
 						break;
@@ -1758,8 +1589,8 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 
 			if (result != NULL)
 			{
-				ntids = emit_lossy_bitmap_to_tbm((roaring_bitmap_t *) result, tbm);
-				roaring_bitmap_free((roaring_bitmap_t *) result);
+				ntids = emit_lossy_bitmap_to_tbm(result, tbm);
+				roaring64_bitmap_free(result);
 				result = NULL;
 			}
 		}
@@ -1767,9 +1598,9 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 		{
 			pfree(order);
 			if (col_bm)
-				roaring_bitmap_free((roaring_bitmap_t *) col_bm);
+				roaring64_bitmap_free(col_bm);
 			if (result)
-				roaring_bitmap_free((roaring_bitmap_t *) result);
+				roaring64_bitmap_free(result);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -1795,8 +1626,8 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 			char	   typalign;
 			int64	  *vals;
 			int		   nvals = 0;
-			roaring_bitmap_t ** volatile bms  = NULL;
-			roaring_bitmap_t ** volatile pbms = NULL;
+			roaring64_bitmap_t ** volatile bms  = NULL;
+			roaring64_bitmap_t ** volatile pbms = NULL;
 
 			get_typlenbyvalalign(atttypid, &typlen, &typbyval, &typalign);
 			deconstruct_array(arr, atttypid, typlen, typbyval, typalign,
@@ -1830,34 +1661,32 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 					{
 						int s;
 
-						pbms = palloc(nvals * sizeof(roaring_bitmap_t *));
+						pbms = palloc(nvals * sizeof(roaring64_bitmap_t *));
 						for (j = 0; j < nvals; j++)
-							pbms[j] = roaring_bitmap_create();
+							pbms[j] = roaring64_bitmap_create();
 						for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 						{
-							pending_chain_fill_values(index, insert_heads[s],
-													  vals, (roaring_bitmap_t **) pbms,
-													  nvals, snapshot);
+							pending_chain_fill_values_exact(index, insert_heads[s],
+															vals, pbms, nvals, snapshot);
 							if (merging_heads[s] != InvalidBlockNumber)
-								pending_chain_fill_values(index, merging_heads[s],
-														  vals, (roaring_bitmap_t **) pbms,
-														  nvals, snapshot);
+								pending_chain_fill_values_exact(index, merging_heads[s],
+																vals, pbms, nvals, snapshot);
 						}
 					}
 
-					bms = palloc(nvals * sizeof(roaring_bitmap_t *));
+					bms = palloc(nvals * sizeof(roaring64_bitmap_t *));
 					lookup_values_as_bitmaps_leaf_walk(index, root_blkno,
 													   vals, bms, nvals);
 					for (j = 0; j < nvals; j++)
 					{
 						if (pbms != NULL)
 						{
-							roaring_bitmap_or_inplace(bms[j], pbms[j]);
-							roaring_bitmap_free(pbms[j]);
+							roaring64_bitmap_or_inplace(bms[j], pbms[j]);
+							roaring64_bitmap_free(pbms[j]);
 							pbms[j] = NULL;
 						}
 						ntids += emit_lossy_bitmap_to_tbm(bms[j], tbm);
-						roaring_bitmap_free(bms[j]);
+						roaring64_bitmap_free(bms[j]);
 						bms[j] = NULL;
 					}
 					pfree((void *) bms);
@@ -1874,14 +1703,14 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 					{
 						for (j = 0; j < nvals; j++)
 							if (bms[j])
-								roaring_bitmap_free(bms[j]);
+								roaring64_bitmap_free(bms[j]);
 						pfree((void *) bms);
 					}
 					if (pbms)
 					{
 						for (j = 0; j < nvals; j++)
 							if (pbms[j])
-								roaring_bitmap_free(pbms[j]);
+								roaring64_bitmap_free(pbms[j]);
 						pfree((void *) pbms);
 					}
 					PG_RE_THROW();
@@ -1893,7 +1722,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 		}
 		else
 		{
-			roaring_bitmap_t * volatile bm = NULL;
+			roaring64_bitmap_t * volatile bm = NULL;
 			int64 scan_value;
 
 			if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(key->sk_argument)))
@@ -1903,35 +1732,35 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 
 			PG_TRY();
 			{
-				bm = lookup_value_as_bitmap_lossy(index, root_blkno, scan_value);
+				bm = lookup_value_as_bitmap(index, root_blkno, scan_value);
 				if (any_pending)
 				{
 					int s;
 
 					for (s = 0; s < ROARING_PENDING_SHARDS; s++)
 					{
-						roaring_bitmap_t *pbm =
-							pending_chain_as_bitmap_lossy(index, insert_heads[s],
-														  scan_value, snapshot);
-						roaring_bitmap_or_inplace(bm, pbm);
-						roaring_bitmap_free(pbm);
+						roaring64_bitmap_t *pbm =
+							pending_chain_as_bitmap(index, insert_heads[s],
+													scan_value, snapshot);
+						roaring64_bitmap_or_inplace(bm, pbm);
+						roaring64_bitmap_free(pbm);
 						if (merging_heads[s] != InvalidBlockNumber)
 						{
-							pbm = pending_chain_as_bitmap_lossy(index, merging_heads[s],
-																scan_value, snapshot);
-							roaring_bitmap_or_inplace(bm, pbm);
-							roaring_bitmap_free(pbm);
+							pbm = pending_chain_as_bitmap(index, merging_heads[s],
+														  scan_value, snapshot);
+							roaring64_bitmap_or_inplace(bm, pbm);
+							roaring64_bitmap_free(pbm);
 						}
 					}
 				}
 				ntids = emit_lossy_bitmap_to_tbm(bm, tbm);
-				roaring_bitmap_free(bm);
+				roaring64_bitmap_free(bm);
 				bm = NULL;
 			}
 			PG_CATCH();
 			{
 				if (bm)
-					roaring_bitmap_free(bm);
+					roaring64_bitmap_free(bm);
 				PG_RE_THROW();
 			}
 			PG_END_TRY();

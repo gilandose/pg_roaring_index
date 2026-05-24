@@ -312,8 +312,8 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 	if (index->rd_att->natts > 1)
 	{
 		/* Multi-column: one pending entry per non-null column. */
-		uint32		linear_tid = ((uint32) ItemPointerGetBlockNumber(ht_ctid) << 9) |
-							   (uint32)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
+		uint64		linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
+							   (uint64)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
 		TransactionId xmin = GetCurrentTransactionId();
 		int			  i;
 
@@ -341,8 +341,8 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 			return false;
 		entry.value = roaring_datum_to_key64(values[0], typid);
 	}
-	entry.linear_tid = ((uint32) ItemPointerGetBlockNumber(ht_ctid) << 9) |
-					   (uint32)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
+	entry.linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
+					   (uint64)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
 	entry.xmin       = GetCurrentTransactionId();
 
 	roaring_pending_append(index, &entry);

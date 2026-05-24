@@ -378,22 +378,20 @@ roaring_write_overflow_chain(Relation index,
 }
 
 /*
- * roaring_read_overflow_bitmap
+ * roaring_overflow_read_bytes
  *
- * Reassemble and deserialize the bitmap for a leaf entry that uses overflow
- * pages.  Concatenates the inline_prefix bytes with data from the chain.
+ * Internal helper: reassemble raw serialized bitmap bytes from an overflow
+ * entry into a palloc'd buffer.  Caller must pfree the result.
  */
-roaring_bitmap_t *
-roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
+static char *
+roaring_overflow_read_bytes(Relation index, const RoaringOverflowEntry *oe)
 {
 	size_t		 total_len = oe->total_len;
 	Size		 cap	   = ROARING_OVERFLOW_PAGE_CAP;
 	size_t		 off;
 	BlockNumber	 cur;
-	roaring_bitmap_t *bm;
 	char		*buf;
 
-	/* Guard against a corrupt total_len that would cause a huge palloc. */
 	if (total_len == 0 || total_len > (size_t) MaxAllocSize)
 		elog(ERROR,
 			 "pg_roaring_index: corrupt overflow entry: invalid total_len %zu",
@@ -401,11 +399,9 @@ roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
 
 	buf = palloc(total_len);
 
-	/* Inline prefix stored directly in the entry. */
 	off = Min(sizeof(oe->inline_prefix), total_len);
 	memcpy(buf, oe->inline_prefix, off);
 
-	/* Walk overflow chain, prefetching one page ahead to pipeline I/O. */
 	cur = oe->overflow_blkno;
 	while (cur != InvalidBlockNumber && off < total_len)
 	{
@@ -427,6 +423,30 @@ roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
 			PrefetchBuffer(index, MAIN_FORKNUM, cur);
 		UnlockReleaseBuffer(ovbuf);
 	}
+
+	return buf;
+}
+
+/* roaring_read_overflow_bitmap — exact mode (roaring64). */
+roaring64_bitmap_t *
+roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
+{
+	size_t		   total_len = oe->total_len;
+	char		  *buf = roaring_overflow_read_bytes(index, oe);
+	roaring64_bitmap_t *bm;
+
+	bm = roaring64_bitmap_portable_deserialize_safe(buf, total_len);
+	pfree(buf);
+	return bm;
+}
+
+/* roaring_read_overflow_bitmap_lossy — lossy mode (roaring32). */
+roaring_bitmap_t *
+roaring_read_overflow_bitmap_lossy(Relation index, const RoaringOverflowEntry *oe)
+{
+	size_t		  total_len = oe->total_len;
+	char		 *buf = roaring_overflow_read_bytes(index, oe);
+	roaring_bitmap_t *bm;
 
 	bm = roaring_bitmap_portable_deserialize_safe(buf, total_len);
 	pfree(buf);
