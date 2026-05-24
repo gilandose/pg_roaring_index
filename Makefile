@@ -8,11 +8,12 @@ OBJS = \
 	src/roaring_vacuum.o \
 	src/roaring_cost.o \
 	src/roaring_bgworker.o \
+	src/roaring_stats.o \
 	src/vendor/croaring/roaring.o
 
 EXTENSION = pg_roaring_index
 DATA      = pg_roaring_index--1.0.sql
-REGRESS   = roaring_basic roaring_lossy roaring_multicolumn roaring_types roaring_text
+REGRESS   = roaring_basic roaring_lossy roaring_multicolumn roaring_types roaring_text roaring_stats
 
 PG_CPPFLAGS = -Iinclude -Isrc/vendor/croaring -DUSE_CROARING
 

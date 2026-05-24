@@ -131,3 +131,64 @@ CREATE OPERATOR CLASS roaring_text_page_ops
 CREATE OPERATOR CLASS roaring_uuid_page_ops
     DEFAULT FOR TYPE uuid USING roaring_lossy AS
     OPERATOR 1 =(uuid, uuid);
+
+-- ----------------------------------------------------------------
+-- Observability
+-- ----------------------------------------------------------------
+
+-- roaring_index_stats: read the metapage of a roaring/roaring_lossy index
+-- and return one diagnostic row.
+CREATE FUNCTION roaring_index_stats(
+    indexrelid regclass,
+    OUT total_entries   bigint,
+    OUT pending_count   bigint,
+    OUT pending_threshold int,
+    OUT is_lossy        bool,
+    OUT bg_merge_running bool,
+    OUT index_version   int,
+    OUT root_blkno      bigint,
+    OUT leftmost_leaf   bigint,
+    OUT free_list_head  bigint
+) RETURNS RECORD
+    AS 'MODULE_PATHNAME', 'roaring_index_stats'
+    LANGUAGE C STRICT;
+
+-- pg_stat_roaring_indexes: one row per roaring/roaring_lossy index.
+CREATE VIEW pg_stat_roaring_indexes AS
+    SELECT
+        c.oid              AS indexrelid,
+        n.nspname          AS schemaname,
+        c.relname          AS indexrelname,
+        am.amname,
+        s.total_entries,
+        s.pending_count,
+        s.pending_threshold,
+        s.is_lossy,
+        s.bg_merge_running,
+        s.index_version,
+        s.root_blkno,
+        s.leftmost_leaf,
+        s.free_list_head
+    FROM pg_class c
+    JOIN pg_namespace n  ON n.oid  = c.relnamespace
+    JOIN pg_am am        ON am.oid = c.relam
+    JOIN LATERAL roaring_index_stats(c.oid) s ON true
+    WHERE am.amname IN ('roaring', 'roaring_lossy')
+      AND c.relkind = 'i';
+
+-- roaring_index_health: simple textual health probe.
+CREATE FUNCTION roaring_index_health(regclass) RETURNS text
+    LANGUAGE sql STRICT
+    AS $$
+        SELECT
+            CASE
+                WHEN bg_merge_running AND pending_count >= pending_threshold
+                    THEN 'merge overdue'
+                WHEN bg_merge_running
+                    THEN 'merge in progress'
+                WHEN pending_count > 0
+                    THEN 'pending inserts'
+                ELSE 'ok'
+            END
+        FROM roaring_index_stats($1)
+    $$;

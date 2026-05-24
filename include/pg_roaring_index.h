@@ -471,4 +471,10 @@ extern void roaring_costestimate(struct PlannerInfo *root,
 /* roaring_validate.c (in pg_roaring_index.c for now) */
 extern bool roaring_validate(Oid opclassoid);
 
+/* GUC: roaring.pending_merge_threshold (defined in pg_roaring_index.c) */
+extern int roaring_pending_merge_threshold_guc;
+
+/* roaring_stats.c */
+extern Datum roaring_index_stats(struct FunctionCallInfoBaseData *fcinfo);
+
 #endif /* PG_ROARING_INDEX_H */

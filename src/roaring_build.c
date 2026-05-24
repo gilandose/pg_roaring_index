@@ -169,7 +169,7 @@ write_metapage(Relation index,
 	}
 
 	meta->total_entries			 = total_entries;
-	meta->pending_merge_threshold = ROARING_PENDING_MERGE_THRESHOLD;
+	meta->pending_merge_threshold = (uint32) roaring_pending_merge_threshold_guc;
 
 	/*
 	 * Set pd_lower past the metapage data so GenericXLog's mask_unused_space
@@ -636,7 +636,7 @@ roaring_buildempty(Relation index)
 		meta->shards[i].carry_head   = InvalidBlockNumber;
 	}
 	meta->total_entries			  = 0;
-	meta->pending_merge_threshold = ROARING_PENDING_MERGE_THRESHOLD;
+	meta->pending_merge_threshold = (uint32) roaring_pending_merge_threshold_guc;
 	((PageHeader) page)->pd_lower =
 		(LocationIndex)(SizeOfPageHeaderData + sizeof(RoaringMetaPageData));
 	PageSetChecksumInplace(page, ROARING_METAPAGE_BLKNO);

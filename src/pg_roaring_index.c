@@ -16,6 +16,26 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(roaring_handler);
 PG_FUNCTION_INFO_V1(roaring_page_handler);
 
+int roaring_pending_merge_threshold_guc = ROARING_PENDING_MERGE_THRESHOLD;
+
+void
+_PG_init(void)
+{
+	DefineCustomIntVariable(
+		"roaring.pending_merge_threshold",
+		"Number of pending entries before triggering a background merge.",
+		"Applied at index creation time; stored in the metapage.",
+		&roaring_pending_merge_threshold_guc,
+		ROARING_PENDING_MERGE_THRESHOLD,
+		1000,
+		10000000,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+	MarkGUCPrefixReserved("roaring");
+}
+
 /*
  * roaring_validate
  *
