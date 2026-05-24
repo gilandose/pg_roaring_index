@@ -76,7 +76,7 @@ roaring_costestimate(struct PlannerInfo *root,
 					cache->insert_head[si]  = meta->shards[si].insert_head;
 					cache->merging_head[si] = meta->shards[si].merging_head;
 				}
-				cache->pending_count = total;
+				cache->pending_count_approx = total;
 			}
 			cache->root_blkno    = meta->root_directory_page;
 			cache->total_entries = meta->total_entries;

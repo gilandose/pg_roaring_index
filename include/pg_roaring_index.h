@@ -352,7 +352,7 @@ typedef struct RoaringAmCache
     BlockNumber root_blkno;
     uint32      total_entries;
     XLogRecPtr  meta_lsn;
-    uint32      pending_count;          /* sum across all shards */
+    uint32      pending_count_approx;   /* advisory: sum of insert_counts; stale by up to ROARING_PENDING_PER_PAGE-1 inserts */
     /* Per-shard head pointers so scans can walk all chains without re-reading meta */
     BlockNumber insert_head[ROARING_PENDING_SHARDS];
     BlockNumber merging_head[ROARING_PENDING_SHARDS];

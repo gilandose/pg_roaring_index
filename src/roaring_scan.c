@@ -1160,7 +1160,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	BlockNumber			root_blkno;
 	BlockNumber			insert_heads[ROARING_PENDING_SHARDS];
 	BlockNumber			merging_heads[ROARING_PENDING_SHARDS];
-	uint32				pending_count;
+	uint32				pending_count_approx;
 	bool				any_pending;
 	Snapshot			snapshot;
 
@@ -1181,7 +1181,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	{
 		RoaringAmCache *cache = (RoaringAmCache *) index->rd_amcache;
 
-		if (cache != NULL && cache->pending_count == 0)
+		if (cache != NULL && cache->pending_count_approx == 0)
 		{
 			bool	   any_merging = false;
 			int		   si;
@@ -1202,7 +1202,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					int k;
 
 					root_blkno    = cache->root_blkno;
-					pending_count = 0;
+					pending_count_approx = 0;
 					for (k = 0; k < ROARING_PENDING_SHARDS; k++)
 					{
 						insert_heads[k]  = cache->insert_head[k];
@@ -1210,7 +1210,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					}
 					/*
 					 * insert_count is updated only on page extension, not on
-					 * every hot-path insert.  pending_count == 0 does NOT mean
+					 * every hot-path insert.  pending_count_approx == 0 does NOT mean
 					 * the chains are empty.  Always walk the chains for
 					 * correctness; head pages are typically in shared_buffers.
 					 */
@@ -1235,7 +1235,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 				insert_heads[si]     = meta->shards[si].insert_head;
 				merging_heads[si]    = meta->shards[si].merging_head;
 			}
-			pending_count = total;
+			pending_count_approx = total;
 		}
 
 		if (cache == NULL)
@@ -1257,7 +1257,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		cache->root_blkno    = root_blkno;
 		cache->total_entries = meta->total_entries;
 		cache->meta_lsn      = PageGetLSN(BufferGetPage(metabuf));
-		cache->pending_count = pending_count;
+		cache->pending_count_approx = pending_count_approx;
 		UnlockReleaseBuffer(metabuf);
 
 		{
@@ -1267,7 +1267,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
 				if (merging_heads[si] != InvalidBlockNumber)
 				{ any_merging = true; break; }
-			any_pending = (pending_count > 0 || any_merging);
+			any_pending = (pending_count_approx > 0 || any_merging);
 		}
 	}
 	after_meta:;
@@ -1310,7 +1310,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			/*
 			 * Absent key with no pending list: the AND result is provably
 			 * empty.  Stop peeking immediately; skip sort and bitmap work.
-			 * Not safe when pending_count > 0 — that column might have
+			 * Not safe when pending_count_approx > 0 — that column might have
 			 * freshly inserted rows not yet merged into the main index.
 			 */
 			if (order[ki].card_est == 0 && !any_pending)
@@ -1688,7 +1688,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 	BlockNumber			root_blkno;
 	BlockNumber			insert_heads[ROARING_PENDING_SHARDS];
 	BlockNumber			merging_heads[ROARING_PENDING_SHARDS];
-	uint32				pending_count;
+	uint32				pending_count_approx;
 	bool				any_pending;
 	Snapshot			snapshot;
 
@@ -1706,7 +1706,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 	{
 		RoaringAmCache *cache = (RoaringAmCache *) index->rd_amcache;
 
-		if (cache != NULL && cache->pending_count == 0)
+		if (cache != NULL && cache->pending_count_approx == 0)
 		{
 			bool	   any_merging = false;
 			int		   si;
@@ -1727,7 +1727,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 					int k;
 
 					root_blkno    = cache->root_blkno;
-					pending_count = 0;
+					pending_count_approx = 0;
 					for (k = 0; k < ROARING_PENDING_SHARDS; k++)
 					{
 						insert_heads[k]  = cache->insert_head[k];
@@ -1735,7 +1735,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 					}
 					/*
 					 * insert_count is updated only on page extension, not on
-					 * every hot-path insert. pending_count == 0 does NOT mean
+					 * every hot-path insert. pending_count_approx == 0 does NOT mean
 					 * the chains are empty. Always walk the chains for
 					 * correctness; head pages are typically in shared_buffers.
 					 */
@@ -1760,7 +1760,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 				insert_heads[si]     = meta->shards[si].insert_head;
 				merging_heads[si]    = meta->shards[si].merging_head;
 			}
-			pending_count = total;
+			pending_count_approx = total;
 		}
 
 		if (cache == NULL)
@@ -1782,7 +1782,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 		cache->root_blkno    = root_blkno;
 		cache->total_entries = meta->total_entries;
 		cache->meta_lsn      = PageGetLSN(BufferGetPage(metabuf));
-		cache->pending_count = pending_count;
+		cache->pending_count_approx = pending_count_approx;
 		UnlockReleaseBuffer(metabuf);
 
 		{
@@ -1792,7 +1792,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
 				if (merging_heads[si] != InvalidBlockNumber)
 				{ any_merging = true; break; }
-			any_pending = (pending_count > 0 || any_merging);
+			any_pending = (pending_count_approx > 0 || any_merging);
 		}
 	}
 	after_meta_lossy:;
