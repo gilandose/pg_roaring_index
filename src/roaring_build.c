@@ -192,6 +192,7 @@ write_metapage(Relation index,
 static void
 write_leaf_and_dir_pages(Relation index,
 						  RoaringBuildTuple *tuples, long ntuples,
+						  bool is_lossy,
 						  long *nentries_out,
 						  BlockNumber *root_dir_out,
 						  BlockNumber *leftmost_out,
@@ -246,28 +247,44 @@ write_leaf_and_dir_pages(Relation index,
 		int64			   cur_value  = tuples[i].value;
 		long			   group_end  = i + 1;
 		long			   gc;
-		uint64			  *gtids;
-		roaring64_bitmap_t * volatile bm = NULL;
 		long			   gi;
 		size_t			   bitmap_size;
 		Size			   entry_size;
 		RoaringLeafEntry  *le;
+		/* Exactly one of bm64/bm32 is set, matching is_lossy. */
+		roaring64_bitmap_t * volatile bm64 = NULL;
+		roaring_bitmap_t   * volatile bm32 = NULL;
 
 		while (group_end < ntuples && tuples[group_end].value == cur_value)
 			group_end++;
 
-		/* Build bitmap from sorted tids in one call. */
-		gc    = group_end - i;
-		gtids = (uint64 *) palloc(gc * sizeof(uint64));
-		for (gi = 0; gi < gc; gi++)
-			gtids[gi] = tuples[i + gi].tid;
-		bm = roaring64_bitmap_of_ptr((size_t) gc, gtids);
-		pfree(gtids);
+		gc = group_end - i;
+
+		if (is_lossy)
+		{
+			/* Lossy: tids are block numbers (fit in uint32). */
+			uint32 *gtids32 = (uint32 *) palloc(gc * sizeof(uint32));
+
+			for (gi = 0; gi < gc; gi++)
+				gtids32[gi] = (uint32) tuples[i + gi].tid;
+			bm32 = roaring_bitmap_of_ptr((size_t) gc, gtids32);
+			pfree(gtids32);
+			bitmap_size = roaring_bitmap_portable_size_in_bytes(bm32);
+		}
+		else
+		{
+			uint64 *gtids64 = (uint64 *) palloc(gc * sizeof(uint64));
+
+			for (gi = 0; gi < gc; gi++)
+				gtids64[gi] = tuples[i + gi].tid;
+			bm64 = roaring64_bitmap_of_ptr((size_t) gc, gtids64);
+			pfree(gtids64);
+			bitmap_size = roaring64_bitmap_portable_size_in_bytes(bm64);
+		}
 
 		PG_TRY();
 		{
 		nentries++;
-		bitmap_size = roaring64_bitmap_portable_size_in_bytes(bm);
 
 		if (bitmap_size > (size_t) max_inline)
 			entry_size = MAXALIGN(sizeof(RoaringOverflowEntry));
@@ -335,12 +352,16 @@ write_leaf_and_dir_pages(Relation index,
 			size_t				  pfx_len;
 			RoaringOverflowEntry *oe;
 
-			bm_data	   = (char *) palloc(bitmap_size);
-			roaring64_bitmap_portable_serialize(bm, bm_data);
-			pfx_len	   = Min(ROARING_OVERFLOW_INLINE_BYTES, bitmap_size);
-			oe		   = (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
+			bm_data = (char *) palloc(bitmap_size);
+			if (is_lossy)
+				roaring_bitmap_portable_serialize(bm32, bm_data);
+			else
+				roaring64_bitmap_portable_serialize(bm64, bm_data);
+			pfx_len = Min(ROARING_OVERFLOW_INLINE_BYTES, bitmap_size);
+			oe		= (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
 			oe->value		   = cur_value;
-			oe->cardinality	   = roaring64_cardinality32(bm);
+			oe->cardinality	   = is_lossy ? roaring_cardinality32(bm32)
+										  : roaring64_cardinality32(bm64);
 			oe->flags		   = ROARING_ENTRY_OVERFLOW;
 			oe->total_len	   = (uint32) bitmap_size;
 			oe->overflow_blkno = roaring_write_overflow_chain(index, bm_data,
@@ -357,10 +378,18 @@ write_leaf_and_dir_pages(Relation index,
 		else
 		{
 			le = (RoaringLeafEntry *) palloc(sizeof(RoaringLeafEntry) + bitmap_size);
-			le->value		= cur_value;
-			le->cardinality = roaring64_cardinality32(bm);
-			le->flags		= ROARING_ENTRY_INLINE;
-			roaring64_bitmap_portable_serialize(bm, (char *)(le + 1));
+			le->value   = cur_value;
+			le->flags   = ROARING_ENTRY_INLINE;
+			if (is_lossy)
+			{
+				le->cardinality = roaring_cardinality32(bm32);
+				roaring_bitmap_portable_serialize(bm32, (char *)(le + 1));
+			}
+			else
+			{
+				le->cardinality = roaring64_cardinality32(bm64);
+				roaring64_bitmap_portable_serialize(bm64, (char *)(le + 1));
+			}
 
 			if (PageAddItem(leaf_page, (Item) le,
 							sizeof(RoaringLeafEntry) + bitmap_size,
@@ -370,16 +399,13 @@ write_leaf_and_dir_pages(Relation index,
 		}
 
 		leaf_spc->entry_count++;
-		roaring64_bitmap_free(bm);
-		bm = NULL;
+		if (is_lossy) { roaring_bitmap_free(bm32); bm32 = NULL; }
+		else		  { roaring64_bitmap_free(bm64); bm64 = NULL; }
 		}
 		PG_FINALLY();
 		{
-			if (bm)
-			{
-				roaring64_bitmap_free(bm);
-				bm = NULL;
-			}
+			if (bm32) { roaring_bitmap_free(bm32); bm32 = NULL; }
+			if (bm64) { roaring64_bitmap_free(bm64); bm64 = NULL; }
 		}
 		PG_END_TRY();
 
@@ -537,8 +563,8 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 		  cmp_build_tuple);
 
 	/* Write leaf pages + directory; counts distinct values into nentries. */
-	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples, &nentries,
-							 &root_dir, &leftmost_leaf, &rightmost_leaf);
+	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples, false,
+							 &nentries, &root_dir, &leftmost_leaf, &rightmost_leaf);
 
 	pfree(bstate.tuples);
 
@@ -783,8 +809,8 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 		bstate.ntuples = out;
 	}
 
-	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples, &nentries,
-							 &root_dir, &leftmost_leaf, &rightmost_leaf);
+	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples, true,
+							 &nentries, &root_dir, &leftmost_leaf, &rightmost_leaf);
 
 	pfree(bstate.tuples);
 
