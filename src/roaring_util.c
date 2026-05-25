@@ -2,6 +2,7 @@
 
 #include "access/xloginsert.h"
 #include "catalog/pg_type_d.h"
+#include "utils/lsyscache.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "utils/builtins.h"
@@ -45,6 +46,9 @@ roaring_datum_to_key32(Datum d, Oid typid)
 			return (int32) hash_bytes(u->data, UUID_LEN);
 		}
 		default:
+			/* Enum types are stored as Oid internally. */
+			if (get_typtype(typid) == TYPTYPE_ENUM)
+				return (int32) DatumGetObjectId(d);
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("roaring index: unsupported column type %s for multi-column key",
@@ -91,6 +95,9 @@ roaring_datum_to_key64(Datum d, Oid typid)
 			return (int64)(uint32) hash_bytes(u->data, UUID_LEN);
 		}
 		default:
+			/* Enum types are stored as Oid internally. */
+			if (get_typtype(typid) == TYPTYPE_ENUM)
+				return (int64)(uint32) DatumGetObjectId(d);
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("roaring index: unsupported column type %s",

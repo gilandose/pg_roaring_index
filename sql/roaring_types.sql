@@ -161,4 +161,43 @@ SELECT count(*) AS mix_absent
 
 DROP TABLE t_mixed;
 
+-- ================================================================
+-- 7.  enum (exact and lossy)
+-- ================================================================
+CREATE TYPE mood AS ENUM ('happy', 'neutral', 'sad');
+
+CREATE TABLE t_enum (id int, v mood);
+INSERT INTO t_enum VALUES
+    (1, 'happy'), (2, 'happy'), (3, 'neutral'),
+    (4, 'sad'), (5, 'sad'), (6, 'sad');
+
+CREATE INDEX t_enum_ro ON t_enum USING roaring (v);
+VACUUM t_enum;
+
+SELECT count(*) AS enum_happy   FROM t_enum WHERE v = 'happy'::mood;    -- 2
+SELECT count(*) AS enum_neutral FROM t_enum WHERE v = 'neutral'::mood;  -- 1
+SELECT count(*) AS enum_sad     FROM t_enum WHERE v = 'sad'::mood;      -- 3
+SELECT count(*) AS enum_none    FROM t_enum WHERE v = 'happy'::mood AND v = 'sad'::mood;  -- 0
+
+-- Pending list visible before VACUUM.
+INSERT INTO t_enum VALUES (7, 'happy');
+SELECT count(*) AS enum_happy_pending FROM t_enum WHERE v = 'happy'::mood;  -- 3
+
+VACUUM t_enum;
+SELECT count(*) AS enum_happy_post FROM t_enum WHERE v = 'happy'::mood;  -- 3
+
+-- ambulkdelete.
+DELETE FROM t_enum WHERE id = 1;
+VACUUM t_enum;
+SELECT count(*) AS enum_happy_partial FROM t_enum WHERE v = 'happy'::mood;  -- 2
+
+CREATE INDEX t_enum_lo ON t_enum USING roaring_lossy (v);
+VACUUM t_enum;
+
+SELECT count(*) AS enum_lo_sad  FROM t_enum WHERE v = 'sad'::mood;    -- 3
+SELECT count(*) AS enum_lo_none FROM t_enum WHERE v = 'neutral'::mood AND v = 'sad'::mood;  -- 0
+
+DROP TABLE t_enum;
+DROP TYPE mood;
+
 RESET enable_seqscan;

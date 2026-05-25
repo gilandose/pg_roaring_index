@@ -63,6 +63,11 @@ CREATE OPERATOR CLASS roaring_oid_tid_ops
     DEFAULT FOR TYPE oid USING roaring AS
     OPERATOR 1 =(oid, oid);
 
+-- Enum types: stored internally as Oid; key extraction is identical to oid.
+CREATE OPERATOR CLASS roaring_enum_tid_ops
+    DEFAULT FOR TYPE anyenum USING roaring AS
+    OPERATOR 1 =(anyenum, anyenum);
+
 -- Hash-keyed types (prototype): text, varchar, uuid.
 -- Keys are hash_any(bytes) → int32; collisions are theoretically possible
 -- but negligible at low-to-moderate cardinality (< ~100K distinct values).
@@ -137,6 +142,10 @@ CREATE OPERATOR CLASS roaring_float4_page_ops
 CREATE OPERATOR CLASS roaring_oid_page_ops
     DEFAULT FOR TYPE oid USING roaring_lossy AS
     OPERATOR 1 =(oid, oid);
+
+CREATE OPERATOR CLASS roaring_enum_page_ops
+    DEFAULT FOR TYPE anyenum USING roaring_lossy AS
+    OPERATOR 1 =(anyenum, anyenum);
 
 CREATE OPERATOR CLASS roaring_text_page_ops
     DEFAULT FOR TYPE text USING roaring_lossy AS
