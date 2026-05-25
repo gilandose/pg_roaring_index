@@ -69,24 +69,20 @@ SELECT count(*) AS prefix_t9    FROM mc_exact WHERE tenant = 9;  -- 0
          0
 (1 row)
 
--- (c) Plan shape: bitmap index scan must appear.
+-- (c) Plan shape: IndexScan chosen when amgettuple is registered.
 EXPLAIN (COSTS OFF) SELECT id FROM mc_exact WHERE tenant = 1 AND location = 10;
-                       QUERY PLAN                       
---------------------------------------------------------
- Bitmap Heap Scan on mc_exact
-   Recheck Cond: ((tenant = 1) AND (location = 10))
-   ->  Bitmap Index Scan on mc_exact_idx
-         Index Cond: ((tenant = 1) AND (location = 10))
-(4 rows)
+                    QUERY PLAN                    
+--------------------------------------------------
+ Index Scan using mc_exact_idx on mc_exact
+   Index Cond: ((tenant = 1) AND (location = 10))
+(2 rows)
 
 EXPLAIN (COSTS OFF) SELECT id FROM mc_exact WHERE tenant = 1;
-               QUERY PLAN                
------------------------------------------
- Bitmap Heap Scan on mc_exact
-   Recheck Cond: (tenant = 1)
-   ->  Bitmap Index Scan on mc_exact_idx
-         Index Cond: (tenant = 1)
-(4 rows)
+                QUERY PLAN                 
+-------------------------------------------
+ Index Scan using mc_exact_idx on mc_exact
+   Index Cond: (tenant = 1)
+(2 rows)
 
 -- ----------------------------------------------------------------
 -- 2. Pending list visible within the same transaction

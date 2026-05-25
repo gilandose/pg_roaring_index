@@ -150,6 +150,17 @@ roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 
 	so->bitmap_loaded = false;
 
+	if (so->scan_iter)
+	{
+		roaring64_iterator_free(so->scan_iter);
+		so->scan_iter = NULL;
+	}
+	if (so->scan_bm)
+	{
+		roaring64_bitmap_free(so->scan_bm);
+		so->scan_bm = NULL;
+	}
+
 	if (keys && nkeys > 0)
 		memmove(scan->keyData, keys, nkeys * sizeof(ScanKeyData));
 
@@ -159,7 +170,13 @@ roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 void
 roaring_endscan(IndexScanDesc scan)
 {
-	pfree(scan->opaque);
+	RoaringScanOpaque *so = (RoaringScanOpaque *) scan->opaque;
+
+	if (so->scan_iter)
+		roaring64_iterator_free(so->scan_iter);
+	if (so->scan_bm)
+		roaring64_bitmap_free(so->scan_bm);
+	pfree(so);
 	scan->opaque = NULL;
 }
 
@@ -1193,58 +1210,45 @@ emit_lossy_bitmap_to_tbm(roaring_bitmap_t *bm, TIDBitmap *tbm)
 }
 
 /* ----------------------------------------------------------------
- * roaring_getbitmap / roaring_getbitmap_lossy
+ * build_scan_bitmap_exact
  *
- * Near-verbatim counterparts differing in bitmap type (roaring64 vs
- * roaring32), TBM addition (tbm_add_tuples vs tbm_add_page), and
- * linear_tid encoding (TID vs block number).
+ * Build and return the combined roaring64 bitmap for an exact-mode scan.
+ * Multi-column: AND across all keys.  Single-column IN-list: OR across
+ * all values.  Single-column equality: one bitmap.
  *
- * IMPORTANT: if you fix a bug in one function, apply the same fix to
- * the other.  See also pending_chain_as_bitmap / _lossy and
- * lookup_value_as_bitmap / _lossy which share the same duality.
+ * Returns NULL if no rows can possibly match (null/NaN key, empty IN-list).
+ * Caller must call roaring64_bitmap_free() on a non-NULL result.
  *
- * Single-column (natts==1): raw int8/int4 value lookup.
- * Multi-column (natts>1): one bitmap per scan key (index + pending),
- * AND across all keys, then emit the intersection to tbm.
+ * Shared by roaring_getbitmap (BitmapIndexScan) and roaring_gettuple
+ * (IndexScan / IndexOnlyScan).
  * ---------------------------------------------------------------- */
-
-int64
-roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+static roaring64_bitmap_t *
+build_scan_bitmap_exact(IndexScanDesc scan)
 {
-	Relation			index = scan->indexRelation;
-	RoaringScanOpaque  *so    = (RoaringScanOpaque *) scan->opaque;
-	int64				ntids = 0;
-
-	Buffer				metabuf;
-	RoaringMetaPageData *meta;
-	BlockNumber			root_blkno;
-	BlockNumber			insert_heads[ROARING_PENDING_SHARDS];
-	BlockNumber			merging_heads[ROARING_PENDING_SHARDS];
-	uint32				pending_count_approx;
-	bool				any_pending;
-	Snapshot			snapshot;
-
-	ItemPointerData		tid_buf[ROARING_TID_BATCH];
-	int					tid_count = 0;
-
-	if (so->bitmap_loaded)
-		return 0;
-	so->bitmap_loaded = true;
+	Relation             index = scan->indexRelation;
+	BlockNumber          root_blkno;
+	BlockNumber          insert_heads[ROARING_PENDING_SHARDS];
+	BlockNumber          merging_heads[ROARING_PENDING_SHARDS];
+	uint32               pending_count_approx;
+	bool                 any_pending;
+	Snapshot             snapshot;
 
 	if (scan->numberOfKeys < 1)
-		return 0;
+		return NULL;
 
 	if (scan->keyData[0].sk_flags & SK_ISNULL)
-		return 0;
+		return NULL;
 
 	/* ---- Read metapage (or use rd_amcache). ---- */
 	{
-		RoaringAmCache *cache = (RoaringAmCache *) index->rd_amcache;
+		RoaringAmCache  *cache  = (RoaringAmCache *) index->rd_amcache;
+		Buffer           metabuf;
+		RoaringMetaPageData *meta;
 
 		if (cache != NULL && cache->pending_count_approx == 0)
 		{
-			bool	   any_merging = false;
-			int		   si;
+			bool any_merging = false;
+			int  si;
 
 			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
 				if (cache->merging_head[si] != InvalidBlockNumber)
@@ -1261,19 +1265,13 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 				{
 					int k;
 
-					root_blkno    = cache->root_blkno;
+					root_blkno           = cache->root_blkno;
 					pending_count_approx = 0;
 					for (k = 0; k < ROARING_PENDING_SHARDS; k++)
 					{
 						insert_heads[k]  = cache->insert_head[k];
 						merging_heads[k] = InvalidBlockNumber;
 					}
-					/*
-					 * insert_count is updated only on page extension, not on
-					 * every hot-path insert.  pending_count_approx == 0 does NOT mean
-					 * the chains are empty.  Always walk the chains for
-					 * correctness; head pages are typically in shared_buffers.
-					 */
 					any_pending = true;
 					goto after_meta;
 				}
@@ -1284,16 +1282,16 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 		meta = RoaringPageGetMeta(BufferGetPage(metabuf));
 		roaring_validate_metapage(index, meta);
-		root_blkno    = meta->root_directory_page;
+		root_blkno = meta->root_directory_page;
 		{
 			uint32 total = 0;
 			int    si;
 
 			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
 			{
-				total               += meta->shards[si].insert_count;
-				insert_heads[si]     = meta->shards[si].insert_head;
-				merging_heads[si]    = meta->shards[si].merging_head;
+				total              += meta->shards[si].insert_count;
+				insert_heads[si]    = meta->shards[si].insert_head;
+				merging_heads[si]   = meta->shards[si].merging_head;
 			}
 			pending_count_approx = total;
 		}
@@ -1314,15 +1312,15 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 				cache->merging_head[si] = merging_heads[si];
 			}
 		}
-		cache->root_blkno    = root_blkno;
-		cache->total_entries = meta->total_entries;
-		cache->meta_lsn      = PageGetLSN(BufferGetPage(metabuf));
+		cache->root_blkno           = root_blkno;
+		cache->total_entries        = meta->total_entries;
+		cache->meta_lsn             = PageGetLSN(BufferGetPage(metabuf));
 		cache->pending_count_approx = pending_count_approx;
 		UnlockReleaseBuffer(metabuf);
 
 		{
-			bool   any_merging = false;
-			int    si;
+			bool any_merging = false;
+			int  si;
 
 			for (si = 0; si < ROARING_PENDING_SHARDS; si++)
 				if (merging_heads[si] != InvalidBlockNumber)
@@ -1335,19 +1333,18 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	snapshot = scan->xs_snapshot;
 
 	/*
-	 * Multi-column path: look up per-column bitmaps, AND them together, emit
-	 * to tbm.  Keys are processed in cardinality order (smallest first) so
-	 * each AND step narrows the running result as quickly as possible.
-	 * SK_SEARCHARRAY keys use a single pending-chain walk for all IN values.
+	 * Multi-column path: look up per-column bitmaps, AND them together.
+	 * Keys processed in cardinality order (smallest-first) so each AND
+	 * narrows the running result as quickly as possible.
 	 */
 	if (index->rd_att->natts > 1)
 	{
 		roaring64_bitmap_t * volatile result = NULL;
 		roaring64_bitmap_t * volatile col_bm = NULL;
+		roaring64_bitmap_t *ret = NULL;
 		ScanKeyOrder	   *order;
 		int ki;
 
-		/* Build cardinality estimates, sort keys ascending. */
 		order = palloc(scan->numberOfKeys * sizeof(ScanKeyOrder));
 		for (ki = 0; ki < scan->numberOfKeys; ki++)
 		{
@@ -1358,25 +1355,19 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			if (k->sk_flags & (SK_ISNULL | SK_SEARCHARRAY))
 				order[ki].card_est = UINT64_MAX;
 			else if (typid == FLOAT4OID && isnan(DatumGetFloat4(k->sk_argument)))
-				order[ki].card_est = 0;		/* NaN matches nothing; process first */
+				order[ki].card_est = 0;
 			else
 			{
 				int64 col_key = ROARING_COL_KEY(k->sk_attno,
-												 roaring_datum_to_key32(k->sk_argument, typid));
+												roaring_datum_to_key32(k->sk_argument, typid));
 
 				order[ki].card_est = peek_value_cardinality(index, root_blkno, col_key);
 			}
 
-			/*
-			 * Absent key with no pending list: the AND result is provably
-			 * empty.  Stop peeking immediately; skip sort and bitmap work.
-			 * Not safe when pending_count_approx > 0 — that column might have
-			 * freshly inserted rows not yet merged into the main index.
-			 */
 			if (order[ki].card_est == 0 && !any_pending)
 			{
 				pfree(order);
-				return 0;
+				return NULL;
 			}
 		}
 		qsort(order, scan->numberOfKeys, sizeof(ScanKeyOrder), scankey_order_cmp);
@@ -1414,8 +1405,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 					{
 						if (nulls[i])
 							continue;
-						if (col_typid == FLOAT4OID &&
-							isnan(DatumGetFloat4(elems[i])))
+						if (col_typid == FLOAT4OID && isnan(DatumGetFloat4(elems[i])))
 							continue;
 						col_keys[nkeys++] = ROARING_COL_KEY(
 							k->sk_attno,
@@ -1426,12 +1416,6 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 					if (nkeys > 0)
 					{
-						/*
-						 * pbms and vbms are declared volatile so the nested PG_CATCH
-						 * can free them safely on error (T15).  palloc0 ensures
-						 * uninitialized slots are NULL so catch-side iteration is safe
-						 * even if roaring64_bitmap_create() throws mid-loop (T16).
-						 */
 						roaring64_bitmap_t ** volatile pbms_v = NULL;
 						roaring64_bitmap_t ** volatile vbms_v = NULL;
 						int j, m;
@@ -1556,7 +1540,6 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 				{
 					roaring64_bitmap_and_inplace(result, col_bm);
 					roaring64_bitmap_free(col_bm);
-					/* Early exit: no rows can match. */
 					if (roaring64_bitmap_is_empty(result))
 					{
 						col_bm = NULL;
@@ -1566,13 +1549,8 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 				col_bm = NULL;
 			}
 
-			if (result != NULL)
-			{
-				ntids = emit_exact_bitmap_to_tbm(result, tbm, tid_buf, &tid_count,
-												  so->needs_recheck);
-				roaring64_bitmap_free(result);
-				result = NULL;
-			}
+			ret    = result;
+			result = NULL;
 		}
 		PG_CATCH();
 		{
@@ -1586,11 +1564,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		PG_END_TRY();
 
 		pfree(order);
-
-		if (tid_count > 0)
-			tbm_add_tuples(tbm, tid_buf, tid_count, so->needs_recheck);
-
-		return ntids;
+		return ret;
 	}
 
 	/*
@@ -1610,9 +1584,10 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			bool	   typbyval;
 			char	   typalign;
 			int64	  *vals;
-			int		   nvals = 0;
-			roaring64_bitmap_t ** volatile bms  = NULL;
-			roaring64_bitmap_t ** volatile pbms = NULL;
+			int		   nvals		= 0;
+			roaring64_bitmap_t ** volatile bms	 = NULL;
+			roaring64_bitmap_t ** volatile pbms  = NULL;
+			roaring64_bitmap_t *combined = NULL;
 
 			get_typlenbyvalalign(atttypid, &typlen, &typbyval, &typalign);
 			deconstruct_array(arr, atttypid, typlen, typbyval, typalign,
@@ -1673,10 +1648,13 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 							roaring64_bitmap_free(pbms[j]);
 							pbms[j] = NULL;
 						}
-						ntids += emit_exact_bitmap_to_tbm(bms[j], tbm, tid_buf,
-														  &tid_count,
-														  so->needs_recheck);
-						roaring64_bitmap_free(bms[j]);
+						if (combined == NULL)
+							combined = bms[j];
+						else
+						{
+							roaring64_bitmap_or_inplace(combined, bms[j]);
+							roaring64_bitmap_free(bms[j]);
+						}
 						bms[j] = NULL;
 					}
 					pfree((void *) bms);
@@ -1703,12 +1681,18 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 								roaring64_bitmap_free(pbms[j]);
 						pfree((void *) pbms);
 					}
+					if (combined)
+					{
+						roaring64_bitmap_free(combined);
+						combined = NULL;
+					}
 					PG_RE_THROW();
 				}
 				PG_END_TRY();
 			}
 
 			pfree(vals);
+			return combined;
 		}
 		else
 		{
@@ -1716,7 +1700,7 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			int64 scan_value;
 
 			if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(key->sk_argument)))
-				goto single_exact_done;
+				return NULL;
 
 			scan_value = roaring_datum_to_key64(key->sk_argument, atttypid);
 
@@ -1743,10 +1727,6 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						}
 					}
 				}
-				ntids = emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count,
-												 so->needs_recheck);
-				roaring64_bitmap_free(bm);
-				bm = NULL;
 			}
 			PG_CATCH();
 			{
@@ -1755,14 +1735,105 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 				PG_RE_THROW();
 			}
 			PG_END_TRY();
+
+			return bm;
 		}
-		single_exact_done:;
 	}
+}
+
+/* ----------------------------------------------------------------
+ * roaring_getbitmap / roaring_getbitmap_lossy
+ *
+ * Near-verbatim counterparts differing in bitmap type (roaring64 vs
+ * roaring32), TBM addition (tbm_add_tuples vs tbm_add_page), and
+ * linear_tid encoding (TID vs block number).
+ *
+ * IMPORTANT: if you fix a bug in one function, apply the same fix to
+ * the other.  See also pending_chain_as_bitmap / _lossy and
+ * lookup_value_as_bitmap / _lossy which share the same duality.
+ *
+ * Single-column (natts==1): raw int8/int4 value lookup.
+ * Multi-column (natts>1): one bitmap per scan key (index + pending),
+ * AND across all keys, then emit the intersection to tbm.
+ * ---------------------------------------------------------------- */
+
+int64
+roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+{
+	RoaringScanOpaque  *so    = (RoaringScanOpaque *) scan->opaque;
+	roaring64_bitmap_t *bm;
+	ItemPointerData		tid_buf[ROARING_TID_BATCH];
+	int					tid_count = 0;
+	int64				ntids;
+
+	if (so->bitmap_loaded)
+		return 0;
+	so->bitmap_loaded = true;
+
+	bm = build_scan_bitmap_exact(scan);
+	if (bm == NULL)
+		return 0;
+
+	ntids = emit_exact_bitmap_to_tbm(bm, tbm, tid_buf, &tid_count, so->needs_recheck);
+	roaring64_bitmap_free(bm);
 
 	if (tid_count > 0)
 		tbm_add_tuples(tbm, tid_buf, tid_count, so->needs_recheck);
 
 	return ntids;
+}
+
+/* ----------------------------------------------------------------
+ * roaring_gettuple
+ *
+ * amgettuple for exact mode: enables IndexScan and IndexOnlyScan paths.
+ * On the first call the full result bitmap is built via
+ * build_scan_bitmap_exact() and stored in so->scan_bm; a roaring64
+ * iterator (so->scan_iter) then drives one-TID-per-call delivery.
+ *
+ * IndexOnlyScan benefit: the executor checks the VM for each returned
+ * block; all-visible pages require no heap I/O.  This eliminates heap
+ * reads proportional to the all-visible fraction, which for stable
+ * lookup tables can be nearly 100%.
+ *
+ * Backward scans: not supported — roaring bitmaps have no reverse
+ * iterator in the CRoaring API.  The planner only uses backward index
+ * scans for ORDER BY DESC with amcanorder=true; we advertise
+ * amcanorder=false, so this path is unreachable in practice.
+ * ---------------------------------------------------------------- */
+bool
+roaring_gettuple(IndexScanDesc scan, ScanDirection dir)
+{
+	RoaringScanOpaque *so = (RoaringScanOpaque *) scan->opaque;
+	uint64             linear;
+	BlockNumber        blk;
+	OffsetNumber       off;
+
+	if (dir == BackwardScanDirection)
+		return false;
+
+	/* Build the result bitmap on first call. */
+	if (so->scan_bm == NULL)
+	{
+		so->scan_bm = build_scan_bitmap_exact(scan);
+		if (so->scan_bm == NULL)
+			return false;
+		so->scan_iter = roaring64_iterator_create(so->scan_bm);
+	}
+
+	if (!roaring64_iterator_has_value(so->scan_iter))
+		return false;
+
+	linear = roaring64_iterator_value(so->scan_iter);
+	blk    = (BlockNumber)(linear >> 9);
+	off    = (OffsetNumber)((linear & 0x1FF) + 1);
+
+	ItemPointerSet(&scan->xs_heaptid, blk, off);
+	scan->xs_recheck = so->needs_recheck;
+
+	roaring64_iterator_advance(so->scan_iter);
+
+	return true;
 }
 
 /* ----------------------------------------------------------------

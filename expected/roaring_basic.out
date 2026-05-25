@@ -47,6 +47,16 @@ SELECT count(*) AS cnt_val99 FROM roaring_test WHERE val = 99;  -- absent
 -- ----------------------------------------------------------------
 -- 2. Plan shape
 -- ----------------------------------------------------------------
+-- amgettuple registered: planner chooses IndexScan for small result sets.
+EXPLAIN (COSTS OFF) SELECT id FROM roaring_test WHERE val = 1;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Index Scan using roaring_test_idx on roaring_test
+   Index Cond: (val = 1)
+(2 rows)
+
+-- BitmapIndexScan is still reachable when IndexScan is disabled.
+SET enable_indexscan = off;
 EXPLAIN (COSTS OFF) SELECT id FROM roaring_test WHERE val = 1;
                  QUERY PLAN                  
 ---------------------------------------------
@@ -56,6 +66,7 @@ EXPLAIN (COSTS OFF) SELECT id FROM roaring_test WHERE val = 1;
          Index Cond: (val = 1)
 (4 rows)
 
+RESET enable_indexscan;
 -- ----------------------------------------------------------------
 -- 3. NULL values are not indexed (seq scan required for IS NULL)
 -- ----------------------------------------------------------------

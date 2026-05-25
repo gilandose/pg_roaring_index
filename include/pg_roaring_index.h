@@ -365,6 +365,10 @@ typedef struct RoaringScanOpaque
 {
     bool    bitmap_loaded;
     bool    needs_recheck;  /* true when any index column uses a hash-keyed type */
+
+    /* amgettuple (IndexScan / IndexOnlyScan) state — exact mode only */
+    roaring64_bitmap_t   *scan_bm;    /* combined result bitmap; NULL until first gettuple */
+    roaring64_iterator_t *scan_iter;  /* iterator over scan_bm */
 } RoaringScanOpaque;
 
 /* ----------
@@ -440,7 +444,8 @@ extern void roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
                            ScanKey orderbys, int norderbys);
 extern int64 roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern int64 roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm);
-extern void roaring_endscan(IndexScanDesc scan);
+extern bool  roaring_gettuple(IndexScanDesc scan, ScanDirection dir);
+extern void  roaring_endscan(IndexScanDesc scan);
 
 /* roaring_vacuum.c */
 extern IndexBulkDeleteResult *roaring_bulkdelete(IndexVacuumInfo *info,

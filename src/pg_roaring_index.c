@@ -171,7 +171,7 @@ roaring_handler(PG_FUNCTION_ARGS)
     amroutine->aminsert          = roaring_insert;
     amroutine->ambulkdelete      = roaring_bulkdelete;
     amroutine->amvacuumcleanup   = roaring_vacuumcleanup;
-    amroutine->amcanreturn       = NULL;
+    amroutine->amcanreturn       = NULL;  /* no column projection from index */
     amroutine->amcostestimate    = roaring_costestimate;
     amroutine->amoptions         = NULL;
     amroutine->amproperty        = NULL;
@@ -180,7 +180,7 @@ roaring_handler(PG_FUNCTION_ARGS)
     amroutine->amadjustmembers   = NULL;
     amroutine->ambeginscan       = roaring_beginscan;
     amroutine->amrescan          = roaring_rescan;
-    amroutine->amgettuple        = NULL; /* bitmap AM: no amgettuple */
+    amroutine->amgettuple        = roaring_gettuple;  /* IndexScan / IndexOnlyScan */
     amroutine->amgetbitmap       = roaring_getbitmap;
     amroutine->amendscan         = roaring_endscan;
     amroutine->ammarkpos         = NULL;

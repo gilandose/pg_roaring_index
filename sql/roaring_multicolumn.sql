@@ -41,7 +41,7 @@ SELECT count(*) AS prefix_t1    FROM mc_exact WHERE tenant = 1;  -- 3
 SELECT count(*) AS prefix_t2    FROM mc_exact WHERE tenant = 2;  -- 2
 SELECT count(*) AS prefix_t9    FROM mc_exact WHERE tenant = 9;  -- 0
 
--- (c) Plan shape: bitmap index scan must appear.
+-- (c) Plan shape: IndexScan chosen when amgettuple is registered.
 EXPLAIN (COSTS OFF) SELECT id FROM mc_exact WHERE tenant = 1 AND location = 10;
 EXPLAIN (COSTS OFF) SELECT id FROM mc_exact WHERE tenant = 1;
 
