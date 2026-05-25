@@ -81,10 +81,17 @@ INSERT INTO t_mixed VALUES
     (4, 'inactive', 20), (5, 'active', 10), (6, 'pending', 30);
 
 CREATE INDEX t_mixed_idx ON t_mixed USING roaring (status, val);
+VACUUM t_mixed;
 
 SET enable_seqscan = off;
 SELECT id FROM t_mixed WHERE status = 'active'   AND val = 10 ORDER BY id;
 SELECT id FROM t_mixed WHERE status = 'inactive' AND val = 20 ORDER BY id;
 SELECT id FROM t_mixed WHERE status = 'pending'  AND val = 30 ORDER BY id;
+
+-- Querying only the int column of a (text, int) index must not force recheck.
+-- Before the fix, needs_recheck was set for the entire scan whenever any index
+-- column was text/uuid, even when that column wasn't in the WHERE clause.
+EXPLAIN (COSTS OFF) SELECT id FROM t_mixed WHERE val = 10;
+
 RESET enable_seqscan;
 DROP TABLE t_mixed;

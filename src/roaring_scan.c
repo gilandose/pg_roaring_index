@@ -118,15 +118,17 @@ roaring_beginscan(Relation rel, int nkeys, int norderbys)
 	so				  = (RoaringScanOpaque *) palloc0(sizeof(RoaringScanOpaque));
 	so->bitmap_loaded = false;
 
-	/* Detect hash-keyed columns (text, uuid): their bitmaps can collide, so
-	 * the executor must recheck every matched tuple. */
+	/* Detect hash-keyed columns (text, uuid) among the queried keys only.
+	 * Columns present in the index but not in this scan's WHERE clause cannot
+	 * produce hash collisions, so recheck is unnecessary for them. */
 	so->needs_recheck = false;
 	{
 		int i;
 
-		for (i = 0; i < rel->rd_index->indnkeyatts; i++)
+		for (i = 0; i < scan->numberOfKeys; i++)
 		{
-			Oid opcintype = rel->rd_opcintype[i];
+			int attno	   = scan->keyData[i].sk_attno;	/* 1-indexed */
+			Oid opcintype  = rel->rd_opcintype[attno - 1];
 
 			if (opcintype == TEXTOID || opcintype == UUIDOID)
 			{
