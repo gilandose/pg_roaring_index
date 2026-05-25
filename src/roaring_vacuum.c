@@ -1169,6 +1169,7 @@ roaring_merge_pending(Relation index)
 						roaring_bitmap_add_many(bm32, (size_t) gc, gtp);
 						pfree(gtp);
 					}
+					roaring_bitmap_run_optimize(bm32);
 					new_size = roaring_bitmap_portable_size_in_bytes(bm32);
 					bm_card  = roaring_cardinality32(bm32);
 				}
@@ -1197,6 +1198,7 @@ roaring_merge_pending(Relation index)
 							 "for value " INT64_FORMAT, cur_value);
 
 					roaring64_bitmap_add_many(bm64, group_count, group_tids);
+					roaring64_bitmap_run_optimize(bm64);
 					new_size = roaring64_bitmap_portable_size_in_bytes(bm64);
 					bm_card  = roaring64_cardinality32(bm64);
 				}
@@ -1383,12 +1385,14 @@ roaring_merge_pending(Relation index)
 				bm32 = roaring_bitmap_create();
 				roaring_bitmap_add_many(bm32, (size_t) group_count, gtp);
 				pfree(gtp);
+				roaring_bitmap_run_optimize(bm32);
 				bm_size = roaring_bitmap_portable_size_in_bytes(bm32);
 			}
 			else
 			{
 				bm64 = roaring64_bitmap_create();
 				roaring64_bitmap_add_many(bm64, group_count, group_tids);
+				roaring64_bitmap_run_optimize(bm64);
 				bm_size = roaring64_bitmap_portable_size_in_bytes(bm64);
 			}
 			entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bm_size);
@@ -1931,6 +1935,7 @@ roaring_vacuum_one_leaf(Relation index, Buffer buf,
 				}
 				else
 				{
+					roaring64_bitmap_run_optimize(bm);
 					new_bm_bytes = roaring64_bitmap_portable_size_in_bytes(bm);
 
 					if (was_overflow)
@@ -2367,7 +2372,10 @@ roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 							}
 							else
 							{
-								size_t new_bytes =
+								size_t new_bytes;
+
+								roaring_bitmap_run_optimize(new_bm);
+								new_bytes =
 									roaring_bitmap_portable_size_in_bytes(new_bm);
 
 								if (was_overflow &&

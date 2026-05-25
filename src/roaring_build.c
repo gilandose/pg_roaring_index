@@ -359,6 +359,7 @@ write_leaf_and_dir_pages(Relation index,
 				gtids32[gi] = (uint32) tuples[i + gi].tid;
 			bm32 = roaring_bitmap_of_ptr((size_t) gc, gtids32);
 			pfree(gtids32);
+			roaring_bitmap_run_optimize(bm32);
 			bitmap_size = roaring_bitmap_portable_size_in_bytes(bm32);
 		}
 		else
@@ -369,6 +370,7 @@ write_leaf_and_dir_pages(Relation index,
 				gtids64[gi] = tuples[i + gi].tid;
 			bm64 = roaring64_bitmap_of_ptr((size_t) gc, gtids64);
 			pfree(gtids64);
+			roaring64_bitmap_run_optimize(bm64);
 			bitmap_size = roaring64_bitmap_portable_size_in_bytes(bm64);
 		}
 
