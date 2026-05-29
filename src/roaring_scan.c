@@ -183,37 +183,8 @@ roaring_endscan(IndexScanDesc scan)
 }
 
 /* ----------------------------------------------------------------
- * roaring_pending_visible
- *
- * Scan-side MVCC visibility: is a pending entry visible to 'snapshot'?
- * Uses the full snapshot protocol (XidInMVCCSnapshot) so the answer
- * tracks the query's exact snapshot, including in-progress transactions
- * that the snapshot already decided to exclude.
- *
- * Contrast with collect_pending (vacuum.c), which uses a horizon-based
- * fast path: entries older than GetOldestNonRemovableTransactionId() skip
- * the in-progress check entirely.  Both are correct for their callers;
- * scan-side must use the snapshot because vacuum's horizon is not safe
- * here (it could admit rows invisible to the querying transaction).
+ * roaring_pending_visible — see roaring_util.c
  * ---------------------------------------------------------------- */
-static bool
-roaring_pending_visible(TransactionId xmin, Snapshot snapshot)
-{
-	if (!TransactionIdIsValid(xmin))
-		return false;
-	/* Frozen / bootstrap xids are always visible. */
-	if (!TransactionIdIsNormal(xmin))
-		return true;
-	if (TransactionIdIsCurrentTransactionId(xmin))
-		return true;
-	if (XidInMVCCSnapshot(xmin, snapshot))
-		return false;
-	if (TransactionIdDidAbort(xmin))
-		return false;
-	if (TransactionIdIsInProgress(xmin))
-		return false;
-	return TransactionIdDidCommit(xmin);
-}
 
 /* ----------------------------------------------------------------
  * lookup_value_as_bitmap
@@ -1212,6 +1183,271 @@ emit_lossy_bitmap_to_tbm(roaring_bitmap_t *bm, TIDBitmap *tbm)
 }
 
 /* ----------------------------------------------------------------
+ * pending_chain_as_bitmap_all
+ *
+ * Like pending_chain_as_bitmap but collects every visible TID regardless
+ * of value.  Used by build_scan_bitmap_all for full-index enumeration.
+ * ---------------------------------------------------------------- */
+static roaring64_bitmap_t *
+pending_chain_as_bitmap_all(Relation index, BlockNumber start_blkno,
+							Snapshot snapshot)
+{
+	roaring64_bitmap_t *bm  = roaring64_bitmap_create();
+	BlockNumber		  cur = start_blkno;
+
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				  buf;
+		Page				  page;
+		RoaringPendingSpecial *spc;
+		RoaringPendingEntry	  *raw;
+		uint16				  k;
+
+		buf  = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		spc  = (RoaringPendingSpecial *) PageGetSpecialPointer(page);
+		raw  = (RoaringPendingEntry *) PageGetContents(page);
+
+		if (spc->page_type != ROARING_PAGE_PENDING_INSERT)
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+		if (spc->entry_count > ROARING_PENDING_PER_PAGE)
+		{
+			UnlockReleaseBuffer(buf);
+			roaring64_bitmap_free(bm);
+			elog(ERROR, "pg_roaring_index: corrupt pending page %u: "
+				 "entry_count %u > max %d",
+				 cur, spc->entry_count, ROARING_PENDING_PER_PAGE);
+		}
+
+		for (k = 0; k < spc->entry_count; k++)
+		{
+			if (!roaring_pending_visible(raw[k].xmin, snapshot))
+				continue;
+			roaring64_bitmap_add(bm, raw[k].linear_tid);
+		}
+
+		cur = spc->next_page;
+		UnlockReleaseBuffer(buf);
+	}
+	return bm;
+}
+
+/* ----------------------------------------------------------------
+ * build_scan_bitmap_all
+ *
+ * Build a roaring64 bitmap containing ALL indexed TIDs.  Used when
+ * numberOfKeys == 0 (full index enumeration), which is required by
+ * REINDEX CONCURRENTLY's validate_index phase.
+ *
+ * Walks the leftmost path in the directory to the first leaf page,
+ * then follows right_page links to visit every leaf.  Defers overflow
+ * entries (same pattern as lookup_values_as_bitmaps_leaf_walk) so the
+ * leaf buffer is always released before reading overflow chains.
+ * ---------------------------------------------------------------- */
+static roaring64_bitmap_t *
+build_scan_bitmap_all(IndexScanDesc scan)
+{
+	Relation			index = scan->indexRelation;
+	BlockNumber			root_blkno;
+	BlockNumber			insert_heads[ROARING_PENDING_SHARDS];
+	BlockNumber			merging_heads[ROARING_PENDING_SHARDS];
+	bool				any_pending = false;
+	Snapshot			snapshot;
+	roaring64_bitmap_t *result;
+	BlockNumber			cur;
+
+	/* Always read the metapage directly; full-index scans are rare. */
+	{
+		Buffer				 metabuf;
+		RoaringMetaPageData *meta;
+
+		metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+		meta = RoaringPageGetMeta(BufferGetPage(metabuf));
+		roaring_validate_metapage(index, meta);
+		root_blkno = meta->root_directory_page;
+		for (int s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			insert_heads[s]  = meta->shards[s].insert_head;
+			merging_heads[s] = meta->shards[s].merging_head;
+			if (insert_heads[s] != InvalidBlockNumber ||
+				merging_heads[s] != InvalidBlockNumber)
+				any_pending = true;
+		}
+		UnlockReleaseBuffer(metabuf);
+	}
+
+	result = roaring64_bitmap_create();
+
+	/* Find the first (leftmost) leaf page by descending the directory. */
+	cur = roaring_dir_lookup(index, root_blkno, INT64_MIN);
+
+	/* Walk all leaf pages via right_page links. */
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer			   buf;
+		Page			   page;
+		RoaringLeafSpecial *spc;
+		OffsetNumber	   maxoff;
+		BlockNumber		   right;
+
+		typedef struct { RoaringOverflowEntry oe; } DeferredOE;
+		DeferredOE *deferred	 = NULL;
+		int			deferred_cap = 0;
+		int			ndeferred	 = 0;
+
+		buf	 = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page   = BufferGetPage(buf);
+		spc	 = (RoaringLeafSpecial *) PageGetSpecialPointer(page);
+		maxoff = PageGetMaxOffsetNumber(page);
+		right  = spc->right_page;
+
+		for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId			  lid	  = PageGetItemId(page, off);
+			Size			  item_len = ItemIdGetLength(lid);
+			RoaringLeafEntry *le	  = (RoaringLeafEntry *) PageGetItem(page, lid);
+
+			if (le->cardinality == 0)
+				continue;
+
+			if (le->flags & ROARING_ENTRY_OVERFLOW)
+			{
+				if (ndeferred == deferred_cap)
+				{
+					int newcap = (deferred_cap == 0) ? 4 : deferred_cap * 2;
+
+					deferred = (deferred == NULL)
+						? palloc(newcap * sizeof(DeferredOE))
+						: repalloc(deferred, newcap * sizeof(DeferredOE));
+					deferred_cap = newcap;
+				}
+				memcpy(&deferred[ndeferred].oe, le,
+					   sizeof(RoaringOverflowEntry));
+				ndeferred++;
+			}
+			else
+			{
+				roaring64_bitmap_t *entry_bm;
+
+				if (item_len < sizeof(RoaringLeafEntry))
+					continue;
+				entry_bm = roaring64_bitmap_portable_deserialize_safe(
+					(const char *)(le + 1),
+					item_len - sizeof(RoaringLeafEntry));
+				if (entry_bm != NULL)
+				{
+					roaring64_bitmap_or_inplace(result, entry_bm);
+					roaring64_bitmap_free(entry_bm);
+				}
+			}
+		}
+
+		UnlockReleaseBuffer(buf);
+
+		for (int j = 0; j < ndeferred; j++)
+		{
+			roaring64_bitmap_t *oe_bm =
+				roaring_read_overflow_bitmap(index, &deferred[j].oe);
+
+			roaring64_bitmap_or_inplace(result, oe_bm);
+			roaring64_bitmap_free(oe_bm);
+		}
+		if (deferred)
+			pfree(deferred);
+
+		cur = right;
+	}
+
+	/* OR in any pending entries. */
+	if (any_pending)
+	{
+		snapshot = scan->xs_snapshot;
+		for (int s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			if (insert_heads[s] != InvalidBlockNumber)
+			{
+				roaring64_bitmap_t *pbm =
+					pending_chain_as_bitmap_all(index, insert_heads[s], snapshot);
+
+				roaring64_bitmap_or_inplace(result, pbm);
+				roaring64_bitmap_free(pbm);
+			}
+			if (merging_heads[s] != InvalidBlockNumber)
+			{
+				roaring64_bitmap_t *pbm =
+					pending_chain_as_bitmap_all(index, merging_heads[s], snapshot);
+
+				roaring64_bitmap_or_inplace(result, pbm);
+				roaring64_bitmap_free(pbm);
+			}
+		}
+	}
+
+	return result;
+}
+
+/* ----------------------------------------------------------------
+ * roaring_count_key_exact
+ *
+ * Compute the exact count of visible TIDs for a set of keys by building
+ * leaf bitmap(s) and OR-ing in ALL pending chains (all shards).  Used by
+ * the CustomScan count(*) executor when a pending list exists, to avoid
+ * double-counting TIDs present in both the leaf and the pending list
+ * (e.g. after REINDEX CONCURRENTLY which re-inserts every row via aminsert).
+ *
+ * For IN-lists (nkeys > 1), bitmaps for distinct values are disjoint so
+ * we sum individual cardinalities without building a union bitmap.
+ *
+ * keys[] must be sorted ascending and deduplicated.
+ * insert_heads/merging_heads are ROARING_PENDING_SHARDS-element arrays.
+ * ---------------------------------------------------------------- */
+int64
+roaring_count_key_exact(Relation index, BlockNumber root_blkno,
+						const int64 *keys, int nkeys,
+						const BlockNumber *insert_heads,
+						const BlockNumber *merging_heads,
+						Snapshot snapshot)
+{
+	int64	total = 0;
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		roaring64_bitmap_t *bm = lookup_value_as_bitmap(index, root_blkno, keys[i]);
+		int					s;
+
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			if (insert_heads[s] != InvalidBlockNumber)
+			{
+				roaring64_bitmap_t *pbm =
+					pending_chain_as_bitmap(index, insert_heads[s], keys[i], snapshot);
+
+				roaring64_bitmap_or_inplace(bm, pbm);
+				roaring64_bitmap_free(pbm);
+			}
+			if (merging_heads[s] != InvalidBlockNumber)
+			{
+				roaring64_bitmap_t *pbm =
+					pending_chain_as_bitmap(index, merging_heads[s], keys[i], snapshot);
+
+				roaring64_bitmap_or_inplace(bm, pbm);
+				roaring64_bitmap_free(pbm);
+			}
+		}
+
+		total += (int64) roaring64_bitmap_get_cardinality(bm);
+		roaring64_bitmap_free(bm);
+	}
+	return total;
+}
+
+/* ----------------------------------------------------------------
  * build_scan_bitmap_exact
  *
  * Build and return the combined roaring64 bitmap for an exact-mode scan.
@@ -1817,7 +2053,10 @@ roaring_gettuple(IndexScanDesc scan, ScanDirection dir)
 	/* Build the result bitmap on first call. */
 	if (so->scan_bm == NULL)
 	{
-		so->scan_bm = build_scan_bitmap_exact(scan);
+		if (scan->numberOfKeys < 1)
+			so->scan_bm = build_scan_bitmap_all(scan);	/* full-index scan (REINDEX validation) */
+		else
+			so->scan_bm = build_scan_bitmap_exact(scan);
 		if (so->scan_bm == NULL)
 			return false;
 		so->scan_iter = roaring64_iterator_create(so->scan_bm);
@@ -1832,6 +2071,47 @@ roaring_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	ItemPointerSet(&scan->xs_heaptid, blk, off);
 	scan->xs_recheck = so->needs_recheck;
+
+	/*
+	 * T65: IndexOnlyScan projection.  Build xs_itup from scan keys (key
+	 * columns) and the payload store (INCLUDE columns).  If the index has no
+	 * INCLUDE columns but xs_want_itup is still set (single-column IOS),
+	 * we still need to return the key column value from the scan key.
+	 */
+	if (scan->xs_want_itup)
+	{
+		Relation index = scan->indexRelation;
+		int      natts = index->rd_att->natts;
+		int      nkeys = index->rd_index->indnkeyatts;
+		Datum    values[INDEX_MAX_KEYS];
+		bool     isnull[INDEX_MAX_KEYS];
+		int      i;
+
+		for (i = 0; i < natts; i++)
+			isnull[i] = true;
+
+		for (i = 0; i < scan->numberOfKeys; i++)
+		{
+			int col = scan->keyData[i].sk_attno - 1;
+
+			if (col >= 0 && col < nkeys)
+			{
+				values[col] = scan->keyData[i].sk_argument;
+				isnull[col] = false;
+			}
+		}
+
+		if (natts > nkeys)
+		{
+			values[nkeys] = Int64GetDatum(roaring_payload_fetch(index, linear));
+			isnull[nkeys] = false;
+		}
+
+		if (scan->xs_itup)
+			pfree(scan->xs_itup);
+		scan->xs_itup     = index_form_tuple(RelationGetDescr(index), values, isnull);
+		scan->xs_itupdesc = RelationGetDescr(index);
+	}
 
 	roaring64_iterator_advance(so->scan_iter);
 
