@@ -2,16 +2,20 @@
 
 #include <math.h>
 
+#include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xloginsert.h"
+#include "catalog/pg_operator_d.h"
 #include "catalog/pg_type_d.h"
 #include "commands/progress.h"
+#include "executor/tuptable.h"
 #include "pgstat.h"
 #include "storage/checksum.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/tuplesort.h"
 
 extern int maintenance_work_mem;
 
@@ -20,43 +24,42 @@ extern int maintenance_work_mem;
  * ---------------------------------------------------------------- */
 
 /*
- * One (value, linearized_tid) pair collected during the heap scan.
- * After the scan the array is sorted by (value, tid) so value groups
- * are contiguous; each group's tids are in ascending order.
+ * (value, linearized_tid) pairs are fed into a Tuplesortstate sorted by
+ * (value ASC, tid ASC) so value groups come back contiguous with each group's
+ * tids in ascending order.  Tuplesort spills to temp files when input exceeds
+ * maintenance_work_mem, so the build is no longer bounded by RAM (T46/T61).
+ *
+ * Each entry is a synthetic two-column heap tuple (int8 value, int8 tid).
+ * tid is ≤ 41 bits ((blkno<<9)|offset), always positive in an int8, so signed
+ * int8 comparison matches the desired unsigned tid order.
  */
-typedef struct RoaringBuildTuple
-{
-	int64	value;
-	uint64	tid;
-} RoaringBuildTuple;
-
 typedef struct RoaringBuildState
 {
 	double				heap_tuples;
 	Oid					atttypid;   /* column 0 type: used only for single-column indexes */
-	long				nalloc;
-	long				ntuples;
-	RoaringBuildTuple  *tuples;
+	long				ntuples;    /* count emitted into the sort (progress only) */
+	TupleDesc			tupdesc;    /* (int8, int8) descriptor for sort tuples */
+	TupleTableSlot	   *slot;       /* virtual slot reused for each put */
+	Tuplesortstate	   *sortstate;
 } RoaringBuildState;
 
 /*
- * Abort the build if doubling the tuple array would exceed maintenance_work_mem.
- * maintenance_work_mem is in kB; sizeof(RoaringBuildTuple) == 16 bytes.
+ * Emit one (value, tid) pair into the sort via the reusable virtual slot.
  */
-static void
-check_build_mem_limit(long new_nalloc)
+static inline void
+build_emit(RoaringBuildState *bstate, int64 value, uint64 tid)
 {
-	long max_nalloc = ((long) maintenance_work_mem * 1024L) /
-					  (long) sizeof(RoaringBuildTuple);
+	TupleTableSlot *slot = bstate->slot;
 
-	if (new_nalloc > max_nalloc)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("roaring_build: index build exceeds maintenance_work_mem"),
-				 errdetail("Tuple array requires %ld entries (%zu bytes each) but "
-						   "maintenance_work_mem limits the build to %ld entries.",
-						   new_nalloc, sizeof(RoaringBuildTuple), max_nalloc),
-				 errhint("Increase maintenance_work_mem and retry.")));
+	ExecClearTuple(slot);
+	slot->tts_values[0] = Int64GetDatum(value);
+	slot->tts_values[1] = Int64GetDatum((int64) tid);
+	slot->tts_isnull[0] = false;
+	slot->tts_isnull[1] = false;
+	ExecStoreVirtualTuple(slot);
+
+	tuplesort_puttupleslot(bstate->sortstate, slot);
+	bstate->ntuples++;
 }
 
 /* ----------------------------------------------------------------
@@ -93,20 +96,7 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 
 			value = ROARING_COL_KEY(i + 1, roaring_datum_to_key32(values[i], typid));
 
-			if (bstate->ntuples == bstate->nalloc)
-			{
-				long new_nalloc = bstate->nalloc * 2;
-				check_build_mem_limit(new_nalloc);
-				bstate->nalloc = new_nalloc;
-				bstate->tuples  = (RoaringBuildTuple *)
-								  repalloc_extended(bstate->tuples,
-													bstate->nalloc * sizeof(RoaringBuildTuple),
-													MCXT_ALLOC_HUGE);
-			}
-
-			bstate->tuples[bstate->ntuples].value = value;
-			bstate->tuples[bstate->ntuples].tid   = linear_tid;
-			bstate->ntuples++;
+			build_emit(bstate, value, linear_tid);
 		}
 
 		/* T65: write INCLUDE column payload before the pending entry. */
@@ -131,38 +121,13 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 
 		value = roaring_datum_to_key64(values[0], bstate->atttypid);
 
-		if (bstate->ntuples == bstate->nalloc)
-		{
-			long new_nalloc = bstate->nalloc * 2;
-			check_build_mem_limit(new_nalloc);
-			bstate->nalloc = new_nalloc;
-			bstate->tuples  = (RoaringBuildTuple *)
-							  repalloc_extended(bstate->tuples,
-												bstate->nalloc * sizeof(RoaringBuildTuple),
-												MCXT_ALLOC_HUGE);
-		}
-
-		bstate->tuples[bstate->ntuples].value = value;
-		bstate->tuples[bstate->ntuples].tid   = linear_tid;
-		bstate->ntuples++;
+		build_emit(bstate, value, linear_tid);
 
 		/* T65: write INCLUDE column payload before the pending entry. */
 		if (natts > nkeys && !isnull[nkeys])
 			roaring_payload_insert(index, linear_tid, DatumGetInt64(values[nkeys]));
 	}
 }
-
-static int
-cmp_build_tuple(const void *a, const void *b)
-{
-	const RoaringBuildTuple *ta = (const RoaringBuildTuple *) a;
-	const RoaringBuildTuple *tb = (const RoaringBuildTuple *) b;
-
-	if (ta->value != tb->value)
-		return (ta->value > tb->value) - (ta->value < tb->value);
-	return (ta->tid > tb->tid) - (ta->tid < tb->tid);
-}
-
 
 /* ----------------------------------------------------------------
  * write_metapage
@@ -264,16 +229,199 @@ flush_leaf_wal_batch(Relation index, Buffer *bufs, BlockNumber *blknos, int n)
 		UnlockReleaseBuffer(bufs[i]);
 }
 
+/*
+ * LeafWriter — mutable state for streaming leaf-page construction.
+ *
+ * leaf_writer_emit() is called once per value group (in ascending value
+ * order); it run-optimizes and serializes the group's bitmap, transitions to
+ * a new leaf page when the current one is full, and records one directory
+ * entry per completed leaf page.  leaf_writer_finish() finalizes the last
+ * partially filled leaf page after the stream is exhausted.
+ */
+typedef struct LeafWriter
+{
+	Relation			index;
+	int					max_inline;
+	RoaringDirEntry	   *leaf_entries;	/* one per completed leaf page */
+	uint32				leaf_count;
+	long				nentries;		/* distinct values emitted */
+	Buffer				leaf_buf;
+	Page				leaf_page;
+	RoaringLeafSpecial *leaf_spc;
+	BlockNumber			leftmost;
+	BlockNumber			rightmost;
+	Buffer				batch_bufs[ROARING_BUILD_WAL_BATCH];
+	BlockNumber			batch_blknos[ROARING_BUILD_WAL_BATCH];
+	int					batch_n;
+} LeafWriter;
+
+static void
+leaf_writer_emit(LeafWriter *w, int64 value, roaring64_bitmap_t *bm64)
+{
+	size_t	bitmap_size;
+	Size	entry_size;
+
+	roaring64_bitmap_run_optimize(bm64);
+	bitmap_size = roaring64_bitmap_portable_size_in_bytes(bm64);
+
+	w->nentries++;
+
+	if (bitmap_size > (size_t) w->max_inline)
+		entry_size = MAXALIGN(sizeof(RoaringOverflowEntry));
+	else
+		entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bitmap_size);
+
+	/* ---- transition to new leaf page if needed ---- */
+	if (w->leaf_buf == InvalidBuffer ||
+		PageGetFreeSpace(w->leaf_page) < entry_size)
+	{
+		if (w->leaf_buf != InvalidBuffer)
+		{
+			OffsetNumber	  maxoff;
+			RoaringLeafEntry *last;
+			BlockNumber		  old_blkno;
+			Buffer			  new_buf;
+			BlockNumber		  new_blkno;
+
+			maxoff	  = PageGetMaxOffsetNumber(w->leaf_page);
+			last	  = (RoaringLeafEntry *)
+						PageGetItem(w->leaf_page,
+									PageGetItemId(w->leaf_page, maxoff));
+			old_blkno = BufferGetBlockNumber(w->leaf_buf);
+
+			w->leaf_entries[w->leaf_count].high_key   = last->value;
+			w->leaf_entries[w->leaf_count].child_page = old_blkno;
+			w->leaf_count++;
+
+			new_buf	  = roaring_extend_page(w->index);
+			new_blkno = BufferGetBlockNumber(new_buf);
+
+			w->leaf_spc->right_page = new_blkno;
+			MarkBufferDirty(w->leaf_buf);
+			w->batch_bufs[w->batch_n]   = w->leaf_buf;
+			w->batch_blknos[w->batch_n] = old_blkno;
+			w->batch_n++;
+			if (w->batch_n == ROARING_BUILD_WAL_BATCH)
+			{
+				flush_leaf_wal_batch(w->index, w->batch_bufs,
+									 w->batch_blknos, w->batch_n);
+				w->batch_n = 0;
+			}
+
+			w->leaf_buf  = new_buf;
+			w->leaf_page = BufferGetPage(w->leaf_buf);
+			PageInit(w->leaf_page, BLCKSZ, sizeof(RoaringLeafSpecial));
+			w->leaf_spc  = (RoaringLeafSpecial *)
+						PageGetSpecialPointer(w->leaf_page);
+			w->leaf_spc->page_type	 = ROARING_PAGE_LEAF;
+			w->leaf_spc->flags		 = 0;
+			w->leaf_spc->entry_count = 0;
+			w->leaf_spc->left_page	 = old_blkno;
+			w->leaf_spc->right_page  = InvalidBlockNumber;
+		}
+		else
+		{
+			w->leaf_buf  = roaring_extend_page(w->index);
+			w->leaf_page = BufferGetPage(w->leaf_buf);
+			PageInit(w->leaf_page, BLCKSZ, sizeof(RoaringLeafSpecial));
+			w->leaf_spc  = (RoaringLeafSpecial *)
+						PageGetSpecialPointer(w->leaf_page);
+			w->leaf_spc->page_type	 = ROARING_PAGE_LEAF;
+			w->leaf_spc->flags		 = 0;
+			w->leaf_spc->entry_count = 0;
+			w->leaf_spc->left_page	 = InvalidBlockNumber;
+			w->leaf_spc->right_page  = InvalidBlockNumber;
+			w->leftmost = BufferGetBlockNumber(w->leaf_buf);
+		}
+	}
+
+	if (bitmap_size > (size_t) w->max_inline)
+	{
+		char				 *bm_data;
+		RoaringOverflowEntry *oe;
+
+		bm_data = (char *) palloc(bitmap_size);
+		roaring64_bitmap_portable_serialize(bm64, bm_data);
+		oe		= (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
+		oe->value		   = value;
+		oe->cardinality	   = roaring64_cardinality32(bm64);
+		oe->flags		   = ROARING_ENTRY_OVERFLOW;
+		oe->total_len	   = (uint32) bitmap_size;
+		oe->overflow_blkno = roaring_write_overflow_chain(w->index, bm_data,
+														   bitmap_size);
+		pfree(bm_data);
+
+		if (PageAddItem(w->leaf_page, (Item) oe,
+						sizeof(RoaringOverflowEntry),
+						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+			elog(ERROR, "roaring_build: PageAddItem failed unexpectedly");
+		pfree(oe);
+	}
+	else
+	{
+		RoaringLeafEntry *le;
+
+		le = (RoaringLeafEntry *) palloc(sizeof(RoaringLeafEntry) + bitmap_size);
+		le->value       = value;
+		le->flags       = ROARING_ENTRY_INLINE;
+		le->cardinality = roaring64_cardinality32(bm64);
+		roaring64_bitmap_portable_serialize(bm64, (char *)(le + 1));
+
+		if (PageAddItem(w->leaf_page, (Item) le,
+						sizeof(RoaringLeafEntry) + bitmap_size,
+						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+			elog(ERROR, "roaring_build: PageAddItem failed unexpectedly");
+		pfree(le);
+	}
+
+	Assert(w->leaf_spc->entry_count < PG_UINT16_MAX);
+	w->leaf_spc->entry_count++;
+}
+
+static void
+leaf_writer_finish(LeafWriter *w)
+{
+	OffsetNumber	  maxoff;
+	RoaringLeafEntry *last;
+	BlockNumber		  blkno;
+
+	if (w->leaf_buf == InvalidBuffer)
+		return;
+
+	blkno  = BufferGetBlockNumber(w->leaf_buf);
+	maxoff = PageGetMaxOffsetNumber(w->leaf_page);
+	last   = (RoaringLeafEntry *)
+			 PageGetItem(w->leaf_page, PageGetItemId(w->leaf_page, maxoff));
+
+	w->leaf_entries[w->leaf_count].high_key   = last->value;
+	w->leaf_entries[w->leaf_count].child_page = blkno;
+	w->leaf_count++;
+
+	w->rightmost = blkno;
+	MarkBufferDirty(w->leaf_buf);
+	w->batch_bufs[w->batch_n]   = w->leaf_buf;
+	w->batch_blknos[w->batch_n] = blkno;
+	w->batch_n++;
+	flush_leaf_wal_batch(w->index, w->batch_bufs, w->batch_blknos, w->batch_n);
+	w->batch_n = 0;
+}
+
 /* ----------------------------------------------------------------
  * write_leaf_and_dir_pages
  *
- * Writes sorted entries as leaf pages, then builds the directory
- * (1-level if ≤ max_dir leaf pages, 2-level otherwise).
+ * Streams sorted (value, tid) tuples out of the Tuplesortstate, builds one
+ * roaring bitmap per value group, writes them as leaf pages, then builds the
+ * directory (1-level if ≤ max_dir leaf pages, 2/3-level otherwise).
  * Sets *root_dir_out = InvalidBlockNumber if nentries == 0.
+ *
+ * ntuples is the post-scan count of emitted (value, tid) pairs — an upper
+ * bound on distinct values, used to size leaf_entries and to pre-check the
+ * directory capacity.
  * ---------------------------------------------------------------- */
 static void
 write_leaf_and_dir_pages(Relation index,
-						  RoaringBuildTuple *tuples, long ntuples,
+						  Tuplesortstate *sortstate, TupleDesc tupdesc,
+						  long ntuples,
 						  long *nentries_out,
 						  BlockNumber *root_dir_out,
 						  BlockNumber *leftmost_out,
@@ -296,23 +444,9 @@ write_leaf_and_dir_pages(Relation index,
 									 - SizeOfPageHeaderData)
 									/ sizeof(RoaringDirEntry));
 
-	/* leaf_entries: one entry per leaf page written */
 	RoaringDirEntry	   *leaf_entries;
-	uint32				leaf_count = 0;
-	long				nentries   = 0;
-
-	Buffer				leaf_buf  = InvalidBuffer;
-	Page				leaf_page = NULL;
-	RoaringLeafSpecial *leaf_spc  = NULL;
-	BlockNumber			leftmost  = InvalidBlockNumber;
-	BlockNumber			rightmost = InvalidBlockNumber;
-
-	/* WAL batch for completed leaf pages */
-	Buffer		leaf_batch_bufs[ROARING_BUILD_WAL_BATCH];
-	BlockNumber	leaf_batch_blknos[ROARING_BUILD_WAL_BATCH];
-	int			leaf_batch_n = 0;
-
-	long i;
+	uint32				leaf_count;
+	LeafWriter			w;
 
 	Assert(max_dir < PG_UINT16_MAX); /* entry_count is uint16 */
 
@@ -343,193 +477,88 @@ write_leaf_and_dir_pages(Relation index,
 	leaf_entries = palloc_extended(ntuples * sizeof(RoaringDirEntry),
 								   MCXT_ALLOC_HUGE);
 
-	/* ---- Phase A: write leaf pages ---- */
-	i = 0;
-	while (i < ntuples)
+	memset(&w, 0, sizeof(w));
+	w.index        = index;
+	w.max_inline   = max_inline;
+	w.leaf_entries = leaf_entries;
+	w.leaf_buf     = InvalidBuffer;
+	w.leftmost     = InvalidBlockNumber;
+	w.rightmost    = InvalidBlockNumber;
+
+	/*
+	 * ---- Phase A: stream sorted tuples, one value group at a time ----
+	 *
+	 * tuplesort returns tuples in (value ASC, tid ASC) order, so equal values
+	 * arrive contiguously with ascending tids.  We accumulate each value
+	 * group's tids into a single roaring bitmap and hand it to the leaf writer
+	 * on the value transition (and once more at end-of-stream).  Peak roaring
+	 * memory is one in-progress bitmap (bounded by a single value's
+	 * cardinality), not the whole sorted set.
+	 *
+	 * bm64 is volatile so PG_FINALLY frees the correct pointer after a longjmp
+	 * (an ERROR may fire mid-emit before the bitmap is freed and NULLed).
+	 */
 	{
-		int64			   cur_value  = tuples[i].value;
-		long			   group_end  = i + 1;
-		long			   gc;
-		long			   gi;
-		size_t			   bitmap_size;
-		Size			   entry_size;
-		RoaringLeafEntry  *le;
-		/*
-		 * volatile ensures PG_FINALLY sees the correct pointer after a
-		 * longjmp: the bitmaps are constructed before PG_TRY but may not
-		 * yet be freed (NULL'd) when an ERROR fires inside the try block.
-		 * Without volatile, the compiler may cache the NULL assignment in a
-		 * register that the longjmp clobbers, leaving PG_FINALLY with a
-		 * stale non-NULL or NULL value.
-		 */
 		roaring64_bitmap_t * volatile bm64 = NULL;
-
-		CHECK_FOR_INTERRUPTS();
-
-		while (group_end < ntuples && tuples[group_end].value == cur_value)
-			group_end++;
-
-		gc = group_end - i;
-
-		{
-			uint64 *gtids64 = (uint64 *) palloc(gc * sizeof(uint64));
-
-			for (gi = 0; gi < gc; gi++)
-				gtids64[gi] = tuples[i + gi].tid;
-			bm64 = roaring64_bitmap_of_ptr((size_t) gc, gtids64);
-			pfree(gtids64);
-			roaring64_bitmap_run_optimize(bm64);
-			bitmap_size = roaring64_bitmap_portable_size_in_bytes(bm64);
-		}
+		TupleTableSlot * volatile slot = NULL;
+		bool	have_group = false;
+		int64	cur_value  = 0;
 
 		PG_TRY();
 		{
-		nentries++;
+			slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
 
-		if (bitmap_size > (size_t) max_inline)
-			entry_size = MAXALIGN(sizeof(RoaringOverflowEntry));
-		else
-			entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bitmap_size);
-
-		/* ---- transition to new leaf page if needed ---- */
-		if (leaf_buf == InvalidBuffer ||
-			PageGetFreeSpace(leaf_page) < entry_size)
-		{
-			if (leaf_buf != InvalidBuffer)
+			while (tuplesort_gettupleslot(sortstate, true, false, slot, NULL))
 			{
-				OffsetNumber	 maxoff;
-				RoaringLeafEntry *last;
-				BlockNumber		 old_blkno;
-				Buffer			 new_buf;
-				BlockNumber		 new_blkno;
+				int64	value;
+				uint64	tid;
+				bool	isn;
 
-				maxoff	  = PageGetMaxOffsetNumber(leaf_page);
-				last	  = (RoaringLeafEntry *)
-							PageGetItem(leaf_page,
-										PageGetItemId(leaf_page, maxoff));
-				old_blkno = BufferGetBlockNumber(leaf_buf);
+				CHECK_FOR_INTERRUPTS();
 
-				leaf_entries[leaf_count].high_key   = last->value;
-				leaf_entries[leaf_count].child_page = old_blkno;
-				leaf_count++;
+				value = DatumGetInt64(slot_getattr(slot, 1, &isn));
+				tid   = (uint64) DatumGetInt64(slot_getattr(slot, 2, &isn));
 
-				new_buf	  = roaring_extend_page(index);
-				new_blkno = BufferGetBlockNumber(new_buf);
-
-				leaf_spc->right_page = new_blkno;
-				MarkBufferDirty(leaf_buf);
-				leaf_batch_bufs[leaf_batch_n]   = leaf_buf;
-				leaf_batch_blknos[leaf_batch_n] = old_blkno;
-				leaf_batch_n++;
-				if (leaf_batch_n == ROARING_BUILD_WAL_BATCH)
+				if (have_group && value != cur_value)
 				{
-					flush_leaf_wal_batch(index, leaf_batch_bufs,
-										 leaf_batch_blknos, leaf_batch_n);
-					leaf_batch_n = 0;
+					leaf_writer_emit(&w, cur_value, bm64);
+					roaring64_bitmap_free(bm64);
+					bm64 = NULL;
+					have_group = false;
 				}
 
-				leaf_buf  = new_buf;
-				leaf_page = BufferGetPage(leaf_buf);
-				PageInit(leaf_page, BLCKSZ, sizeof(RoaringLeafSpecial));
-				leaf_spc  = (RoaringLeafSpecial *)
-							PageGetSpecialPointer(leaf_page);
-				leaf_spc->page_type	  = ROARING_PAGE_LEAF;
-				leaf_spc->flags		  = 0;
-				leaf_spc->entry_count = 0;
-				leaf_spc->left_page	  = old_blkno;
-				leaf_spc->right_page  = InvalidBlockNumber;
+				if (!have_group)
+				{
+					bm64       = roaring64_bitmap_create();
+					cur_value  = value;
+					have_group = true;
+				}
+
+				roaring64_bitmap_add(bm64, tid);
 			}
-			else
+
+			if (have_group)
 			{
-				leaf_buf  = roaring_extend_page(index);
-				leaf_page = BufferGetPage(leaf_buf);
-				PageInit(leaf_page, BLCKSZ, sizeof(RoaringLeafSpecial));
-				leaf_spc  = (RoaringLeafSpecial *)
-							PageGetSpecialPointer(leaf_page);
-				leaf_spc->page_type	  = ROARING_PAGE_LEAF;
-				leaf_spc->flags		  = 0;
-				leaf_spc->entry_count = 0;
-				leaf_spc->left_page	  = InvalidBlockNumber;
-				leaf_spc->right_page  = InvalidBlockNumber;
-				leftmost = BufferGetBlockNumber(leaf_buf);
+				leaf_writer_emit(&w, cur_value, bm64);
+				roaring64_bitmap_free(bm64);
+				bm64 = NULL;
+				have_group = false;
 			}
-		}
-
-		if (bitmap_size > (size_t) max_inline)
-		{
-			char				 *bm_data;
-			RoaringOverflowEntry *oe;
-
-			bm_data = (char *) palloc(bitmap_size);
-			roaring64_bitmap_portable_serialize(bm64, bm_data);
-			oe		= (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
-			oe->value		   = cur_value;
-			oe->cardinality	   = roaring64_cardinality32(bm64);
-			oe->flags		   = ROARING_ENTRY_OVERFLOW;
-			oe->total_len	   = (uint32) bitmap_size;
-			oe->overflow_blkno = roaring_write_overflow_chain(index, bm_data,
-															   bitmap_size);
-			pfree(bm_data);
-
-			if (PageAddItem(leaf_page, (Item) oe,
-							sizeof(RoaringOverflowEntry),
-							InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-				elog(ERROR, "roaring_build: PageAddItem failed unexpectedly");
-			pfree(oe);
-		}
-		else
-		{
-			le = (RoaringLeafEntry *) palloc(sizeof(RoaringLeafEntry) + bitmap_size);
-			le->value       = cur_value;
-			le->flags       = ROARING_ENTRY_INLINE;
-			le->cardinality = roaring64_cardinality32(bm64);
-			roaring64_bitmap_portable_serialize(bm64, (char *)(le + 1));
-
-			if (PageAddItem(leaf_page, (Item) le,
-							sizeof(RoaringLeafEntry) + bitmap_size,
-							InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-				elog(ERROR, "roaring_build: PageAddItem failed unexpectedly");
-			pfree(le);
-		}
-
-		Assert(leaf_spc->entry_count < PG_UINT16_MAX);
-		leaf_spc->entry_count++;
-		roaring64_bitmap_free(bm64); bm64 = NULL;
 		}
 		PG_FINALLY();
 		{
-			if (bm64) { roaring64_bitmap_free(bm64); bm64 = NULL; }
+			if (bm64)
+				roaring64_bitmap_free(bm64);
+			if (slot)
+				ExecDropSingleTupleTableSlot(slot);
 		}
 		PG_END_TRY();
-
-		i = group_end;
 	}
 
-	/* Finalize last leaf page. */
-	if (leaf_buf != InvalidBuffer)
-	{
-		OffsetNumber	 maxoff;
-		RoaringLeafEntry *last;
-		BlockNumber		 blkno;
+	/* Finalize the last partially filled leaf page. */
+	leaf_writer_finish(&w);
 
-		blkno  = BufferGetBlockNumber(leaf_buf);
-		maxoff = PageGetMaxOffsetNumber(leaf_page);
-		last   = (RoaringLeafEntry *)
-				 PageGetItem(leaf_page, PageGetItemId(leaf_page, maxoff));
-
-		leaf_entries[leaf_count].high_key   = last->value;
-		leaf_entries[leaf_count].child_page = blkno;
-		leaf_count++;
-
-		rightmost = blkno;
-		MarkBufferDirty(leaf_buf);
-		leaf_batch_bufs[leaf_batch_n]   = leaf_buf;
-		leaf_batch_blknos[leaf_batch_n] = blkno;
-		leaf_batch_n++;
-		flush_leaf_wal_batch(index, leaf_batch_bufs,
-							 leaf_batch_blknos, leaf_batch_n);
-		leaf_batch_n = 0;
-	}
+	leaf_count = w.leaf_count;
 
 	/* ---- Phase B: build directory ---- */
 	if (leaf_count <= max_dir)
@@ -603,9 +632,9 @@ write_leaf_and_dir_pages(Relation index,
 	}
 
 	pfree(leaf_entries);
-	*nentries_out  = nentries;
-	*leftmost_out  = leftmost;
-	*rightmost_out = rightmost;
+	*nentries_out  = w.nentries;
+	*leftmost_out  = w.leftmost;
+	*rightmost_out = w.rightmost;
 }
 
 /* ================================================================
@@ -618,7 +647,6 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	RoaringBuildState	bstate;
 	double				reltuples;
 	long				nentries    = 0;
-	long				init_nalloc;
 
 	BlockNumber			root_dir		= InvalidBlockNumber;
 	BlockNumber			leftmost_leaf	= InvalidBlockNumber;
@@ -645,33 +673,32 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	}
 
 	/*
-	 * Size the initial tuple array from pg_class.reltuples so the array
-	 * doesn't have to be repalloc'd on most builds.  Fall back to 1024 for
-	 * empty/unanalyzed tables.
+	 * Sort (value, tid) pairs through a Tuplesortstate so the build spills to
+	 * temp files rather than holding every pair in RAM (T46/T61).  The synthetic
+	 * sort tuple is two int8 columns: (value, tid), sorted ascending on both,
+	 * which matches the (value ASC, tid ASC) order the leaf writer expects.
 	 */
 	{
-		/* Clamp initial allocation to maintenance_work_mem budget. */
-		long mem_nalloc = ((long) maintenance_work_mem * 1024L) /
-						  (long) sizeof(RoaringBuildTuple) /
-						  Max(index->rd_att->natts, 1);
+		AttrNumber	attNums[2]     = {1, 2};
+		Oid			sortOps[2]     = {Int8LessOperator, Int8LessOperator};
+		Oid			sortColls[2]   = {InvalidOid, InvalidOid};
+		bool		nullsFirst[2]  = {false, false};
 
-		/* Guard against implementation-defined cast when reltuples > LONG_MAX. */
-		init_nalloc = Min((long) heap->rd_rel->reltuples,
-						  (long) (MaxAllocHugeSize / sizeof(RoaringBuildTuple) /
-								  (Size) Max(index->rd_att->natts, 1)));
-		if (init_nalloc < 1024)
-			init_nalloc = 1024;
-		if (mem_nalloc > 1024 && init_nalloc > mem_nalloc)
-			init_nalloc = mem_nalloc;
+		bstate.tupdesc = CreateTemplateTupleDesc(2);
+		TupleDescInitEntry(bstate.tupdesc, (AttrNumber) 1, "value", INT8OID, -1, 0);
+		TupleDescInitEntry(bstate.tupdesc, (AttrNumber) 2, "tid",   INT8OID, -1, 0);
+
+		bstate.sortstate = tuplesort_begin_heap(bstate.tupdesc, 2,
+												attNums, sortOps, sortColls,
+												nullsFirst,
+												maintenance_work_mem, NULL,
+												TUPLESORT_NONE);
+		bstate.slot = MakeSingleTupleTableSlot(bstate.tupdesc, &TTSOpsVirtual);
 	}
 
 	bstate.heap_tuples = 0;
 	bstate.atttypid    = TupleDescAttr(index->rd_att, 0)->atttypid;
-	bstate.nalloc      = init_nalloc * index->rd_att->natts; /* natts entries per row */
 	bstate.ntuples     = 0;
-	bstate.tuples      = (RoaringBuildTuple *)
-						 palloc_extended(bstate.nalloc * sizeof(RoaringBuildTuple),
-										 MCXT_ALLOC_HUGE);
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_TOTAL,
 								 (int64) heap->rd_rel->reltuples);
@@ -684,17 +711,19 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
 								 (int64) bstate.ntuples);
 
-	/* Sort flat array by (value, tid). */
+	/* Sort (value, tid); tuplesort spills to disk under maintenance_work_mem. */
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE, 2); /* sorting */
-	qsort(bstate.tuples, bstate.ntuples, sizeof(RoaringBuildTuple),
-		  cmp_build_tuple);
+	tuplesort_performsort(bstate.sortstate);
 
 	/* Write leaf pages + directory; counts distinct values into nentries. */
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE, 3); /* writing pages */
-	write_leaf_and_dir_pages(index, bstate.tuples, bstate.ntuples,
+	write_leaf_and_dir_pages(index, bstate.sortstate, bstate.tupdesc,
+							 bstate.ntuples,
 							 &nentries, &root_dir, &leftmost_leaf, &rightmost_leaf);
 
-	pfree(bstate.tuples);
+	tuplesort_end(bstate.sortstate);
+	ExecDropSingleTupleTableSlot(bstate.slot);
+	FreeTupleDesc(bstate.tupdesc);
 
 	{
 		BlockNumber pending_blknos[ROARING_PENDING_SHARDS];
