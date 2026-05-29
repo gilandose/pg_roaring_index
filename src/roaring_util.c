@@ -480,18 +480,6 @@ roaring_read_overflow_bitmap(Relation index, const RoaringOverflowEntry *oe)
 	return bm;
 }
 
-/* roaring_read_overflow_bitmap_lossy — lossy mode (roaring32). */
-roaring_bitmap_t *
-roaring_read_overflow_bitmap_lossy(Relation index, const RoaringOverflowEntry *oe)
-{
-	size_t		  total_len = oe->total_len;
-	char		 *buf = roaring_overflow_read_bytes(index, oe);
-	roaring_bitmap_t *bm;
-
-	bm = roaring_bitmap_portable_deserialize_safe(buf, total_len);
-	pfree(buf);
-	return bm;
-}
 
 /*
  * roaring_pending_visible

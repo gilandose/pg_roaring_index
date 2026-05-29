@@ -659,7 +659,6 @@ roaring_merge_pending(Relation index)
 	int					 i;
 	bool				 leaf_structure_changed = false;
 	uint32				 new_total_entries;
-	bool				 is_lossy;
 
 	/*
 	 * Step 1: crash-safe merge setup for all shards.
@@ -710,7 +709,6 @@ roaring_merge_pending(Relation index)
 	leftmost_leaf	  = meta->leftmost_leaf_page;
 	rightmost_leaf	  = meta->rightmost_leaf_page;
 	old_total_entries = meta->total_entries;
-	is_lossy		  = (meta->flags & ROARING_FLAG_LOSSY) != 0;
 
 	/* Determine which shard will host the carry chain (lowest-numbered active). */
 	for (i = 0; i < ROARING_PENDING_SHARDS; i++)
@@ -1117,7 +1115,6 @@ roaring_merge_pending(Relation index)
 				Size				bitmap_len;
 				Size				leaf_free;
 				roaring64_bitmap_t *bm64 = NULL;
-				roaring_bitmap_t   *bm32 = NULL;
 				size_t				new_size;
 				uint32				bm_card;
 				bool				was_overflow;
@@ -1135,73 +1132,32 @@ roaring_merge_pending(Relation index)
 				/* Save free space before releasing the buffer — pointer goes stale. */
 				leaf_free = PageGetFreeSpace(leafpage);
 
-				if (is_lossy)
+				if (was_overflow)
 				{
-					if (was_overflow)
-					{
-						RoaringOverflowEntry oe_copy;
+					RoaringOverflowEntry oe_copy;
 
-						memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
-						old_ovf_blkno = oe_copy.overflow_blkno;
-						UnlockReleaseBuffer(leafbuf);
-						bm32 = roaring_read_overflow_bitmap_lossy(index, &oe_copy);
-					}
-					else
-					{
-						bitmap_len = item_len - sizeof(RoaringLeafEntry);
-						bm32 = roaring_bitmap_portable_deserialize_safe(
-								(const char *)(le + 1), bitmap_len);
-						UnlockReleaseBuffer(leafbuf);
-					}
-
-					if (bm32 == NULL)
-						elog(ERROR,
-							 "pg_roaring_index: merge: failed to deserialise bitmap "
-							 "for value " INT64_FORMAT, cur_value);
-
-					{
-						int		 gc	 = group_count;
-						uint32	*gtp = (uint32 *) palloc(gc * sizeof(uint32));
-						int		 gi;
-
-						for (gi = 0; gi < gc; gi++)
-							gtp[gi] = (uint32) group_tids[gi];
-						roaring_bitmap_add_many(bm32, (size_t) gc, gtp);
-						pfree(gtp);
-					}
-					roaring_bitmap_run_optimize(bm32);
-					new_size = roaring_bitmap_portable_size_in_bytes(bm32);
-					bm_card  = roaring_cardinality32(bm32);
+					memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
+					old_ovf_blkno = oe_copy.overflow_blkno;
+					UnlockReleaseBuffer(leafbuf);
+					bm64 = roaring_read_overflow_bitmap(index, &oe_copy);
 				}
 				else
 				{
-					if (was_overflow)
-					{
-						RoaringOverflowEntry oe_copy;
-
-						memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
-						old_ovf_blkno = oe_copy.overflow_blkno;
-						UnlockReleaseBuffer(leafbuf);
-						bm64 = roaring_read_overflow_bitmap(index, &oe_copy);
-					}
-					else
-					{
-						bitmap_len = item_len - sizeof(RoaringLeafEntry);
-						bm64 = roaring64_bitmap_portable_deserialize_safe(
-								(const char *)(le + 1), bitmap_len);
-						UnlockReleaseBuffer(leafbuf);
-					}
-
-					if (bm64 == NULL)
-						elog(ERROR,
-							 "pg_roaring_index: merge: failed to deserialise bitmap "
-							 "for value " INT64_FORMAT, cur_value);
-
-					roaring64_bitmap_add_many(bm64, group_count, group_tids);
-					roaring64_bitmap_run_optimize(bm64);
-					new_size = roaring64_bitmap_portable_size_in_bytes(bm64);
-					bm_card  = roaring64_cardinality32(bm64);
+					bitmap_len = item_len - sizeof(RoaringLeafEntry);
+					bm64 = roaring64_bitmap_portable_deserialize_safe(
+							(const char *)(le + 1), bitmap_len);
+					UnlockReleaseBuffer(leafbuf);
 				}
+
+				if (bm64 == NULL)
+					elog(ERROR,
+						 "pg_roaring_index: merge: failed to deserialise bitmap "
+						 "for value " INT64_FORMAT, cur_value);
+
+				roaring64_bitmap_add_many(bm64, group_count, group_tids);
+				roaring64_bitmap_run_optimize(bm64);
+				new_size = roaring64_bitmap_portable_size_in_bytes(bm64);
+				bm_card  = roaring64_cardinality32(bm64);
 
 				write_ovf = (new_size > (size_t) max_inline);
 
@@ -1222,22 +1178,12 @@ roaring_merge_pending(Relation index)
 				{
 					bm_data		  = (char *) palloc(new_size);
 					new_ovf_blkno = InvalidBlockNumber;
-					if (is_lossy)
-					{
-						roaring_bitmap_portable_serialize(bm32, bm_data);
-						roaring_bitmap_free(bm32);
-						bm32 = NULL;
-					}
-					else
-					{
-						roaring64_bitmap_portable_serialize(bm64, bm_data);
-						roaring64_bitmap_free(bm64);
-						bm64 = NULL;
-					}
+					roaring64_bitmap_portable_serialize(bm64, bm_data);
+					roaring64_bitmap_free(bm64);
+					bm64 = NULL;
 				}
 				PG_FINALLY();
 				{
-					if (bm32 != NULL) { roaring_bitmap_free(bm32);   bm32 = NULL; }
 					if (bm64 != NULL) { roaring64_bitmap_free(bm64); bm64 = NULL; }
 				}
 				PG_END_TRY();
@@ -1369,58 +1315,30 @@ roaring_merge_pending(Relation index)
 		{
 			/* ---- 3b: new value — build bitmap and insert into leaves. ---- */
 			roaring64_bitmap_t * volatile bm64 = NULL;
-			roaring_bitmap_t   * volatile bm32 = NULL;
 			size_t				bm_size;
 			Size				entry_size;
 			RoaringLeafEntry   *new_le;
 			bool				inserted = false;
 
-			if (is_lossy)
-			{
-				uint32 *gtp = (uint32 *) palloc(group_count * sizeof(uint32));
-				int		gi;
-
-				for (gi = 0; gi < group_count; gi++)
-					gtp[gi] = (uint32) group_tids[gi];
-				bm32 = roaring_bitmap_create();
-				roaring_bitmap_add_many(bm32, (size_t) group_count, gtp);
-				pfree(gtp);
-				roaring_bitmap_run_optimize(bm32);
-				bm_size = roaring_bitmap_portable_size_in_bytes(bm32);
-			}
-			else
-			{
-				bm64 = roaring64_bitmap_create();
-				roaring64_bitmap_add_many(bm64, group_count, group_tids);
-				roaring64_bitmap_run_optimize(bm64);
-				bm_size = roaring64_bitmap_portable_size_in_bytes(bm64);
-			}
+			bm64 = roaring64_bitmap_create();
+			roaring64_bitmap_add_many(bm64, group_count, group_tids);
+			roaring64_bitmap_run_optimize(bm64);
+			bm_size = roaring64_bitmap_portable_size_in_bytes(bm64);
 			entry_size = MAXALIGN(sizeof(RoaringLeafEntry) + bm_size);
 
 			PG_TRY();
 			{
-				new_le			= (RoaringLeafEntry *)
-								  palloc(sizeof(RoaringLeafEntry) + bm_size);
-				new_le->value	= cur_value;
-				new_le->flags	= ROARING_ENTRY_INLINE;
-				if (is_lossy)
-				{
-					new_le->cardinality = roaring_cardinality32(bm32);
-					roaring_bitmap_portable_serialize(bm32, (char *)(new_le + 1));
-					roaring_bitmap_free(bm32);
-					bm32 = NULL;
-				}
-				else
-				{
-					new_le->cardinality = roaring64_cardinality32(bm64);
-					roaring64_bitmap_portable_serialize(bm64, (char *)(new_le + 1));
-					roaring64_bitmap_free(bm64);
-					bm64 = NULL;
-				}
+				new_le				= (RoaringLeafEntry *)
+									  palloc(sizeof(RoaringLeafEntry) + bm_size);
+				new_le->value		= cur_value;
+				new_le->flags		= ROARING_ENTRY_INLINE;
+				new_le->cardinality = roaring64_cardinality32(bm64);
+				roaring64_bitmap_portable_serialize(bm64, (char *)(new_le + 1));
+				roaring64_bitmap_free(bm64);
+				bm64 = NULL;
 			}
 			PG_FINALLY();
 			{
-				if (bm32 != NULL) { roaring_bitmap_free(bm32);   bm32 = NULL; }
 				if (bm64 != NULL) { roaring64_bitmap_free(bm64); bm64 = NULL; }
 			}
 			PG_END_TRY();
@@ -2102,375 +2020,6 @@ roaring_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return stats;
 }
 
-/* ----------------------------------------------------------------
- * roaring_bulkdelete_lossy
- *
- * Lossy mode does not store individual TIDs, so we cannot remove dead
- * TIDs from bitmaps at ambulkdelete time.  Stale block numbers cause
- * extra rechecks (which find no matching rows) but are not incorrect.
- * We walk the leaf chain only to populate num_index_tuples for stats.
- *
- * Dead block entries are cleaned up implicitly: after vacuumcleanup
- * merges fresh pending inserts, re-inserted values re-add any live
- * blocks.  A future pass could rebuild bitmaps from scratch to reclaim
- * space from fully-dead blocks, but that is not implemented yet.
- * ---------------------------------------------------------------- */
-IndexBulkDeleteResult *
-roaring_bulkdelete_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
-						 IndexBulkDeleteCallback callback, void *callback_state)
-{
-	Relation			 index = info->index;
-	Buffer				 metabuf;
-	RoaringMetaPageData *meta;
-	BlockNumber			 leftmost;
-	BlockNumber			 cur;
-
-	if (stats == NULL)
-		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-
-	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
-	meta     = RoaringPageGetMeta(BufferGetPage(metabuf));
-	leftmost = meta->leftmost_leaf_page;
-	UnlockReleaseBuffer(metabuf);
-
-	/* Walk leaf pages to count distinct values (entries). */
-	cur = leftmost;
-	while (cur != InvalidBlockNumber)
-	{
-		Buffer				buf;
-		Page				page;
-		RoaringLeafSpecial *spc;
-
-		buf  = ReadBuffer(index, cur);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		spc  = (RoaringLeafSpecial *) PageGetSpecialPointer(page);
-
-		stats->num_index_tuples += PageGetMaxOffsetNumber(page);
-		cur = spc->right_page;
-		UnlockReleaseBuffer(buf);
-	}
-
-	return stats;
-}
-
-/* ----------------------------------------------------------------
- * roaring_resummarize_lossy
- *
- * Remove stale block numbers from lossy bitmaps.  For each value V, read
- * only the heap pages listed in V's bitmap and check for live tuples with
- * the indexed value.  Block numbers with no live V-tuples are removed.
- *
- * This is the BRIN-style dead-block cleanup: O(bitmap_pages) not O(heap).
- *
- * Holding index leaf EXCLUSIVE while reading heap pages is safe: concurrent
- * scans that have already returned their bitmap hold no index locks, so the
- * lock sets are disjoint and no deadlock is possible.
- *
- * Liveness check: any LP_NORMAL heap tuple with a valid xmin and the indexed
- * value counts as "live enough" to retain the block.  Conservative (we may
- * keep blocks where the only V-tuple has a committed xmax), but never drops
- * a block that could still be needed.  A subsequent VACUUM round will prune
- * such tuples to LP_DEAD and the next vacuumcleanup will drop the block.
- * ---------------------------------------------------------------- */
-static void
-roaring_resummarize_lossy(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
-{
-	const int			 max_inline = (int)(BLCKSZ
-										   - MAXALIGN(sizeof(RoaringLeafSpecial))
-										   - SizeOfPageHeaderData
-										   - sizeof(ItemIdData)
-										   - MAXALIGN(sizeof(RoaringLeafEntry)));
-	Relation			 index        = info->index;
-	Relation			 heap         = info->heaprel;
-	TupleDesc			 tupdesc;
-	Oid					 col_typid;
-	AttrNumber			 heap_attnum;
-	BlockNumber			 heap_nblocks;
-	BlockNumber			 leftmost, cur;
-	Buffer				 metabuf;
-
-	if (!heap)
-		return;
-
-	tupdesc      = RelationGetDescr(heap);
-	col_typid    = TupleDescAttr(index->rd_att, 0)->atttypid;
-	{
-		IndexInfo *ii = BuildIndexInfo(index);
-		heap_attnum  = ii->ii_IndexAttrNumbers[0];  /* 1-based heap column */
-	}
-	heap_nblocks = RelationGetNumberOfBlocks(heap);
-
-	metabuf  = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
-	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
-	leftmost = RoaringPageGetMeta(BufferGetPage(metabuf))->leftmost_leaf_page;
-	UnlockReleaseBuffer(metabuf);
-
-	{
-	OvfRecycleCtx recycle_ctx;
-
-	recycle_ctx.heads = NULL;
-	recycle_ctx.n     = 0;
-	recycle_ctx.cap   = 0;
-
-	for (cur = leftmost; cur != InvalidBlockNumber; )
-	{
-		Buffer				 leafbuf;
-		Page				 leafpage;
-		RoaringLeafSpecial	*lspc;
-		OffsetNumber		 off, maxoff;
-		BlockNumber			 next;
-		GenericXLogState	* volatile xstate;
-		Page				 img;
-		bool				 page_changed = false;
-
-		leafbuf  = ReadBuffer(index, cur);
-		LockBuffer(leafbuf, BUFFER_LOCK_EXCLUSIVE);
-		leafpage = BufferGetPage(leafbuf);
-		lspc     = (RoaringLeafSpecial *) PageGetSpecialPointer(leafpage);
-		maxoff   = PageGetMaxOffsetNumber(leafpage);
-		next     = lspc->right_page;
-
-		xstate = GenericXLogStart(index);
-		img    = GenericXLogRegisterBuffer((GenericXLogState *) xstate, leafbuf, 0);
-
-		PG_TRY();
-		{
-			for (off = FirstOffsetNumber; off <= maxoff; off++)
-			{
-				ItemId            iid;
-				RoaringLeafEntry *le;
-				int64             value;
-				bool              was_overflow;
-				BlockNumber       old_ovf_blkno;
-				roaring_bitmap_t * volatile bm    = NULL;
-				roaring_bitmap_t * volatile new_bm = NULL;
-				uint32            old_card, new_card;
-
-				iid = PageGetItemId(img, off);
-				if (!ItemIdIsUsed(iid))
-					continue;
-
-				le            = (RoaringLeafEntry *) PageGetItem(img, iid);
-				value         = le->value;
-				was_overflow  = (le->flags & ROARING_ENTRY_OVERFLOW) != 0;
-				old_ovf_blkno = InvalidBlockNumber;
-
-				PG_TRY();
-				{
-					if (was_overflow)
-					{
-						RoaringOverflowEntry oe_copy;
-
-						memcpy(&oe_copy, le, sizeof(RoaringOverflowEntry));
-						old_ovf_blkno = oe_copy.overflow_blkno;
-						/*
-						 * roaring_read_overflow_bitmap_lossy takes share locks on
-						 * overflow pages.  We hold leafbuf exclusive — safe
-						 * because overflow pages are always higher-numbered
-						 * than the leaf and no other process holds overflow
-						 * exclusive while we own this leaf.
-						 */
-						bm = roaring_read_overflow_bitmap_lossy(index, &oe_copy);
-					}
-					else
-					{
-						size_t bm_bytes = ItemIdGetLength(iid)
-										  - sizeof(RoaringLeafEntry);
-						bm = roaring_bitmap_portable_deserialize_safe(
-								(const char *)(le + 1), bm_bytes);
-					}
-
-					if (bm != NULL)
-					{
-						roaring_uint32_iterator_t it;
-
-						old_card = roaring_cardinality32(bm);
-						new_bm   = roaring_bitmap_create();
-
-						roaring_iterator_init(bm, &it);
-						while (it.has_value)
-						{
-							BlockNumber hblkno  = (BlockNumber) it.current_value;
-							bool        has_live = false;
-
-							if (hblkno < heap_nblocks)
-							{
-								Buffer       hbuf;
-								Page         hpage;
-								OffsetNumber ho, hmaxoff;
-
-								hbuf = ReadBufferExtended(heap, MAIN_FORKNUM,
-														  hblkno, RBM_NORMAL,
-														  info->strategy);
-								LockBuffer(hbuf, BUFFER_LOCK_SHARE);
-								hpage   = BufferGetPage(hbuf);
-								hmaxoff = PageGetMaxOffsetNumber(hpage);
-
-								for (ho = FirstOffsetNumber;
-									 ho <= hmaxoff && !has_live;
-									 ho++)
-								{
-									ItemId        hiid = PageGetItemId(hpage, ho);
-									HeapTupleData htup;
-									bool          isnull;
-									Datum         val;
-									int64         col_val;
-
-									if (!ItemIdIsNormal(hiid))
-										continue;
-
-									htup.t_data     = (HeapTupleHeader)
-													  PageGetItem(hpage, hiid);
-									htup.t_len      = ItemIdGetLength(hiid);
-									htup.t_tableOid = RelationGetRelid(heap);
-									ItemPointerSet(&htup.t_self, hblkno, ho);
-
-									/*
-									 * Skip tuples whose xmin was never committed
-									 * (aborted insert).  Tuples with valid xmin
-									 * but committed xmax are conservatively kept;
-									 * they will be pruned on a future VACUUM.
-									 */
-									if (HeapTupleHeaderXminInvalid(htup.t_data))
-										continue;
-
-									val = heap_getattr(&htup, heap_attnum,
-													   tupdesc, &isnull);
-									if (isnull)
-										continue;
-
-									col_val = roaring_datum_to_key64(val, col_typid);
-									if (col_val == value)
-										has_live = true;
-								}
-
-								UnlockReleaseBuffer(hbuf);
-							}
-							/* hblkno >= heap_nblocks: truncated — omit from new_bm */
-
-							if (has_live)
-								roaring_bitmap_add(new_bm, (uint32) hblkno);
-
-							roaring_uint32_iterator_advance(&it);
-						}
-
-						new_card = roaring_cardinality32(new_bm);
-
-						if (new_card != old_card)
-						{
-							page_changed = true;
-
-							if (new_card == 0)
-							{
-								PageIndexTupleDelete(img, off);
-								((RoaringLeafSpecial *)
-								 PageGetSpecialPointer(img))->entry_count--;
-								off--;
-								maxoff--;
-							}
-							else
-							{
-								size_t new_bytes;
-
-								roaring_bitmap_run_optimize(new_bm);
-								new_bytes =
-									roaring_bitmap_portable_size_in_bytes(new_bm);
-
-								if (was_overflow &&
-									new_bytes > (size_t) max_inline)
-								{
-									/* Still overflow: write a new chain. */
-									char  *bm_data = (char *) palloc(new_bytes);
-									RoaringOverflowEntry new_oe;
-
-									roaring_bitmap_portable_serialize(new_bm,
-																	  bm_data);
-									new_oe.value        = value;
-									new_oe.cardinality  = new_card;
-									new_oe.flags        = ROARING_ENTRY_OVERFLOW;
-									new_oe.total_len    = (uint32) new_bytes;
-									new_oe.overflow_blkno =
-										roaring_write_overflow_chain(
-											index, bm_data, new_bytes);
-									pfree(bm_data);
-
-									if (!PageIndexTupleOverwrite(
-											img, off,
-											(Item) &new_oe,
-											sizeof(RoaringOverflowEntry)))
-										elog(ERROR,
-											 "pg_roaring_index: resummarize: "
-											 "PageIndexTupleOverwrite (overflow) "
-											 "failed for value " INT64_FORMAT,
-											 value);
-								}
-								else
-								{
-									/* Inline (or overflow shrunk to inline). */
-									Size new_sz = sizeof(RoaringLeafEntry)
-												  + new_bytes;
-									RoaringLeafEntry *new_le =
-										(RoaringLeafEntry *) palloc(new_sz);
-
-									new_le->value       = value;
-									new_le->cardinality = new_card;
-									new_le->flags       = ROARING_ENTRY_INLINE;
-									roaring_bitmap_portable_serialize(
-										new_bm, (char *)(new_le + 1));
-
-									if (!PageIndexTupleOverwrite(img, off,
-																  (Item) new_le,
-																  new_sz))
-										elog(ERROR,
-											 "pg_roaring_index: resummarize: "
-											 "PageIndexTupleOverwrite (inline) "
-											 "failed for value " INT64_FORMAT,
-											 value);
-									pfree(new_le);
-								}
-							}
-						}
-						/*
-						 * Queue old overflow chain for deferred recycle.  Done
-						 * inside bm != NULL so new_card is guaranteed to be set.
-						 */
-						if (was_overflow && new_card != old_card)
-							ovf_recycle_add(&recycle_ctx, old_ovf_blkno);
-					} /* bm != NULL */
-				}
-				PG_FINALLY();
-				{
-					if (bm)    { roaring_bitmap_free(bm);    bm    = NULL; }
-					if (new_bm){ roaring_bitmap_free(new_bm);new_bm = NULL; }
-				}
-				PG_END_TRY();
-			} /* for off */
-
-			if (page_changed)
-				GenericXLogFinish((GenericXLogState *) xstate);
-			else
-				GenericXLogAbort((GenericXLogState *) xstate);
-			xstate = NULL;
-		}
-		PG_CATCH();
-		{
-			if (xstate)
-				GenericXLogAbort((GenericXLogState *) xstate);
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-
-		UnlockReleaseBuffer(leafbuf);
-		cur = next;
-	}
-
-	/* Recycle old overflow chains replaced during the resummarize pass. */
-	ovf_recycle_flush(index, &recycle_ctx);
-
-	} /* end recycle_ctx scope */
-}
 
 /* ----------------------------------------------------------------
  * roaring_vacuumcleanup
@@ -2663,11 +2212,6 @@ roaring_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	}
 
 	roaring_merge_pending(info->index);
-
-	/* Dead-block cleanup only for single-column lossy indexes. */
-	if ((flags & ROARING_FLAG_LOSSY) &&
-		info->index->rd_att->natts == 1)
-		roaring_resummarize_lossy(info, stats);
 
 	return stats;
 }

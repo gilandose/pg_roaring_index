@@ -10,40 +10,28 @@ SET roaring.pending_merge_threshold = 5000;
 
 CREATE TABLE stats_test (val int);
 INSERT INTO stats_test SELECT i % 100 FROM generate_series(1, 1000) i;
-CREATE INDEX stats_idx       ON stats_test USING roaring(val);
-CREATE INDEX stats_idx_lossy ON stats_test USING roaring_lossy(val);
+CREATE INDEX stats_idx ON stats_test USING roaring(val);
 
--- After ambuild: total_entries=100 (exact), pending_count=0, threshold=5000
+-- After ambuild: total_entries=100, pending_count=0, threshold=5000
 SELECT
     total_entries,
     pending_count,
     pending_threshold,
-    is_lossy,
     bg_merge_running
 FROM roaring_index_stats('stats_idx'::regclass);
-
--- Lossy index: is_lossy=true
-SELECT
-    total_entries,
-    pending_count,
-    pending_threshold,
-    is_lossy,
-    bg_merge_running
-FROM roaring_index_stats('stats_idx_lossy'::regclass);
 
 -- ----------------------------------------------------------------
 -- 2. pg_stat_roaring_indexes view
 -- ----------------------------------------------------------------
-SELECT indexrelname, amname, pending_threshold, is_lossy
+SELECT indexrelname, amname, pending_threshold
 FROM pg_stat_roaring_indexes
-WHERE indexrelname IN ('stats_idx', 'stats_idx_lossy')
+WHERE indexrelname = 'stats_idx'
 ORDER BY indexrelname;
 
 -- ----------------------------------------------------------------
 -- 3. roaring_index_health
 -- ----------------------------------------------------------------
 SELECT roaring_index_health('stats_idx'::regclass);
-SELECT roaring_index_health('stats_idx_lossy'::regclass);
 
 -- ----------------------------------------------------------------
 -- 4. GUC resets to default after RESET

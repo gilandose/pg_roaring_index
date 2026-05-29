@@ -27,15 +27,6 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cs WHERE val = 3;
 -- IN list: still a RoaringCount (sum of disjoint bitmaps).
 EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cs WHERE val IN (1, 2, 3);
 
--- Lossy AM: RoaringCount does not fire for roaring_lossy
--- (block-level bitmaps don't give exact row counts).
-CREATE TABLE t_cs_lo (id int, val bigint);
-INSERT INTO t_cs_lo SELECT i, (i % 10) + 1 FROM generate_series(1, 1000) i;
-CREATE INDEX t_cs_lo_idx ON t_cs_lo USING roaring_lossy (val);
-VACUUM t_cs_lo;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cs_lo WHERE val = 3;
-DROP TABLE t_cs_lo;
-
 -- Multi-column index: RoaringCount does not fire
 -- (intersection semantics; column-sum ≠ row count).
 CREATE TABLE t_cs2 (id int, a int4, b int4);

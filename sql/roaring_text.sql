@@ -29,22 +29,6 @@ RESET enable_seqscan;
 DROP TABLE t_text;
 
 -- ----------------------------------------------------------------
--- text — lossy (page-level)
--- ----------------------------------------------------------------
-CREATE TABLE t_text_lo (id int, status text);
-INSERT INTO t_text_lo VALUES
-    (1, 'active'), (2, 'inactive'), (3, 'active'),
-    (4, 'pending'), (5, 'active'), (6, 'inactive');
-
-CREATE INDEX t_text_lo_idx ON t_text_lo USING roaring_lossy (status);
-
-SET enable_seqscan = off;
-SELECT id FROM t_text_lo WHERE status = 'active'   ORDER BY id;
-SELECT id FROM t_text_lo WHERE status = 'inactive' ORDER BY id;
-RESET enable_seqscan;
-DROP TABLE t_text_lo;
-
--- ----------------------------------------------------------------
 -- uuid
 -- ----------------------------------------------------------------
 CREATE TABLE t_uuid (id int, tenant_id uuid);

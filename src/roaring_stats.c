@@ -46,12 +46,11 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 	values[0] = Int64GetDatum((int64) meta->total_entries);
 	values[1] = Int64GetDatum((int64) pending_count);
 	values[2] = Int32GetDatum((int32) meta->pending_merge_threshold);
-	values[3] = BoolGetDatum((meta->flags & ROARING_FLAG_LOSSY) != 0);
-	values[4] = BoolGetDatum((meta->flags & ROARING_FLAG_BGMERGE_SPAWNED) != 0);
-	values[5] = Int32GetDatum((int32) meta->version);
-	values[6] = Int64GetDatum((int64) meta->root_directory_page);
-	values[7] = Int64GetDatum((int64) meta->leftmost_leaf_page);
-	values[8] = Int64GetDatum((int64) meta->free_list_head);
+	values[3] = BoolGetDatum((meta->flags & ROARING_FLAG_BGMERGE_SPAWNED) != 0);
+	values[4] = Int32GetDatum((int32) meta->version);
+	values[5] = Int64GetDatum((int64) meta->root_directory_page);
+	values[6] = Int64GetDatum((int64) meta->leftmost_leaf_page);
+	values[7] = Int64GetDatum((int64) meta->free_list_head);
 
 	UnlockReleaseBuffer(metabuf);
 	relation_close(index, AccessShareLock);

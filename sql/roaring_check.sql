@@ -27,11 +27,6 @@ SELECT roaring_index_check('chk_big_idx'::regclass, false);  -- heapallindexed=f
 SELECT count(*) AS cnt_300 FROM chk_big WHERE val = 300;
 SELECT count(*) AS cnt_601 FROM chk_big WHERE val = 601;  -- absent
 
--- Same for lossy.
-CREATE INDEX chk_big_lo_idx ON chk_big USING roaring_lossy (val);
-SELECT roaring_index_check('chk_big_lo_idx'::regclass);
-SELECT count(*) AS cnt_lo_300 FROM chk_big WHERE val = 300;
-
 DROP TABLE chk_big;
 
 -- ================================================================

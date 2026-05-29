@@ -42,7 +42,6 @@
 
 /* Metapage flags */
 #define ROARING_FLAG_EXACT              0x01
-#define ROARING_FLAG_LOSSY              0x02
 /*
  * ROARING_FLAG_BGMERGE_SPAWNED: set (under metapage EX, in the same WAL record
  * as the page extension that crossed pending_merge_threshold) when a background
@@ -343,19 +342,6 @@ roaring_float4_to_key32(float4 f)
 	return (int32) bits;
 }
 
-/*
- * roaring_cardinality32 — return a roaring32 bitmap's cardinality as uint32.
- * Used by the lossy path (block-number bitmaps stay roaring32).
- */
-static inline uint32
-roaring_cardinality32(const roaring_bitmap_t *bm)
-{
-	uint64_t card = roaring_bitmap_get_cardinality(bm);
-
-	if (card > (uint64_t) UINT32_MAX)
-		elog(ERROR, "roaring bitmap cardinality exceeds uint32 max");
-	return (uint32) card;
-}
 
 /*
  * roaring64_cardinality32 — return a roaring64 bitmap's cardinality as uint32.
@@ -428,8 +414,6 @@ extern BlockNumber roaring_write_overflow_chain(Relation index,
                                                 size_t total_len);
 extern roaring64_bitmap_t *roaring_read_overflow_bitmap(
     Relation index, const RoaringOverflowEntry *oe);
-extern roaring_bitmap_t *roaring_read_overflow_bitmap_lossy(
-    Relation index, const RoaringOverflowEntry *oe);
 
 /*
  * roaring_datum_to_key32 — convert a Datum of supported type to an int32
@@ -456,8 +440,6 @@ extern void roaring_try_spawn_merge_worker(Relation index);
 /* roaring_build.c */
 extern IndexBuildResult *roaring_build(Relation heap, Relation index,
                                        struct IndexInfo *indexInfo);
-extern IndexBuildResult *roaring_build_lossy(Relation heap, Relation index,
-                                             struct IndexInfo *indexInfo);
 extern void roaring_buildempty(Relation index);
 
 /* roaring_insert.c */
@@ -466,11 +448,6 @@ extern bool roaring_insert(Relation index, Datum *values, bool *isnull,
                            IndexUniqueCheck checkUnique,
                            bool indexUnchanged,
                            struct IndexInfo *indexInfo);
-extern bool roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
-                                 ItemPointer ht_ctid, Relation heapRel,
-                                 IndexUniqueCheck checkUnique,
-                                 bool indexUnchanged,
-                                 struct IndexInfo *indexInfo);
 
 /* roaring_scan.c */
 extern BlockNumber   roaring_dir_lookup(Relation index, BlockNumber dir_blkno,
@@ -479,7 +456,6 @@ extern IndexScanDesc roaring_beginscan(Relation rel, int nkeys, int norderbys);
 extern void roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
                            ScanKey orderbys, int norderbys);
 extern int64 roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm);
-extern int64 roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm);
 extern bool  roaring_gettuple(IndexScanDesc scan, ScanDirection dir);
 extern void  roaring_endscan(IndexScanDesc scan);
 extern int64 roaring_count_key_exact(Relation index, BlockNumber root_blkno,
@@ -493,10 +469,6 @@ extern IndexBulkDeleteResult *roaring_bulkdelete(IndexVacuumInfo *info,
                                                   IndexBulkDeleteResult *stats,
                                                   IndexBulkDeleteCallback callback,
                                                   void *callback_state);
-extern IndexBulkDeleteResult *roaring_bulkdelete_lossy(IndexVacuumInfo *info,
-                                                        IndexBulkDeleteResult *stats,
-                                                        IndexBulkDeleteCallback callback,
-                                                        void *callback_state);
 extern IndexBulkDeleteResult *roaring_vacuumcleanup(IndexVacuumInfo *info,
                                                      IndexBulkDeleteResult *stats);
 

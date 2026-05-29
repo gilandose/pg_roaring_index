@@ -79,94 +79,17 @@ CREATE OPERATOR CLASS roaring_uuid_tid_ops
     DEFAULT FOR TYPE uuid USING roaring AS
     OPERATOR 1 =(uuid, uuid);
 
--- ----------------------------------------------------------------
--- Lossy (page-level) opclasses — roaring_page_ops
---
--- Stores block numbers instead of TIDs.  amrecheck=true so the executor
--- rechecks heap tuples on each matched page.  Index is 10-100x smaller
--- than the exact variant at low cardinality; best for multi-column AND
--- queries or when index size dominates (e.g. ndistinct < 1000).
--- ----------------------------------------------------------------
-
-CREATE FUNCTION pg_roaring_page_handler(internal)
-    RETURNS index_am_handler
-    AS 'MODULE_PATHNAME', 'roaring_page_handler'
-    LANGUAGE C;
-
-CREATE ACCESS METHOD roaring_lossy
-    TYPE INDEX
-    HANDLER pg_roaring_page_handler;
-
-CREATE OPERATOR CLASS roaring_int8_page_ops
-    DEFAULT FOR TYPE int8 USING roaring_lossy AS
-    OPERATOR 1 =(int8, int8);
-
-ALTER OPERATOR FAMILY roaring_int8_page_ops USING roaring_lossy ADD
-    OPERATOR 1 =(int8, int4),
-    OPERATOR 1 =(int8, int2),
-    OPERATOR 1 =(int4, int8),
-    OPERATOR 1 =(int2, int8);
-
-CREATE OPERATOR CLASS roaring_int4_page_ops
-    DEFAULT FOR TYPE int4 USING roaring_lossy AS
-    OPERATOR 1 =(int4, int4);
-
-ALTER OPERATOR FAMILY roaring_int4_page_ops USING roaring_lossy ADD
-    OPERATOR 1 =(int4, int8),
-    OPERATOR 1 =(int4, int2),
-    OPERATOR 1 =(int8, int4),
-    OPERATOR 1 =(int2, int4);
-
-CREATE OPERATOR CLASS roaring_int2_page_ops
-    DEFAULT FOR TYPE int2 USING roaring_lossy AS
-    OPERATOR 1 =(int2, int2);
-
-ALTER OPERATOR FAMILY roaring_int2_page_ops USING roaring_lossy ADD
-    OPERATOR 1 =(int2, int4),
-    OPERATOR 1 =(int2, int8),
-    OPERATOR 1 =(int4, int2),
-    OPERATOR 1 =(int8, int2);
-
-CREATE OPERATOR CLASS roaring_bool_page_ops
-    DEFAULT FOR TYPE bool USING roaring_lossy AS
-    OPERATOR 1 =(boolean, boolean);
-
-CREATE OPERATOR CLASS roaring_date_page_ops
-    DEFAULT FOR TYPE date USING roaring_lossy AS
-    OPERATOR 1 =(date, date);
-
-CREATE OPERATOR CLASS roaring_float4_page_ops
-    DEFAULT FOR TYPE float4 USING roaring_lossy AS
-    OPERATOR 1 =(float4, float4);
-
-CREATE OPERATOR CLASS roaring_oid_page_ops
-    DEFAULT FOR TYPE oid USING roaring_lossy AS
-    OPERATOR 1 =(oid, oid);
-
-CREATE OPERATOR CLASS roaring_enum_page_ops
-    DEFAULT FOR TYPE anyenum USING roaring_lossy AS
-    OPERATOR 1 =(anyenum, anyenum);
-
-CREATE OPERATOR CLASS roaring_text_page_ops
-    DEFAULT FOR TYPE text USING roaring_lossy AS
-    OPERATOR 1 =(text, text);
-
-CREATE OPERATOR CLASS roaring_uuid_page_ops
-    DEFAULT FOR TYPE uuid USING roaring_lossy AS
-    OPERATOR 1 =(uuid, uuid);
 
 -- ----------------------------------------------------------------
 -- Observability
 -- ----------------------------------------------------------------
 
--- roaring_index_stats: read the metapage of a roaring/roaring_lossy index
--- and return one diagnostic row.
+-- roaring_index_stats: read the metapage of a roaring index and return one diagnostic row.
 CREATE FUNCTION roaring_index_stats(
     indexrelid regclass,
     OUT total_entries   bigint,
     OUT pending_count   bigint,
     OUT pending_threshold int,
-    OUT is_lossy        bool,
     OUT bg_merge_running bool,
     OUT index_version   int,
     OUT root_blkno      bigint,
@@ -176,7 +99,7 @@ CREATE FUNCTION roaring_index_stats(
     AS 'MODULE_PATHNAME', 'roaring_index_stats'
     LANGUAGE C STRICT;
 
--- pg_stat_roaring_indexes: one row per roaring/roaring_lossy index.
+-- pg_stat_roaring_indexes: one row per roaring index.
 CREATE VIEW pg_stat_roaring_indexes AS
     SELECT
         c.oid              AS indexrelid,
@@ -186,7 +109,6 @@ CREATE VIEW pg_stat_roaring_indexes AS
         s.total_entries,
         s.pending_count,
         s.pending_threshold,
-        s.is_lossy,
         s.bg_merge_running,
         s.index_version,
         s.root_blkno,
@@ -196,7 +118,7 @@ CREATE VIEW pg_stat_roaring_indexes AS
     JOIN pg_namespace n  ON n.oid  = c.relnamespace
     JOIN pg_am am        ON am.oid = c.relam
     JOIN LATERAL roaring_index_stats(c.oid) s ON true
-    WHERE am.amname IN ('roaring', 'roaring_lossy')
+    WHERE am.amname = 'roaring'
       AND c.relkind = 'i';
 
 -- roaring_index_check: structural integrity check (amcheck equivalent).

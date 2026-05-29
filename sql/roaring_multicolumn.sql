@@ -68,32 +68,7 @@ SELECT count(*) AS both_t1_l10_partial FROM mc_exact WHERE tenant = 1 AND locati
 SELECT count(*) AS prefix_t1_partial   FROM mc_exact WHERE tenant = 1;  -- 3
 
 -- ----------------------------------------------------------------
--- 5. Lossy (roaring_lossy) 2-column index
--- ----------------------------------------------------------------
-CREATE TABLE mc_lossy (
-    id      int,
-    tenant  int4,
-    location int4
-);
-
-INSERT INTO mc_lossy VALUES
-    (1,  1, 10),
-    (2,  1, 10),
-    (3,  1, 20),
-    (4,  2, 10),
-    (5,  2, 30),
-    (6,  3, 10);
-
-CREATE INDEX mc_lossy_idx ON mc_lossy USING roaring_lossy (tenant, location);
-VACUUM mc_lossy;
-
--- Lossy mode: amrecheck=true means results are correct but come via page bitmap.
-SELECT count(*) AS lossy_both_t1_l10 FROM mc_lossy WHERE tenant = 1 AND location = 10;  -- 2
-SELECT count(*) AS lossy_prefix_t1   FROM mc_lossy WHERE tenant = 1;  -- 3
-SELECT count(*) AS lossy_prefix_t9   FROM mc_lossy WHERE tenant = 9;  -- 0
-
--- ----------------------------------------------------------------
--- 6. NULL handling: rows with NULL in either column are not indexed
+-- 5. NULL handling: rows with NULL in either column are not indexed
 -- ----------------------------------------------------------------
 RESET enable_seqscan;
 INSERT INTO mc_exact VALUES (20, NULL, 10, 'null_tenant');
@@ -103,7 +78,7 @@ SELECT count(*) AS null_tenant_rows FROM mc_exact WHERE tenant IS NULL;  -- 1 vi
 SELECT count(*) AS null_loc_rows    FROM mc_exact WHERE tenant = 1 AND location IS NULL;  -- 1 via seqscan (NULL row not indexed)
 
 -- ----------------------------------------------------------------
--- 7. 3-column exact index: internal AND across three keys
+-- 6. 3-column exact index: internal AND across three keys
 -- ----------------------------------------------------------------
 CREATE TABLE mc3 (
     id     int,
