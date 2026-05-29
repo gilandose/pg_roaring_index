@@ -1575,7 +1575,7 @@ build_scan_bitmap_exact(IndexScanDesc scan)
 	 * Keys processed in cardinality order (smallest-first) so each AND
 	 * narrows the running result as quickly as possible.
 	 */
-	if (index->rd_att->natts > 1)
+	if (index->rd_index->indnkeyatts > 1)
 	{
 		roaring64_bitmap_t * volatile result = NULL;
 		roaring64_bitmap_t * volatile col_bm = NULL;
@@ -2250,7 +2250,7 @@ roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm)
 	snapshot = scan->xs_snapshot;
 
 	/* Multi-column: AND bitmaps across scan keys (block-number bitmaps). */
-	if (index->rd_att->natts > 1)
+	if (index->rd_index->indnkeyatts > 1)
 	{
 		roaring_bitmap_t * volatile result = NULL;
 		roaring_bitmap_t * volatile col_bm = NULL;

@@ -357,10 +357,6 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 	if (isnull[0])
 		return false;
 
-	/* HOT update: indexed column unchanged, no new index entry needed. */
-	if (indexUnchanged)
-		return false;
-
 	if (nkeys > 1)
 	{
 		uint64 linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
@@ -416,9 +412,6 @@ roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
 	memset(&entry, 0, sizeof(entry));
 
 	if (isnull[0])
-		return false;
-
-	if (indexUnchanged)
 		return false;
 
 	if (nkeys > 1)
