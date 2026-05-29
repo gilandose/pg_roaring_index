@@ -67,16 +67,20 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 					   bool *isnull, bool tupleIsAlive, void *state)
 {
 	RoaringBuildState  *bstate = (RoaringBuildState *) state;
-	int					natts   = index->rd_att->natts;
+	int					natts  = index->rd_att->natts;
+	int					nkeys  = index->rd_index->indnkeyatts;
 
 	bstate->heap_tuples++;
 
-	if (natts > 1)
+	if (nkeys > 1)
 	{
-		/* Multi-column: emit one (attno-namespaced key, tid) entry per column. */
-		int i;
+		/* Multi-column key: emit one (attno-namespaced key, tid) entry per KEY column. */
+		int    i;
+		uint64 linear_tid =
+			((uint64) ItemPointerGetBlockNumber(tid) << 9) |
+			(uint64)(ItemPointerGetOffsetNumber(tid) - 1);
 
-		for (i = 0; i < natts; i++)
+		for (i = 0; i < nkeys; i++)
 		{
 			Oid		typid = TupleDescAttr(index->rd_att, i)->atttypid;
 			int64	value;
@@ -101,16 +105,22 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 			}
 
 			bstate->tuples[bstate->ntuples].value = value;
-			bstate->tuples[bstate->ntuples].tid   =
-				((uint64) ItemPointerGetBlockNumber(tid) << 9) |
-				(uint64)(ItemPointerGetOffsetNumber(tid) - 1);
+			bstate->tuples[bstate->ntuples].tid   = linear_tid;
 			bstate->ntuples++;
 		}
+
+		/* T65: write INCLUDE column payload before the pending entry. */
+		if (natts > nkeys && !isnull[nkeys])
+			roaring_payload_insert(index, linear_tid, DatumGetInt64(values[nkeys]));
+
 		return;
 	}
 
-	/* Single-column path. */
+	/* Single key column path (with optional INCLUDE columns). */
 	{
+		uint64 linear_tid =
+			((uint64) ItemPointerGetBlockNumber(tid) << 9) |
+			(uint64)(ItemPointerGetOffsetNumber(tid) - 1);
 		int64 value;
 
 		if (isnull[0])
@@ -133,10 +143,12 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 		}
 
 		bstate->tuples[bstate->ntuples].value = value;
-		bstate->tuples[bstate->ntuples].tid   =
-			((uint32) ItemPointerGetBlockNumber(tid) << 9) |
-			(uint32)(ItemPointerGetOffsetNumber(tid) - 1);
+		bstate->tuples[bstate->ntuples].tid   = linear_tid;
 		bstate->ntuples++;
+
+		/* T65: write INCLUDE column payload before the pending entry. */
+		if (natts > nkeys && !isnull[nkeys])
+			roaring_payload_insert(index, linear_tid, DatumGetInt64(values[nkeys]));
 	}
 }
 
@@ -175,9 +187,20 @@ write_metapage(Relation index,
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(buf);
 
-	PageInit(page, BLCKSZ, 0);
-	meta = RoaringPageGetMeta(page);
-	memset(meta, 0, sizeof(*meta));
+	/*
+	 * Save payload_dir_head before PageInit wipes the header.  The content
+	 * area (where meta fields live) is untouched by PageInit, so reading it
+	 * here captures whatever payload_get_root_dir wrote during the build scan.
+	 */
+	{
+		RoaringMetaPageData *old_meta = RoaringPageGetMeta(page);
+		BlockNumber saved_payload_dir = old_meta->payload_dir_head;
+
+		PageInit(page, BLCKSZ, 0);
+		meta = RoaringPageGetMeta(page);
+		memset(meta, 0, sizeof(*meta));
+		meta->payload_dir_head = saved_payload_dir;
+	}
 
 	meta->magic					   = ROARING_MAGIC;
 	meta->version				   = ROARING_INDEX_VERSION;
@@ -635,10 +658,18 @@ roaring_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	/* Block 0: placeholder — filled in by write_metapage at the end. */
 	{
-		Buffer buf = roaring_extend_page(index);
+		Buffer				 buf = roaring_extend_page(index);
+		Page				 pg;
+		RoaringMetaPageData *m;
 
 		Assert(BufferGetBlockNumber(buf) == ROARING_METAPAGE_BLKNO);
-		PageInit(BufferGetPage(buf), BLCKSZ, 0);
+		pg = BufferGetPage(buf);
+		PageInit(pg, BLCKSZ, 0);
+		m = RoaringPageGetMeta(pg);
+		memset(m, 0, sizeof(*m));
+		m->payload_dir_head = InvalidBlockNumber;
+		((PageHeader) pg)->pd_lower =
+			(LocationIndex)(SizeOfPageHeaderData + sizeof(RoaringMetaPageData));
 		roaring_wal_and_release(index, buf);
 	}
 
@@ -765,6 +796,7 @@ roaring_buildempty(Relation index)
 	}
 	meta->total_entries			  = 0;
 	meta->pending_merge_threshold = (uint32) roaring_pending_merge_threshold_guc;
+	meta->payload_dir_head		  = InvalidBlockNumber;
 	((PageHeader) page)->pd_lower =
 		(LocationIndex)(SizeOfPageHeaderData + sizeof(RoaringMetaPageData));
 	PageSetChecksumInplace(page, ROARING_METAPAGE_BLKNO);
@@ -899,10 +931,18 @@ roaring_build_lossy(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 
 	{
-		Buffer buf = roaring_extend_page(index);
+		Buffer				 buf = roaring_extend_page(index);
+		Page				 pg;
+		RoaringMetaPageData *m;
 
 		Assert(BufferGetBlockNumber(buf) == ROARING_METAPAGE_BLKNO);
-		PageInit(BufferGetPage(buf), BLCKSZ, 0);
+		pg = BufferGetPage(buf);
+		PageInit(pg, BLCKSZ, 0);
+		m = RoaringPageGetMeta(pg);
+		memset(m, 0, sizeof(*m));
+		m->payload_dir_head = InvalidBlockNumber;
+		((PageHeader) pg)->pd_lower =
+			(LocationIndex)(SizeOfPageHeaderData + sizeof(RoaringMetaPageData));
 		roaring_wal_and_release(index, buf);
 	}
 

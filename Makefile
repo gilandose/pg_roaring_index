@@ -10,6 +10,8 @@ OBJS = \
 	src/roaring_check.o \
 	src/roaring_bgworker.o \
 	src/roaring_stats.o \
+	src/roaring_customscan.o \
+	src/roaring_payload.o \
 	src/vendor/croaring/roaring.o
 
 EXTENSION = pg_roaring_index

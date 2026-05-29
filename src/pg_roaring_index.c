@@ -36,6 +36,7 @@ _PG_init(void)
 		NULL, NULL, NULL
 	);
 	MarkGUCPrefixReserved("roaring");
+	roaring_customscan_init();
 }
 
 /*
@@ -67,11 +68,12 @@ roaring_validate(Oid opclassoid)
     opfamilyoid = opcform->opcfamily;
     ReleaseSysCache(ht);
 
-    if (opcintype != INT8OID  && opcintype != INT4OID  &&
-        opcintype != INT2OID  && opcintype != BOOLOID  &&
-        opcintype != DATEOID  && opcintype != FLOAT4OID &&
-        opcintype != OIDOID   && opcintype != TEXTOID   &&
-        opcintype != UUIDOID)
+    if (opcintype != INT8OID    && opcintype != INT4OID  &&
+        opcintype != INT2OID    && opcintype != BOOLOID  &&
+        opcintype != DATEOID    && opcintype != FLOAT4OID &&
+        opcintype != OIDOID     && opcintype != TEXTOID   &&
+        opcintype != UUIDOID    && opcintype != ANYENUMOID &&
+        get_typtype(opcintype) != TYPTYPE_ENUM)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
                  errmsg("roaring index operator class must use a supported type"),
@@ -128,6 +130,34 @@ roaring_validate(Oid opclassoid)
 }
 
 /*
+ * roaring_canreturn
+ *
+ * Return true if column attno can be returned from the index without a heap
+ * fetch.  Key columns are returned from scan keys (equality AM); INCLUDE
+ * columns are returned from the payload store (T65).  Hash-keyed types store
+ * hash(value) not the original value, so they are not returnable.
+ */
+static bool
+roaring_canreturn(Relation index, int attno)
+{
+	Oid opcintype;
+
+	/*
+	 * Key columns: roaring indexes do not store NULLs, so an IndexOnlyScan
+	 * would return 0 for "WHERE col IS NULL" instead of the correct count.
+	 * Disable IndexOnlyScan on key columns; heap fetches remain correct.
+	 */
+	if (attno <= index->rd_index->indnkeyatts)
+		return false;
+
+	/* INCLUDE columns: hash-keyed types store hash(value), not returnable. */
+	opcintype = index->rd_opcintype[attno - 1];
+	if (opcintype == TEXTOID || opcintype == UUIDOID)
+		return false;
+	return true;
+}
+
+/*
  * roaring_handler
  *
  * Entry point: returns an IndexAmRoutine describing this AM to the executor.
@@ -161,7 +191,7 @@ roaring_handler(PG_FUNCTION_ARGS)
     amroutine->amclusterable  = false;
     amroutine->ampredlocks    = false;
     amroutine->amcanparallel  = false;
-    amroutine->amcaninclude   = false;
+    amroutine->amcaninclude   = true;    /* T65: supports INCLUDE columns */
     amroutine->amusemaintenanceworkmem = false;
     amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
     amroutine->amkeytype      = InvalidOid;
@@ -171,7 +201,7 @@ roaring_handler(PG_FUNCTION_ARGS)
     amroutine->aminsert          = roaring_insert;
     amroutine->ambulkdelete      = roaring_bulkdelete;
     amroutine->amvacuumcleanup   = roaring_vacuumcleanup;
-    amroutine->amcanreturn       = NULL;  /* no column projection from index */
+    amroutine->amcanreturn       = roaring_canreturn;  /* T65: payload projection */
     amroutine->amcostestimate    = roaring_costestimate;
     amroutine->amoptions         = NULL;
     amroutine->amproperty        = NULL;

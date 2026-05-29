@@ -21,7 +21,7 @@
  * On-disk constants
  * ---------- */
 #define ROARING_MAGIC               UINT32_C(0x524F4152)  /* "ROAR" */
-#define ROARING_INDEX_VERSION       2   /* removed inline_prefix from RoaringOverflowEntry */
+#define ROARING_INDEX_VERSION       3   /* T65: added payload directory for INCLUDE column storage */
 
 /*
  * Expected CRoaring major version stored in the metapage.  If the index was
@@ -37,6 +37,8 @@
 #define ROARING_PAGE_OVERFLOW       0x04
 #define ROARING_PAGE_PENDING_INSERT 0x05
 #define ROARING_PAGE_FREE           0x06    /* recycled page on the free list */
+#define ROARING_PAGE_PAYLOAD        0x07    /* dense int64 array for INCLUDE column values */
+#define ROARING_PAGE_PAYLOAD_DIR    0x08    /* directory of payload pages (2-level) */
 
 /* Metapage flags */
 #define ROARING_FLAG_EXACT              0x01
@@ -164,6 +166,9 @@ typedef struct RoaringMetaPageData
     /* Statistics (updated on merge) */
     uint32      total_entries;
     uint32      pending_merge_threshold;
+
+    /* T65: head of the 2-level payload directory (InvalidBlockNumber if no INCLUDE columns) */
+    BlockNumber payload_dir_head;
 } RoaringMetaPageData;
 
 #define RoaringPageGetMeta(page) \
@@ -284,6 +289,36 @@ typedef struct RoaringFreeSpecial
     uint8       _pad[3];
     BlockNumber next_free;  /* next page on free list, or InvalidBlockNumber */
 } RoaringFreeSpecial;   /* 8 bytes — fits inside any existing special area */
+
+/*
+ * T65: Payload page — dense array of int64 PK values indexed by
+ * (linear_tid % ROARING_PAYLOAD_PK_PER_PAGE).
+ * Capacity: (BLCKSZ - SizeOfPageHeaderData - special) / 8 = 1020 entries.
+ */
+typedef struct RoaringPayloadSpecial
+{
+    uint8       page_type;      /* ROARING_PAGE_PAYLOAD */
+    uint8       flags;
+    uint16      entry_count;    /* highest index written + 1 */
+    uint32      reserved;
+} RoaringPayloadSpecial;    /* 8 bytes */
+
+#define ROARING_PAYLOAD_PK_PER_PAGE     1020    /* (8192 - 24 - 8) / 8 */
+
+/*
+ * T65: Payload directory page — dense array of BlockNumbers.
+ * 2-level tree: root dir (level=1) → leaf dir (level=0) → payload pages.
+ * Capacity per dir page: (BLCKSZ - SizeOfPageHeaderData - special) / 4 = 2040 entries.
+ */
+typedef struct RoaringPayloadDirSpecial
+{
+    uint8       page_type;      /* ROARING_PAGE_PAYLOAD_DIR */
+    uint8       level;          /* 1 = root, 0 = leaf */
+    uint16      entry_count;    /* number of populated entries */
+    uint32      reserved;
+} RoaringPayloadDirSpecial; /* 8 bytes */
+
+#define ROARING_PAYLOAD_DIR_ENTRIES_PER_PAGE    2040    /* (8192 - 24 - 8) / 4 */
 
 /* ----------
  * Inline helpers
@@ -409,6 +444,7 @@ extern roaring_bitmap_t *roaring_read_overflow_bitmap_lossy(
  */
 extern int32  roaring_datum_to_key32(Datum d, Oid typid);
 extern int64  roaring_datum_to_key64(Datum d, Oid typid);
+extern bool   roaring_pending_visible(TransactionId xmin, Snapshot snapshot);
 
 /* roaring_vacuum.c — also called from roaring_insert for back-pressure */
 extern void roaring_merge_pending(Relation index);
@@ -446,6 +482,11 @@ extern int64 roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern int64 roaring_getbitmap_lossy(IndexScanDesc scan, TIDBitmap *tbm);
 extern bool  roaring_gettuple(IndexScanDesc scan, ScanDirection dir);
 extern void  roaring_endscan(IndexScanDesc scan);
+extern int64 roaring_count_key_exact(Relation index, BlockNumber root_blkno,
+                                     const int64 *keys, int nkeys,
+                                     const BlockNumber *insert_heads,
+                                     const BlockNumber *merging_heads,
+                                     Snapshot snapshot);
 
 /* roaring_vacuum.c */
 extern IndexBulkDeleteResult *roaring_bulkdelete(IndexVacuumInfo *info,
@@ -474,6 +515,13 @@ extern bool roaring_validate(Oid opclassoid);
 
 /* GUC: roaring.pending_merge_threshold (defined in pg_roaring_index.c) */
 extern int roaring_pending_merge_threshold_guc;
+
+/* roaring_payload.c */
+extern void  roaring_payload_insert(Relation index, uint64 linear_tid, int64 pk);
+extern int64 roaring_payload_fetch(Relation index, uint64 linear_tid);
+
+/* roaring_customscan.c */
+extern void roaring_customscan_init(void);
 
 /* roaring_stats.c */
 extern Datum roaring_index_stats(struct FunctionCallInfoBaseData *fcinfo);

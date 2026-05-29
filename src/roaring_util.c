@@ -1,8 +1,12 @@
 #include "pg_roaring_index.h"
 
+#include "access/transam.h"
+#include "access/xact.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_type_d.h"
+#include "storage/procarray.h"
 #include "utils/lsyscache.h"
+#include "utils/snapmgr.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "utils/builtins.h"
@@ -487,4 +491,29 @@ roaring_read_overflow_bitmap_lossy(Relation index, const RoaringOverflowEntry *o
 	bm = roaring_bitmap_portable_deserialize_safe(buf, total_len);
 	pfree(buf);
 	return bm;
+}
+
+/*
+ * roaring_pending_visible
+ *
+ * Scan-side MVCC visibility check for a pending entry.  Uses the full
+ * snapshot protocol so the answer tracks the query's exact snapshot,
+ * including in-progress transactions excluded by the snapshot.
+ */
+bool
+roaring_pending_visible(TransactionId xmin, Snapshot snapshot)
+{
+	if (!TransactionIdIsValid(xmin))
+		return false;
+	if (!TransactionIdIsNormal(xmin))
+		return true;	/* frozen / bootstrap xids are always visible */
+	if (TransactionIdIsCurrentTransactionId(xmin))
+		return true;
+	if (XidInMVCCSnapshot(xmin, snapshot))
+		return false;
+	if (TransactionIdDidAbort(xmin))
+		return false;
+	if (TransactionIdIsInProgress(xmin))
+		return false;
+	return TransactionIdDidCommit(xmin);
 }

@@ -318,11 +318,12 @@ roaring_insert_multicolumn(Relation index, Datum *values, bool *isnull,
 						   uint64 linear_tid, TransactionId xmin)
 {
 	RoaringPendingEntry entry;
+	int					nkeys = index->rd_index->indnkeyatts;
 	int					i;
 
 	memset(&entry, 0, sizeof(entry));
 
-	for (i = 0; i < index->rd_att->natts; i++)
+	for (i = 0; i < nkeys; i++)
 	{
 		Oid typid = TupleDescAttr(index->rd_att, i)->atttypid;
 
@@ -349,6 +350,7 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 			   struct IndexInfo *indexInfo)
 {
 	RoaringPendingEntry entry;
+	int					nkeys = index->rd_index->indnkeyatts;
 
 	memset(&entry, 0, sizeof(entry));
 
@@ -359,10 +361,14 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 	if (indexUnchanged)
 		return false;
 
-	if (index->rd_att->natts > 1)
+	if (nkeys > 1)
 	{
-		uint64		  linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
-								 (uint64)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
+		uint64 linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
+							(uint64)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
+
+		/* T65: write INCLUDE column payload before the pending entries. */
+		if (index->rd_att->natts > nkeys && !isnull[nkeys])
+			roaring_payload_insert(index, linear_tid, DatumGetInt64(values[nkeys]));
 
 		roaring_insert_multicolumn(index, values, isnull, linear_tid,
 								   GetCurrentTransactionId());
@@ -370,15 +376,21 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 	}
 
 	{
+		uint64 linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
+							(uint64)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
 		Oid typid = TupleDescAttr(index->rd_att, 0)->atttypid;
 
 		if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[0])))
 			return false;
-		entry.value = roaring_datum_to_key64(values[0], typid);
+
+		/* T65: write INCLUDE column payload before the pending entry. */
+		if (index->rd_att->natts > nkeys && !isnull[nkeys])
+			roaring_payload_insert(index, linear_tid, DatumGetInt64(values[nkeys]));
+
+		entry.value      = roaring_datum_to_key64(values[0], typid);
+		entry.linear_tid = linear_tid;
+		entry.xmin       = GetCurrentTransactionId();
 	}
-	entry.linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
-					   (uint64)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
-	entry.xmin       = GetCurrentTransactionId();
 
 	roaring_pending_append(index, &entry);
 	return false;	/* this AM does not support unique indexes */
@@ -399,6 +411,7 @@ roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
 					 struct IndexInfo *indexInfo)
 {
 	RoaringPendingEntry entry;
+	int					nkeys = index->rd_index->indnkeyatts;
 
 	memset(&entry, 0, sizeof(entry));
 
@@ -408,7 +421,7 @@ roaring_insert_lossy(Relation index, Datum *values, bool *isnull,
 	if (indexUnchanged)
 		return false;
 
-	if (index->rd_att->natts > 1)
+	if (nkeys > 1)
 	{
 		roaring_insert_multicolumn(index, values, isnull,
 								   (uint64) ItemPointerGetBlockNumber(ht_ctid),
