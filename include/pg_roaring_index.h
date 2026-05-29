@@ -463,6 +463,11 @@ extern int64 roaring_count_key_exact(Relation index, BlockNumber root_blkno,
                                      const BlockNumber *insert_heads,
                                      const BlockNumber *merging_heads,
                                      Snapshot snapshot);
+extern roaring64_bitmap_t *roaring_build_bitmap_exact(Relation index, BlockNumber root_blkno,
+                                                      const int64 *keys, int nkeys,
+                                                      const BlockNumber *insert_heads,
+                                                      const BlockNumber *merging_heads,
+                                                      Snapshot snapshot);
 
 /* roaring_vacuum.c */
 extern IndexBulkDeleteResult *roaring_bulkdelete(IndexVacuumInfo *info,

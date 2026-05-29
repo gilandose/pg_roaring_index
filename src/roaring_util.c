@@ -331,9 +331,10 @@ roaring_write_overflow_chain(Relation index,
 	size_t		chain_len   = total_len;
 	Size		cap			= ROARING_OVERFLOW_PAGE_CAP;
 	int			npages, i;
-	Buffer	   *bufs;
-	BlockNumber *blknos;
-	BlockNumber first;
+	Buffer	    bufs[32];
+	BlockNumber blknos[32];
+	int         nbufs = 0;
+	BlockNumber first = InvalidBlockNumber;
 
 	if (chain_len == 0)
 		return InvalidBlockNumber;
@@ -345,30 +346,26 @@ roaring_write_overflow_chain(Relation index,
 				 errdetail("Bitmap size %zu bytes exceeds MaxAllocSize.", chain_len)));
 
 	npages = (int)((chain_len + cap - 1) / cap);
-	bufs   = palloc(npages * sizeof(Buffer));
-	blknos = palloc(npages * sizeof(BlockNumber));
 
 	for (i = 0; i < npages; i++)
 	{
-		bufs[i]   = roaring_extend_page(index);
-		blknos[i] = BufferGetBlockNumber(bufs[i]);
-	}
-
-	/* Initialise all overflow pages (no WAL yet). */
-	for (i = 0; i < npages; i++)
-	{
-		Page					p   = BufferGetPage(bufs[i]);
+		Buffer buf = roaring_extend_page(index);
+		BlockNumber blkno = BufferGetBlockNumber(buf);
+		Page p = BufferGetPage(buf);
 		RoaringOverflowSpecial *spc;
-		char				   *dp;
-		size_t					co  = (size_t)i * cap;
-		size_t					cl  = Min(cap, chain_len - co);
+		size_t co = (size_t)i * cap;
+		size_t cl = Min(cap, chain_len - co);
+		char *dp;
+
+		if (i == 0)
+			first = blkno;
 
 		PageInit(p, BLCKSZ, sizeof(RoaringOverflowSpecial));
 		spc				= (RoaringOverflowSpecial *) PageGetSpecialPointer(p);
 		spc->page_type  = ROARING_PAGE_OVERFLOW;
 		spc->flags		= 0;
 		spc->sequence	= (uint16) i;
-		spc->next_page	= (i + 1 < npages) ? blknos[i + 1] : InvalidBlockNumber;
+		spc->next_page	= InvalidBlockNumber;
 		spc->owner_page = InvalidBlockNumber;
 
 		dp = PageGetContents(p);
@@ -376,32 +373,64 @@ roaring_write_overflow_chain(Relation index,
 		((PageHeader) p)->pd_lower =
 			(LocationIndex)(MAXALIGN(SizeOfPageHeaderData) + cl);
 
-		MarkBufferDirty(bufs[i]);
+		MarkBufferDirty(buf);
+
+		if (nbufs > 0)
+		{
+			Page prev_p = BufferGetPage(bufs[nbufs - 1]);
+			RoaringOverflowSpecial *prev_spc = (RoaringOverflowSpecial *) PageGetSpecialPointer(prev_p);
+			prev_spc->next_page = blkno;
+		}
+
+		bufs[nbufs] = buf;
+		blknos[nbufs] = blkno;
+		nbufs++;
+
+		if (nbufs == 32 && i < npages - 1)
+		{
+			if (RelationNeedsWAL(index))
+			{
+				Page *pages = (Page *) palloc((nbufs - 1) * sizeof(Page));
+				int j;
+				for (j = 0; j < nbufs - 1; j++)
+					pages[j] = BufferGetPage(bufs[j]);
+				log_newpages(&index->rd_locator, MAIN_FORKNUM,
+							 nbufs - 1, blknos, pages, true);
+				pfree(pages);
+			}
+
+			{
+				int j;
+				for (j = 0; j < nbufs - 1; j++)
+					UnlockReleaseBuffer(bufs[j]);
+			}
+
+			bufs[0] = bufs[nbufs - 1];
+			blknos[0] = blknos[nbufs - 1];
+			nbufs = 1;
+		}
 	}
 
-	/*
-	 * WAL-log the entire chain as one record instead of one record per page.
-	 * For a 50-page overflow chain this collapses 50 log_newpage_buffer calls
-	 * into a single log_newpages call.
-	 */
-	if (RelationNeedsWAL(index))
+	if (nbufs > 0)
 	{
-		Page *pages = (Page *) palloc(npages * sizeof(Page));
+		if (RelationNeedsWAL(index))
+		{
+			Page *pages = (Page *) palloc(nbufs * sizeof(Page));
+			int j;
+			for (j = 0; j < nbufs; j++)
+				pages[j] = BufferGetPage(bufs[j]);
+			log_newpages(&index->rd_locator, MAIN_FORKNUM,
+						 nbufs, blknos, pages, true);
+			pfree(pages);
+		}
 
-		for (i = 0; i < npages; i++)
-			pages[i] = BufferGetPage(bufs[i]);
-
-		log_newpages(&index->rd_locator, MAIN_FORKNUM,
-					 npages, blknos, pages, true);
-		pfree(pages);
+		{
+			int j;
+			for (j = 0; j < nbufs; j++)
+				UnlockReleaseBuffer(bufs[j]);
+		}
 	}
 
-	for (i = 0; i < npages; i++)
-		UnlockReleaseBuffer(bufs[i]);
-
-	first = blknos[0];
-	pfree(bufs);
-	pfree(blknos);
 	return first;
 }
 

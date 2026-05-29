@@ -46,12 +46,18 @@
 /* ----------------------------------------------------------------
  * Private state stored per-scan
  * ---------------------------------------------------------------- */
+typedef struct RoaringQual
+{
+	int			nkeys;
+	int64	   *keys;
+} RoaringQual;
+
 typedef struct RoaringCountState
 {
 	CustomScanState css;
 	Oid			indexoid;
-	int64	   *keys;		/* sorted array of int64 roaring keys */
-	int			nkeys;
+	RoaringQual *quals;
+	int			nquals;
 	bool		done;
 } RoaringCountState;
 
@@ -202,7 +208,7 @@ extract_const_keys(Node *clause, IndexOptInfo *ii,
 		if (typid == ANYENUMOID)
 			typid = c->consttype;
 
-		key = roaring_datum_to_key64(c->constvalue, typid);
+		key = ROARING_COL_KEY(colno + 1, roaring_datum_to_key32(c->constvalue, typid));
 
 		*attno_out  = var->varattno;
 		*keys_out   = palloc(sizeof(int64));
@@ -280,7 +286,7 @@ extract_const_keys(Node *clause, IndexOptInfo *ii,
 				continue;
 			if (typid == FLOAT4OID && isnan(DatumGetFloat4(elems[i])))
 				continue;
-			keys[nkeys++] = roaring_datum_to_key64(elems[i], typid);
+			keys[nkeys++] = ROARING_COL_KEY(colno + 1, roaring_datum_to_key32(elems[i], typid));
 		}
 		pfree(elems);
 		pfree(nulls);
@@ -342,13 +348,16 @@ roaring_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	{
 		IndexOptInfo *ii     = (IndexOptInfo *) lfirst(lc);
 		ListCell	 *qlc;
+		bool		  all_ok = true;
+		RoaringQual	 *temp_quals;
+		int			  num_quals = 0;
 
 		if (ii->relam != roaring_exact_amoid)
 			continue;
-		if (ii->nkeycolumns != 1)
-			continue;	/* multi-column: intersection needed, not a sum */
 		if (ii->indpred != NIL)
 			continue;	/* partial index: predicate may exclude rows */
+
+		temp_quals = palloc(list_length(input_rel->baserestrictinfo) * sizeof(RoaringQual));
 
 		foreach(qlc, input_rel->baserestrictinfo)
 		{
@@ -359,51 +368,59 @@ roaring_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 
 			if (!extract_const_keys((Node *) ri->clause, ii,
 									&this_attno, &this_keys, &this_nkeys))
-				continue;
+			{
+				all_ok = false;
+				break;
+			}
 
-			/* Found a usable qual. */
+			temp_quals[num_quals].nkeys = this_nkeys;
+			temp_quals[num_quals].keys = this_keys;
+			num_quals++;
+		}
+
+		if (all_ok && num_quals > 0)
+		{
+			/* Found a usable index! */
 			best_ii = ii;
-			keys    = this_keys;
-			nkeys   = this_nkeys;
+			
+			/* Save into private data */
+			List *private_quals = NIL;
+			for (int q = 0; q < num_quals; q++)
+			{
+				List *key_list = NIL;
+				for (int i = 0; i < temp_quals[q].nkeys; i++)
+				{
+					key_list = lappend(key_list,
+									   makeConst(INT8OID, -1, InvalidOid,
+												 sizeof(int64),
+												 Int64GetDatum(temp_quals[q].keys[i]),
+												 false, true));
+				}
+				private_quals = lappend(private_quals, key_list);
+			}
+			
+			CustomPath *cpath = makeNode(CustomPath);
+
+			cpath->path.pathtype          = T_CustomScan;
+			cpath->path.parent            = upper_rel;
+			cpath->path.pathtarget        = upper_rel->reltarget;
+			cpath->path.param_info        = NULL;
+			cpath->path.parallel_aware    = false;
+			cpath->path.parallel_safe     = false;
+			cpath->path.parallel_workers  = 0;
+			cpath->path.rows              = 1;
+			cpath->path.startup_cost      = 0;
+			cpath->path.total_cost        = 1;	/* nearly free */
+			cpath->path.pathkeys          = NIL;
+			cpath->flags                  = 0;
+			cpath->custom_paths           = NIL;
+			cpath->custom_private         = list_make2(makeInteger(best_ii->indexoid),
+													   private_quals);
+			cpath->methods                = &roaring_count_path_methods;
+
+			add_path(upper_rel, (Path *) cpath);
 			break;
 		}
-		if (best_ii != NULL)
-			break;
-	}
-
-	if (best_ii == NULL)
-		return;
-
-	/* Build the CustomPath and add it to upper_rel. */
-	{
-		CustomPath *cpath = makeNode(CustomPath);
-		List	   *key_list = NIL;
-
-		for (int i = 0; i < nkeys; i++)
-			key_list = lappend(key_list,
-							   makeConst(INT8OID, -1, InvalidOid,
-										 sizeof(int64),
-										 Int64GetDatum(keys[i]),
-										 false, true));
-
-		cpath->path.pathtype          = T_CustomScan;
-		cpath->path.parent            = upper_rel;
-		cpath->path.pathtarget        = upper_rel->reltarget;
-		cpath->path.param_info        = NULL;
-		cpath->path.parallel_aware    = false;
-		cpath->path.parallel_safe     = false;
-		cpath->path.parallel_workers  = 0;
-		cpath->path.rows              = 1;
-		cpath->path.startup_cost      = 0;
-		cpath->path.total_cost        = 1;	/* nearly free */
-		cpath->path.pathkeys          = NIL;
-		cpath->flags                  = 0;
-		cpath->custom_paths           = NIL;
-		cpath->custom_private         = list_make2(makeInteger(best_ii->indexoid),
-												   key_list);
-		cpath->methods                = &roaring_count_path_methods;
-
-		add_path(upper_rel, (Path *) cpath);
 	}
 }
 
@@ -474,23 +491,34 @@ roaring_count_begin(CustomScanState *node, EState *estate, int eflags)
 	RoaringCountState *state = (RoaringCountState *) node;
 	CustomScan		  *cscan = (CustomScan *) node->ss.ps.plan;
 	Oid				   indexoid;
-	List			  *key_list;
+	List			  *quals_list;
 	ListCell		  *lc;
-	int				   i = 0;
+	int				   q = 0;
 
-	/* Decode custom_private: [Integer(indexoid), List(key_consts)] */
-	indexoid = (Oid) intVal(linitial(cscan->custom_private));
-	key_list = (List *) lsecond(cscan->custom_private);
+	/* Decode custom_private: [Integer(indexoid), List(List(key_consts))] */
+	indexoid   = (Oid) intVal(linitial(cscan->custom_private));
+	quals_list = (List *) lsecond(cscan->custom_private);
 
 	state->indexoid = indexoid;
-	state->nkeys    = list_length(key_list);
-	state->keys     = palloc(state->nkeys * sizeof(int64));
+	state->nquals   = list_length(quals_list);
+	state->quals    = palloc(state->nquals * sizeof(RoaringQual));
 	state->done     = false;
 
-	foreach(lc, key_list)
+	foreach(lc, quals_list)
 	{
-		Const *c = (Const *) lfirst(lc);
-		state->keys[i++] = DatumGetInt64(c->constvalue);
+		List	 *key_list = (List *) lfirst(lc);
+		ListCell *klc;
+		int		  i = 0;
+
+		state->quals[q].nkeys = list_length(key_list);
+		state->quals[q].keys  = palloc(state->quals[q].nkeys * sizeof(int64));
+
+		foreach(klc, key_list)
+		{
+			Const *c = (Const *) lfirst(klc);
+			state->quals[q].keys[i++] = DatumGetInt64(c->constvalue);
+		}
+		q++;
 	}
 }
 
@@ -676,24 +704,41 @@ roaring_count_exec(CustomScanState *node)
 				any_pending = true;
 		}
 
-		if (!any_pending)
+		if (state->nquals == 1 && !any_pending)
 		{
-			for (int i = 0; i < state->nkeys; i++)
-				total += lookup_leaf_cardinality(index, root_blkno, state->keys[i]);
+			for (int i = 0; i < state->quals[0].nkeys; i++)
+				total += lookup_leaf_cardinality(index, root_blkno, state->quals[0].keys[i]);
 		}
 		else
 		{
 			/*
-			 * Pending list exists.  A naive leaf_cardinality + pending_count
-			 * double-counts TIDs that appear in both (e.g. after REINDEX
-			 * CONCURRENTLY re-inserts rows via aminsert).  Build the actual
-			 * leaf OR pending bitmap; OR is idempotent so duplicates collapse.
+			 * We have either multiple quals (AND conditions to intersect),
+			 * or a pending list (need to deduplicate leaf and pending TIDs).
+			 * Build the exact bitmap for each qual, then AND them together.
 			 */
+			roaring64_bitmap_t *final_bitmap = NULL;
 			snapshot = GetActiveSnapshot();
-			total = roaring_count_key_exact(index, root_blkno,
-											state->keys, state->nkeys,
-											insert_heads, merging_heads,
-											snapshot);
+
+			for (int q = 0; q < state->nquals; q++)
+			{
+				roaring64_bitmap_t *q_bitmap = roaring_build_bitmap_exact(
+					index, root_blkno, state->quals[q].keys, state->quals[q].nkeys,
+					insert_heads, merging_heads, snapshot);
+
+				if (q == 0)
+					final_bitmap = q_bitmap;
+				else
+				{
+					roaring64_bitmap_and_inplace(final_bitmap, q_bitmap);
+					roaring64_bitmap_free(q_bitmap);
+				}
+			}
+
+			if (final_bitmap != NULL)
+			{
+				total = roaring64_bitmap_get_cardinality(final_bitmap);
+				roaring64_bitmap_free(final_bitmap);
+			}
 		}
 	}
 
@@ -725,8 +770,8 @@ roaring_count_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	StringInfoData	   buf;
 
 	initStringInfo(&buf);
-	appendStringInfo(&buf, "%d key%s",
-					 state->nkeys, state->nkeys == 1 ? "" : "s");
+	appendStringInfo(&buf, "%d qual%s",
+					 state->nquals, state->nquals == 1 ? "" : "s");
 	ExplainPropertyText("RoaringCount", buf.data, es);
 	pfree(buf.data);
 }

@@ -1711,3 +1711,43 @@ roaring_gettuple(IndexScanDesc scan, ScanDirection dir)
 	return true;
 }
 
+
+roaring64_bitmap_t *
+roaring_build_bitmap_exact(Relation index, BlockNumber root_blkno,
+						const int64 *keys, int nkeys,
+						const BlockNumber *insert_heads,
+						const BlockNumber *merging_heads,
+						Snapshot snapshot)
+{
+	roaring64_bitmap_t *result = roaring64_bitmap_create();
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		roaring64_bitmap_t *bm = lookup_value_as_bitmap(index, root_blkno, keys[i]);
+		int					s;
+
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			if (insert_heads[s] != InvalidBlockNumber)
+			{
+				roaring64_bitmap_t *pbm =
+					pending_chain_as_bitmap(index, insert_heads[s], keys[i], snapshot);
+
+				roaring64_bitmap_or_inplace(bm, pbm);
+				roaring64_bitmap_free(pbm);
+			}
+			if (merging_heads[s] != InvalidBlockNumber)
+			{
+				roaring64_bitmap_t *pbm =
+					pending_chain_as_bitmap(index, merging_heads[s], keys[i], snapshot);
+
+				roaring64_bitmap_or_inplace(bm, pbm);
+				roaring64_bitmap_free(pbm);
+			}
+		}
+
+		roaring64_bitmap_or_inplace(result, bm);
+		roaring64_bitmap_free(bm);
+	}
+	return result;
+}

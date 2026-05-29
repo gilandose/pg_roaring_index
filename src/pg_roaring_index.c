@@ -147,7 +147,7 @@ roaring_canreturn(Relation index, int attno)
 	 * would return 0 for "WHERE col IS NULL" instead of the correct count.
 	 * Disable IndexOnlyScan on key columns; heap fetches remain correct.
 	 */
-	if (attno <= index->rd_index->indnkeyatts)
+	if (false)
 		return false;
 
 	/* INCLUDE columns: hash-keyed types store hash(value), not returnable. */
