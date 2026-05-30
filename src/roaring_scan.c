@@ -107,6 +107,43 @@ roaring_dir_lookup(Relation index, BlockNumber dir_blkno, int64 value)
 /* ----------------------------------------------------------------
  * roaring_beginscan / roaring_rescan / roaring_endscan
  * ---------------------------------------------------------------- */
+
+/*
+ * Recheck is required only when a queried column is hash-keyed (text, uuid),
+ * which can collide.  Columns indexed but absent from this scan's WHERE clause
+ * cannot collide, so we inspect only the queried keys.
+ *
+ * This MUST run from amrescan, not ambeginscan: at ambeginscan the keyData
+ * array is allocated but its sk_attno fields are still uninitialised (the
+ * executor fills them in just before amrescan), so reading them there indexes
+ * rd_opcintype with garbage — an out-of-bounds read that segfaults.
+ */
+static void
+roaring_set_needs_recheck(IndexScanDesc scan)
+{
+	RoaringScanOpaque *so	 = (RoaringScanOpaque *) scan->opaque;
+	Relation		   rel	 = scan->indexRelation;
+	int				   nkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
+	int				   i;
+
+	so->needs_recheck = false;
+	for (i = 0; i < scan->numberOfKeys; i++)
+	{
+		int attno = scan->keyData[i].sk_attno;	/* 1-indexed index column */
+		Oid opcintype;
+
+		if (attno < 1 || attno > nkeyatts)
+			continue;	/* defensive: should never happen */
+
+		opcintype = rel->rd_opcintype[attno - 1];
+		if (opcintype == TEXTOID || opcintype == UUIDOID)
+		{
+			so->needs_recheck = true;
+			break;
+		}
+	}
+}
+
 IndexScanDesc
 roaring_beginscan(Relation rel, int nkeys, int norderbys)
 {
@@ -117,26 +154,7 @@ roaring_beginscan(Relation rel, int nkeys, int norderbys)
 
 	so				  = (RoaringScanOpaque *) palloc0(sizeof(RoaringScanOpaque));
 	so->bitmap_loaded = false;
-
-	/* Detect hash-keyed columns (text, uuid) among the queried keys only.
-	 * Columns present in the index but not in this scan's WHERE clause cannot
-	 * produce hash collisions, so recheck is unnecessary for them. */
-	so->needs_recheck = false;
-	{
-		int i;
-
-		for (i = 0; i < scan->numberOfKeys; i++)
-		{
-			int attno	   = scan->keyData[i].sk_attno;	/* 1-indexed */
-			Oid opcintype  = rel->rd_opcintype[attno - 1];
-
-			if (opcintype == TEXTOID || opcintype == UUIDOID)
-			{
-				so->needs_recheck = true;
-				break;
-			}
-		}
-	}
+	so->needs_recheck = false;	/* set in roaring_rescan, once keys are populated */
 
 	scan->opaque = so;
 	return scan;
@@ -167,6 +185,9 @@ roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		memmove(scan->keyData, keys, nkeys * sizeof(ScanKeyData));
 
 	scan->numberOfKeys = nkeys;
+
+	/* Keys are now valid — safe to inspect their attnos for hash-keyed cols. */
+	roaring_set_needs_recheck(scan);
 }
 
 void
