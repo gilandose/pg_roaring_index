@@ -105,6 +105,40 @@ RESET enable_bitmapscan;
 RESET enable_indexscan;
 
 -- ================================================================
+-- 6. count(*) WHERE col IS NULL via the per-column NULL bitmap
+--
+-- IS NULL is a positive key lookup (ROARING_NULL_COL_KEY), so RoaringCount
+-- reads the NULL bitmap's cardinality — single qual (O(1) leaf card or pending
+-- fold) and composed with equality (bitmap AND).  IS NOT NULL is the complement
+-- and is declined (no fast path), so it must NOT plan as RoaringCount.
+-- ================================================================
+CREATE TABLE t_cn (id int, v int);
+INSERT INTO t_cn SELECT g, CASE WHEN g % 4 = 0 THEN NULL ELSE g % 5 END
+                 FROM generate_series(1, 100) g;
+CREATE INDEX t_cn_idx ON t_cn USING roaring (v);
+VACUUM t_cn;                 -- merge: NULL key folded to leaf (no pending)
+INSERT INTO t_cn VALUES (101, NULL);   -- one pending NULL (forces bitmap path)
+
+SET enable_seqscan = off;
+-- Single qual: RoaringCount over the NULL key.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cn WHERE v IS NULL;
+SELECT count(*) AS isnull_cnt FROM t_cn WHERE v IS NULL;    -- 25 build + 1 pending = 26
+-- IS NOT NULL is declined: not a RoaringCount.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cn WHERE v IS NOT NULL;
+DROP TABLE t_cn;
+
+-- Multi-column: IS NULL composes with equality via bitmap AND.
+CREATE TABLE t_cn2 (id int, a int, b int);
+INSERT INTO t_cn2 SELECT g, g % 3, CASE WHEN g % 2 = 0 THEN NULL ELSE g % 7 END
+                  FROM generate_series(1, 100) g;
+CREATE INDEX t_cn2_idx ON t_cn2 USING roaring (a, b);
+VACUUM t_cn2;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cn2 WHERE a = 1 AND b IS NULL;
+SELECT count(*) AS bnull_cnt   FROM t_cn2 WHERE b IS NULL;            -- 50
+SELECT count(*) AS a1_bnull    FROM t_cn2 WHERE a = 1 AND b IS NULL;  -- 17
+DROP TABLE t_cn2;
+
+-- ================================================================
 -- Cleanup
 -- ================================================================
 RESET enable_seqscan;

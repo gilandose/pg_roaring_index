@@ -77,7 +77,6 @@ Prefer a B-tree (or BRIN / GIN) when **any** of these apply:
 - **High-cardinality / unique keys**: primary keys, emails, UUID surrogate keys —
   a B-tree is smaller and faster.
 - **Single-row OLTP point lookups that fetch the row.** Roaring is about *sets*.
-- **`IS NULL`-heavy queries.** NULLs are not indexed, so `IS NULL` uses a seqscan.
 - **64-bit / text / uuid columns as *high-cardinality* keys.** These are
   hash-encoded in multi-column keys and rely on executor recheck — fine at low
   cardinality, wasteful at high. (`int8` as a *single-column* key is lossless.)
@@ -188,8 +187,9 @@ read / write / merge protocols.
 
 ## Limitations
 
-- **Equality only** — no range, ordering, or pattern support.
-- **`IS NULL` uses a seqscan** (NULLs are not indexed).
+- **Equality only** — no range, ordering, or pattern support. (`IS NULL` and
+  `IS NOT NULL` *are* supported — each column keeps a NULL bitmap, so
+  `WHERE a = 5 AND b IS NULL` composes as a bitmap intersection.)
 - **Hash-encoded keys** (`text`, `uuid`, multi-column `int8`) rely on executor
   recheck for exactness — extra heap work at high cardinality.
 - **Lossless multi-column `int8`** and a couple of correctness edges (e.g.

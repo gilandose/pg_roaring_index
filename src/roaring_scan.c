@@ -1092,6 +1092,45 @@ roaring_count_key_exact(Relation index, BlockNumber root_blkno,
  * Shared by roaring_getbitmap (BitmapIndexScan) and roaring_gettuple
  * (IndexScan / IndexOnlyScan).
  * ---------------------------------------------------------------- */
+/*
+ * null_key_bitmap
+ *
+ * Bitmap of TIDs whose column `attno` is NULL: the persisted NULL-key leaf
+ * bitmap OR'd with visible pending entries under the same key.  Answers
+ * "col IS NULL" directly, and "col IS NOT NULL" when complemented against the
+ * full index TID set.  Caller frees.
+ */
+static roaring64_bitmap_t *
+null_key_bitmap(Relation index, BlockNumber root_blkno, AttrNumber attno,
+				const BlockNumber *insert_heads, const BlockNumber *merging_heads,
+				bool any_pending, Snapshot snapshot)
+{
+	int64				null_key = ROARING_NULL_COL_KEY(attno);
+	roaring64_bitmap_t *bm = lookup_value_as_bitmap(index, root_blkno, null_key);
+
+	if (any_pending)
+	{
+		int s;
+
+		for (s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			roaring64_bitmap_t *pbm;
+
+			pbm = pending_chain_as_bitmap(index, insert_heads[s], null_key, snapshot);
+			roaring64_bitmap_or_inplace(bm, pbm);
+			roaring64_bitmap_free(pbm);
+
+			if (merging_heads[s] != InvalidBlockNumber)
+			{
+				pbm = pending_chain_as_bitmap(index, merging_heads[s], null_key, snapshot);
+				roaring64_bitmap_or_inplace(bm, pbm);
+				roaring64_bitmap_free(pbm);
+			}
+		}
+	}
+	return bm;
+}
+
 static roaring64_bitmap_t *
 build_scan_bitmap_exact(IndexScanDesc scan)
 {
@@ -1104,9 +1143,6 @@ build_scan_bitmap_exact(IndexScanDesc scan)
 	Snapshot             snapshot;
 
 	if (scan->numberOfKeys < 1)
-		return NULL;
-
-	if (scan->keyData[0].sk_flags & SK_ISNULL)
 		return NULL;
 
 	/* ---- Read metapage (or use rd_amcache). ---- */
@@ -1249,9 +1285,27 @@ build_scan_bitmap_exact(IndexScanDesc scan)
 				ScanKey k = &scan->keyData[order[ki].ki];
 
 				if (k->sk_flags & SK_ISNULL)
-					continue;
+				{
+					/* IS NULL → the column's NULL bitmap; IS NOT NULL → all
+					 * indexed TIDs minus that NULL bitmap.  Either way col_bm
+					 * flows into the same intersection below. */
+					if (k->sk_flags & SK_SEARCHNULL)
+						col_bm = null_key_bitmap(index, root_blkno, k->sk_attno,
+												 insert_heads, merging_heads,
+												 any_pending, snapshot);
+					else
+					{
+						roaring64_bitmap_t *nb =
+							null_key_bitmap(index, root_blkno, k->sk_attno,
+											insert_heads, merging_heads,
+											any_pending, snapshot);
 
-				if (k->sk_flags & SK_SEARCHARRAY)
+						col_bm = build_scan_bitmap_all(scan);
+						roaring64_bitmap_andnot_inplace(col_bm, nb);
+						roaring64_bitmap_free(nb);
+					}
+				}
+				else if (k->sk_flags & SK_SEARCHARRAY)
 				{
 					Oid		   col_typid = TupleDescAttr(index->rd_att,
 														 k->sk_attno - 1)->atttypid;
@@ -1568,6 +1622,23 @@ build_scan_bitmap_exact(IndexScanDesc scan)
 		{
 			roaring64_bitmap_t * volatile bm = NULL;
 			int64 scan_value;
+
+			if (key->sk_flags & SK_ISNULL)
+			{
+				/* IS NULL → NULL bitmap; IS NOT NULL → all indexed minus NULL. */
+				roaring64_bitmap_t *nb =
+					null_key_bitmap(index, root_blkno, key->sk_attno,
+									insert_heads, merging_heads,
+									any_pending, snapshot);
+
+				if (key->sk_flags & SK_SEARCHNULL)
+					return nb;
+
+				bm = build_scan_bitmap_all(scan);
+				roaring64_bitmap_andnot_inplace(bm, nb);
+				roaring64_bitmap_free(nb);
+				return (roaring64_bitmap_t *) bm;
+			}
 
 			if (atttypid == FLOAT4OID && isnan(DatumGetFloat4(key->sk_argument)))
 				return NULL;

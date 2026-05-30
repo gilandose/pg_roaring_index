@@ -89,7 +89,11 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 			int64	value;
 
 			if (isnull[i])
+			{
+				/* Record the TID under this column's NULL key. */
+				build_emit(bstate, ROARING_NULL_COL_KEY(i + 1), linear_tid);
 				continue;
+			}
 
 			if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
 				continue;			/* NaN is not equality-indexable */
@@ -113,13 +117,14 @@ roaring_build_callback(Relation index, ItemPointer tid, Datum *values,
 			(uint64)(ItemPointerGetOffsetNumber(tid) - 1);
 		int64 value;
 
-		if (isnull[0])
-			return;
-
-		if (bstate->atttypid == FLOAT4OID && isnan(DatumGetFloat4(values[0])))
+		if (!isnull[0] && bstate->atttypid == FLOAT4OID &&
+			isnan(DatumGetFloat4(values[0])))
 			return;					/* NaN is not equality-indexable */
 
-		value = roaring_datum_to_key64(values[0], bstate->atttypid);
+		/* NULL rows are recorded under the column's NULL key. */
+		value = isnull[0]
+			? ROARING_NULL_COL_KEY(1)
+			: roaring_datum_to_key64(values[0], bstate->atttypid);
 
 		build_emit(bstate, value, linear_tid);
 

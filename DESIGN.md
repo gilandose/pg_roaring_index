@@ -163,6 +163,15 @@ keyspace whose values are column-tagged — and the scan intersects them.
 > A lossless multi-column `int8` key (per-column directories / covering store) is
 > on the roadmap; see `TODO.md`.
 
+**NULL bitmaps.** Rows whose column is NULL are recorded under a dedicated
+per-column key `NULL_COL_KEY(attno) = ((attno | 0x8000_0000) << 32)`, which sets
+the high attno-bit so NULL keys sort into the **negative** end of the int64 key
+space, disjoint from the (positive) value keys. `amsearchnulls` is therefore
+true: `col IS NULL` reads that bitmap directly (and intersects with other quals,
+e.g. `a = x AND b IS NULL`); `col IS NOT NULL` is the full index TID set with the
+NULL bitmap removed. Because a NULL key is just another key, it flows through the
+same leaf/overflow/pending/merge machinery — no separate structure.
+
 ---
 
 ## Write path

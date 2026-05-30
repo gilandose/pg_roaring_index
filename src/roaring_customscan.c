@@ -149,9 +149,10 @@ is_count_star(PlannerInfo *root)
 /*
  * extract_const_keys - try to extract int64 roaring keys from a qual clause.
  *
- * Handles two forms:
+ * Handles three forms:
  *   OpExpr(Var = Const)           → single key
  *   ScalarArrayOpExpr(Var = ANY(ArrayExpr of Consts))  → key list
+ *   NullTest(Var IS NULL)         → single per-column NULL key
  *
  * Returns a palloc'd array via *keys_out / *nkeys_out, or false on failure.
  * The Var's varattno (1-based) is returned in *attno_out.
@@ -318,6 +319,57 @@ extract_const_keys(Node *clause, IndexOptInfo *ii,
 		*attno_out = var->varattno;
 		*keys_out  = keys;
 		*nkeys_out = nkeys;
+		return true;
+	}
+
+	if (IsA(clause, NullTest))
+	{
+		NullTest *nt = (NullTest *) clause;
+		Node	 *arg;
+		Var		 *var;
+		int		  colno;
+
+		/*
+		 * Only "col IS NULL" is a positive key lookup against the per-column
+		 * NULL bitmap (ROARING_NULL_COL_KEY).  "col IS NOT NULL" is the
+		 * complement (all rows andnot the NULL set), which the key-array count
+		 * model cannot express, so we decline it and let a regular scan answer.
+		 * Row-typed IS NULL (argisrow) has SQL semantics we do not index.
+		 */
+		if (nt->nulltesttype != IS_NULL || nt->argisrow)
+			return false;
+
+		arg = (Node *) nt->arg;
+		/* A binary-compatible cast may wrap the column reference. */
+		while (IsA(arg, RelabelType))
+			arg = (Node *) ((RelabelType *) arg)->arg;
+		if (!IsA(arg, Var))
+			return false;
+		var = (Var *) arg;
+
+		/* Match Var to an index key column (indexkeys are 1-based attno). */
+		colno = -1;
+		for (int k = 0; k < ii->nkeycolumns; k++)
+		{
+			if (ii->indexkeys[k] == var->varattno)
+			{
+				colno = k;
+				break;
+			}
+		}
+		if (colno < 0)
+			return false;
+
+		/*
+		 * NULL-ness is exact for every column type — it does not depend on the
+		 * value encoding — so this path is valid even for hash-keyed
+		 * (text/uuid/multi-column int8) columns, unlike the equality paths above.
+		 * The key matches the one the write path records for NULL rows.
+		 */
+		*attno_out     = var->varattno;
+		*keys_out      = palloc(sizeof(int64));
+		(*keys_out)[0] = ROARING_NULL_COL_KEY(colno + 1);
+		*nkeys_out     = 1;
 		return true;
 	}
 

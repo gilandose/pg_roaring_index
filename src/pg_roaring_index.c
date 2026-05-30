@@ -196,7 +196,7 @@ roaring_handler(PG_FUNCTION_ARGS)
     amroutine->amcanmulticol  = true;
     amroutine->amoptionalkey  = true;   /* any column subset is valid */
     amroutine->amsearcharray  = true;
-    amroutine->amsearchnulls  = false;
+    amroutine->amsearchnulls  = true;   /* IS NULL / IS NOT NULL via NULL bitmaps */
     amroutine->amstorage      = false;
     amroutine->amclusterable  = false;
     amroutine->ampredlocks    = false;

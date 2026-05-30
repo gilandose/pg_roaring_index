@@ -16,7 +16,7 @@ OBJS = \
 
 EXTENSION = pg_roaring_index
 DATA      = pg_roaring_index--1.0.sql
-REGRESS   = roaring_basic roaring_multicolumn roaring_types roaring_text roaring_stats roaring_check roaring_customscan roaring_include
+REGRESS   = roaring_basic roaring_multicolumn roaring_types roaring_text roaring_stats roaring_check roaring_customscan roaring_include roaring_null
 
 PG_CPPFLAGS = -Iinclude -Isrc/vendor/croaring -DUSE_CROARING
 

@@ -329,11 +329,12 @@ roaring_insert_multicolumn(Relation index, Datum *values, bool *isnull,
 		Oid typid = TupleDescAttr(index->rd_att, i)->atttypid;
 
 		if (isnull[i])
+			entry.value = ROARING_NULL_COL_KEY(i + 1);	/* record under NULL key */
+		else if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
 			continue;
-		if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[i])))
-			continue;
-		entry.value      = ROARING_COL_KEY(i + 1,
-										   roaring_datum_to_key32(values[i], typid));
+		else
+			entry.value = ROARING_COL_KEY(i + 1,
+										  roaring_datum_to_key32(values[i], typid));
 		entry.linear_tid = linear_tid;
 		entry.xmin       = xmin;
 		roaring_pending_append(index, &entry);
@@ -355,9 +356,6 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 
 	memset(&entry, 0, sizeof(entry));
 
-	if (isnull[0])
-		return false;
-
 	if (nkeys > 1)
 	{
 		uint64 linear_tid = ((uint64) ItemPointerGetBlockNumber(ht_ctid) << 9) |
@@ -377,14 +375,17 @@ roaring_insert(Relation index, Datum *values, bool *isnull,
 							(uint64)(ItemPointerGetOffsetNumber(ht_ctid) - 1);
 		Oid typid = TupleDescAttr(index->rd_att, 0)->atttypid;
 
-		if (typid == FLOAT4OID && isnan(DatumGetFloat4(values[0])))
+		if (!isnull[0] && typid == FLOAT4OID && isnan(DatumGetFloat4(values[0])))
 			return false;
 
 		/* T65: write INCLUDE column payload before the pending entry. */
 		if (index->rd_att->natts > nkeys && !isnull[nkeys])
 			roaring_payload_insert(index, linear_tid, DatumGetInt64(values[nkeys]));
 
-		entry.value      = roaring_datum_to_key64(values[0], typid);
+		/* NULL rows are recorded under the column's NULL key. */
+		entry.value      = isnull[0]
+			? ROARING_NULL_COL_KEY(1)
+			: roaring_datum_to_key64(values[0], typid);
 		entry.linear_tid = linear_tid;
 		entry.xmin       = GetCurrentTransactionId();
 	}

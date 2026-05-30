@@ -119,6 +119,18 @@
 #define ROARING_COL_KEY_RANGE_HI(attno) \
     (((int64)(attno) << 32) | INT64_C(0x00000000FFFFFFFF))
 
+/*
+ * NULL bitmap key.  Rows whose indexed column is NULL are recorded under a
+ * dedicated per-column key so that "col IS NULL" can be answered by the index
+ * (and intersected with other quals).  The high attno-bit is set so NULL keys
+ * occupy the negative end of the int64 key space, disjoint from value keys
+ * (whose attno is 1..INDEX_MAX_KEYS, giving positive keys).  Single-column
+ * indexes use attno = 1; their raw int8 value space is the only place a one-in-
+ * 2^64 collision with the sentinel is possible — documented in TODO.md.
+ */
+#define ROARING_NULL_COL_KEY(attno) \
+    ((int64)(((uint64)(uint32)(attno) | UINT64_C(0x80000000)) << 32))
+
 /* Fixed block number for the metapage */
 #define ROARING_METAPAGE_BLKNO          0
 
