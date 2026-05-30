@@ -9,3 +9,16 @@ tmp_check/
 src/vendor/croaring/roaring.c
 src/vendor/croaring/roaring.h
 vaults/
+
+# OS / editor cruft
+.DS_Store
+
+# Large local benchmark datasets — never commit these
+/hits_*.tsv
+/clickbench_create.sql
+
+# Regression / benchmark scratch output
+/regression.diffs
+/regression.out
+/bench_out.txt
+/bench_*_dashboard.html

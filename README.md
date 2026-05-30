@@ -1,170 +1,218 @@
 # pg_roaring_index
 
-A native PostgreSQL [Index Access Method](https://www.postgresql.org/docs/current/indexam.html) that stores [roaring bitmaps](https://roaringbitmap.org/) per distinct value. Designed for equality lookups on moderate-cardinality columns in tables with high DELETE+INSERT churn and uncorrelated physical layout.
+A PostgreSQL [index access method](https://www.postgresql.org/docs/current/indexam.html)
+that stores a **[Roaring bitmap](https://roaringbitmap.org/)** of row locations
+for each distinct value of an indexed column. It is built for **equality filters
+on low‑to‑moderate cardinality columns** — the categorical, foreign‑key,
+status‑flag, tenant‑id, and device/region/OS style columns that B‑trees index
+poorly and that dominate analytical filtering on transactional tables.
+
+Its headline capability is a **custom `count(*)` path** that answers
+`count(*) … WHERE a = x AND b = y` by intersecting bitmaps and reading their
+cardinalities — without scanning matching rows or touching the heap.
+
+```sql
+CREATE EXTENSION pg_roaring_index;
+
+CREATE INDEX ON events USING roaring (tenant_id, event_type, country, device);
+
+-- Counted by intersecting bitmaps: no heap access, order-independent.
+SELECT count(*) FROM events
+ WHERE country = 'GB' AND device = 'mobile';
+```
+
+> Status: research-quality / pre-1.0. Exact (TID-level) mode, `roaring64`
+> bitmaps, fully WAL-logged via `generic_xlog`. See [Limitations](#limitations).
 
 ---
 
 ## The problem it solves
 
-Consider a table with 20 columns — `status`, `region`, `tier`, `category`, etc. — each with 10–10 000 distinct values. Your queries filter on arbitrary subsets:
+Consider a wide table — `status`, `region`, `tier`, `category`, `device`, … —
+each column with tens to thousands of distinct values, queried on arbitrary
+subsets:
 
 ```sql
 WHERE region = 'eu-west' AND tier = 'pro' AND category = 'analytics'
 WHERE status = 'active' AND region = 'us-east'
-WHERE tier = 'free' AND category = 'storage' AND status = 'trial'
+WHERE tier   = 'free'   AND category = 'storage'
 ```
 
-You can't pre-build a composite btree for every combination. With single-column btrees, PostgreSQL's `BitmapAnd` node handles the intersection — but each btree scan must walk O(rows / ndistinct) leaf pages to collect TIDs before the intersection even starts. At ndistinct=100 with 1M rows, that's ~20 leaf pages per column per query.
+You can't pre-build a composite B-tree for every combination, and a multi-column
+B-tree only seeks efficiently when its **leading** columns are constrained. With
+single-column B-trees, each scan still walks `O(rows / ndistinct)` leaf pages to
+collect TIDs before the intersection starts.
 
-A roaring index stores the entire TID set for each value as a serialised bitmap. Fetching it is one page read regardless of how many rows match. `BitmapAnd` of three roaring indexes costs three page reads total.
+A roaring index stores the entire TID set for a value as one serialized bitmap.
+Fetching it is one directory lookup plus a page read, regardless of how many rows
+match — and **any subset of the indexed columns can be constrained**, in any
+order. For `count(*)`, it never materializes the rows at all.
+
+---
+
+## When to use it
+
+Reach for `pg_roaring_index` when **most** of these hold:
+
+- **Equality / `IN` predicates** (`=`, `IN (...)`), not ranges.
+- **Low-to-moderate cardinality** columns (a handful to a few million distinct
+  values): country, status, category, tenant, device, OS, ad/engine id, flags.
+- **`count(*)` and aggregate-heavy** workloads — where it shines (often 10×–1000×
+  faster than B-tree; see [Benchmarks](#benchmarks)).
+- **Multi-column AND filters where the column order varies.** Roaring is
+  **order-independent**; a B-tree lives or dies by whether the query matches its
+  key order.
+- **High write churn.** Inserts land in an MVCC-aware, sharded pending list and
+  merge into the bitmaps in batches (GIN-style) — no per-row bitmap rewrites, no
+  page splits under load.
+- You want compact indexes: a 20-column index over 100M rows was **6.3 GB vs the
+  equivalent B-tree's 11 GB**.
+
+## When *not* to use it
+
+Prefer a B-tree (or BRIN / GIN) when **any** of these apply:
+
+- **Range, ordering, or pattern queries**: `<`, `>`, `BETWEEN`, `ORDER BY`,
+  `LIKE 'foo%'`, merge joins. Roaring answers equality only and returns no order.
+- **High-cardinality / unique keys**: primary keys, emails, UUID surrogate keys —
+  a B-tree is smaller and faster.
+- **Single-row OLTP point lookups that fetch the row.** Roaring is about *sets*.
+- **`IS NULL`-heavy queries.** NULLs are not indexed, so `IS NULL` uses a seqscan.
+- **64-bit / text / uuid columns as *high-cardinality* keys.** These are
+  hash-encoded in multi-column keys and rely on executor recheck — fine at low
+  cardinality, wasteful at high. (`int8` as a *single-column* key is lossless.)
+
+## Supported key types
+
+Default operator classes (equality `=`) cover:
+
+`int2` · `int4` · `int8` · `bool` · `date` · `float4` · `oid` · `enum` · `text` · `uuid`
+
+`text`, `uuid`, and multi-column `int8` are **hash-encoded** with executor
+recheck for exactness. An `INCLUDE` column may carry an `int8` payload for
+index-only projection (e.g. `SELECT sum(id) … WHERE …`).
 
 ---
 
 ## Quick start
 
+**Prerequisites** (macOS / Homebrew shown; Linux is analogous):
+
+```sh
+brew install postgresql@18
+export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
+
+# Vendored CRoaring amalgamation (one-time; gitignored)
+bash scripts/fetch-croaring.sh
+```
+
+**Build, install, test:**
+
+```sh
+make
+make install            # into $(pg_config --pkglibdir)
+make installcheck       # 8/8 regression tests (needs a running cluster)
+```
+
+Or run it containerized:
+
+```sh
+cd docker && docker compose up -d   # PostgreSQL 18 with the extension installed
+```
+
+**Use it:**
+
 ```sql
 CREATE EXTENSION pg_roaring_index;
 
--- Exact mode: TID-level precision
-CREATE INDEX ON events USING roaring (status);
-CREATE INDEX ON events USING roaring (region);
-CREATE INDEX ON events USING roaring (tier);
+-- single column
+CREATE INDEX ON hits USING roaring (os);
 
--- Any combination now resolves via BitmapAnd
-SELECT * FROM events WHERE status = 'active' AND region = 'eu-west' AND tier = 'pro';
+-- multi-column + INCLUDE payload (index-only sum projection)
+CREATE INDEX ON hits USING roaring (region, os, device) INCLUDE (id);
+
+SELECT count(*) FROM hits WHERE os = 2;                     -- RoaringCount path
+SELECT count(*) FROM hits WHERE region = 5 AND device = 1;  -- bitmap AND
+SELECT sum(id)  FROM hits WHERE os = 2;                     -- index-only
 ```
-
-No configuration needed. Works with `IN()`, `= ANY()`, and multi-column `BitmapAnd` automatically.
-
----
-
-## Two modes
-
-| Mode | `USING` | Granularity | Recheck | Best for |
-|---|---|---|---|---|
-| Exact | `roaring` | TID | No | Medium cardinality, write churn, multi-column AND |
-| Lossy | `roaring_lossy` | Page | Yes | Very low cardinality, smallest possible footprint |
-
-Lossy mode stores block numbers instead of individual TIDs. Each matched page is rechecked by the executor — correct, but trades CPU for dramatically smaller indexes (1–12% of btree size at ndistinct ≤ 100).
-
-```sql
--- Lossy: smallest indexes, executor rechecks each matched page
-CREATE INDEX ON events USING roaring_lossy (status);
-```
-
-Both modes support `int8` and `int4` columns and cross-type `int8 = int4` comparisons.
 
 ---
 
 ## Benchmarks
 
-All results: PostgreSQL 18, 1M rows, macOS/aarch64, 20s pgbench runs.
+100M-row [ClickBench `hits`](https://github.com/ClickHouse/ClickBench) dataset, a
+20-column roaring index vs an equivalent 20-column B-tree, single-threaded, warm
+cache. Methodology and a re-runnable harness:
+[`bench/README_bench_100m.md`](bench/README_bench_100m.md).
 
-### Multi-column AND  (`WHERE c1 = X AND c2 = Y AND c3 = Z`, ndistinct = 100)
+**`count(*)` — roaring's strength.** It intersects bitmaps and reads
+cardinalities, so it is nearly flat in result size and independent of column
+order:
 
-This is the primary use case. `comp_bt` is a composite btree on `(c1, c2, c3)` — the best-case pre-planned index that requires knowing the query shape in advance. The other three scenarios require no advance planning and cover any column combination.
+| Predicate | Rows | Roaring | B-tree | Speedup |
+|---|---:|---:|---:|---:|
+| `os = 2` (non-leading column) | 27.0M | **56 ms** | 4,229 ms | **~75×** |
+| `searchengineid=3 AND sex=1 AND ismobile=1` | 154k | **203 ms** | 658 ms | 3.2× |
+| `urlcategoryid = 9911` (deepest column) | 4.6M | **3.5 ms** | 7,237 ms | **~2000×** |
+| `searchengineid IN (2,3,4)` | 13.8M | **120 ms** | 9,638 ms | 80× |
+| `regionid=2 AND os=2 AND sex=2` (leading prefix) | 590k | 195 ms | **63 ms** | B-tree 3× |
 
-```
-scenario              index size (3×)   vs 3×btree      TPS
-────────────────────────────────────────────────────────────
-comp_bt(c1,c2,c3)            30 MB      — (baseline)   14801   ← oracle: knows query shape
-3×btree                      20 MB            100%      1231   ← flexible, slow
-3×roaring                  6296 kB             30%      1397   ← flexible, 14% faster, 70% smaller
-3×roaring_lossy             976 kB              4%      6920   ← flexible, 5.6× faster, 96% smaller
-```
+The pattern: **B-tree's speed swings ~100× with whether the predicate matches its
+key order; roaring is order-indifferent.** B-tree still wins when it can seek a
+tight contiguous *leading* prefix.
 
-`roaring_lossy` reaches **47% of the composite btree's throughput** using **independent single-column indexes** and **4% of the btree index space**. On a 20-column table: 20× btree (single-column) ≈ 134 MB; 20× roaring_lossy ≈ 6 MB.
-
-### Single-column equality sweep (`WHERE val = X` and `WHERE val IN (…)`)
-
-Btree wins at high cardinality on single-column equality — that is not the target workload. The table shows where roaring is competitive and where it is not.
-
-```
-ndistinct  rows/val │ bt_size  ro_size  lo_size  ro/bt  lo/bt │ bt_eq   ro_eq  lo_eq │ bt_in   ro_in  lo_in
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────
-       10   100 000 │ 6800 kB  2040 kB   120 kB    30%     1% │   321      85     20 │    76      53     29
-      100    10 000 │ 6816 kB  2448 kB   848 kB    35%    12% │  2670     195     23 │   331      85     16
-    1 000     1 000 │ 7168 kB  2704 kB  2032 kB    37%    28% │ 12662    1462    174 │  2564     656    114
-   10 000       100 │ 6712 kB  8048 kB  2392 kB   119%    35% │ 22327    7981   1467 │ 10339    3132    970
-  100 000        10 │ 9256 kB    13 MB  5976 kB   142%    64% │ 21168   18582   8638 │ 13692   10187   5781
-```
-
-`_eq` = equality TPS (`WHERE val = X`). `_in` = 10-value IN-list TPS.
-
-**Sweet spot**: ndistinct 10–1 000. Index is 28–37% of btree size; lossy stays under 28%. Exact mode TPS is lower than btree for single-column equality — the gain comes in multi-column AND, where one roaring page read replaces O(rows/ndistinct) btree leaf reads per column.
-
-**Not the right tool**: ndistinct > 10 000. Roaring index grows larger than btree (bitmaps don't compress well at low TIDs/value); btree wins on both size and TPS.
+For `sum(id)` (index-only `INCLUDE` projection) roaring wins on highly selective
+results and loses to B-tree on large result sets with a usable leading prefix
+(B-tree streams the inline payload from a contiguous range). Full table in the
+bench README.
 
 ---
 
-## When to use roaring
+## How it works (short version)
 
-**Use it when:**
-- Table has multiple low-to-moderate cardinality columns (ndistinct 10–10 000)
-- Queries filter on arbitrary subsets of those columns — you can't predict which composite index to build
-- High DELETE+INSERT churn (roaring appends to a pending list; no page splits under write load)
-- Index footprint matters — 20 roaring_lossy indexes fit in RAM where 20 btrees don't
+Each distinct value maps to a Roaring bitmap of **linearized TIDs**
+(`(block << 9) | (offset - 1)`). A 1–3 level sorted **directory** locates the
+leaf page for a value; the leaf stores the bitmap inline, or chains to
+**overflow** pages for large bitmaps. New rows append to an MVCC-aware, 8-way
+**sharded pending list** and are merged into the bitmaps in batches. Multi-column
+indexes namespace each column's values into one key space
+(`(attno << 32) | key32`) and intersect per-column bitmaps at scan time. An
+optional `INCLUDE` column lives in a separate dense **payload** store for
+index-only projection. Every page write goes through `generic_xlog` (no custom
+WAL resource manager).
 
-**Stick with btree when:**
-- Single-column equality on a high-cardinality column (ndistinct > 10 000) — btree wins
-- Range queries (`>`, `<`, `BETWEEN`) — roaring only supports equality
-- You know the exact query shape — a composite btree on those columns is 10× faster
-- Columns are updated in-place (HOT updates skip btree maintenance; roaring must insert new pending entries)
+See **[DESIGN.md](DESIGN.md)** for the on-disk layout, diagrams, and the
+read / write / merge protocols.
 
 ---
 
-## Installation
+## Limitations
 
-**Prerequisites**: PostgreSQL 14–18, C compiler, `pg_config` on PATH.
+- **Equality only** — no range, ordering, or pattern support.
+- **`IS NULL` uses a seqscan** (NULLs are not indexed).
+- **Hash-encoded keys** (`text`, `uuid`, multi-column `int8`) rely on executor
+  recheck for exactness — extra heap work at high cardinality.
+- **Lossless multi-column `int8`** and a couple of correctness edges (e.g.
+  projecting a bare *unconstrained* key column of a multi-column index,
+  `SELECT a … WHERE b = 5`, and `IS NULL` under a forced `enable_seqscan=off`)
+  are pending a per-column covering store. See [`TODO.md`](TODO.md).
+- **Serial index build.** `ambuild` is single-threaded (parallel build is on the
+  roadmap); a wide 20-column / 100M-row build takes tens of minutes.
 
-```sh
-# 1. Fetch CRoaring amalgamation (one-time; files are gitignored)
-bash scripts/fetch-croaring.sh
+## Project layout
 
-# 2. Build and install
-make
-make install
-
-# 3. Enable in your database
-psql -c "CREATE EXTENSION pg_roaring_index;"
+```
+src/            access method: build, insert, scan, vacuum, cost, customscan, payload, util
+src/vendor/     vendored CRoaring amalgamation (fetched, gitignored)
+sql/            CREATE EXTENSION SQL + regression test inputs
+expected/       regression test expected output
+bench/          100M roaring-vs-btree benchmark suite (+ README)
+docker/         containerized PostgreSQL 18 build
+DESIGN.md       on-disk layout and protocols (with diagrams)
+TODO.md         roadmap and known limitations
 ```
 
-**macOS (Homebrew)**:
-```sh
-brew install postgresql@18
-export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
-bash scripts/fetch-croaring.sh && make && make install
-```
+## License
 
-**Regression tests**:
-```sh
-make installcheck   # requires a running cluster
-```
-
----
-
-## Pending list and VACUUM
-
-Inserts go to an append-only pending list (GIN-style). VACUUM merges the pending list into the main index. Queries scan both the main index and the pending list so results are always correct between vacuums.
-
-Back-pressure triggers an inline merge when the pending list exceeds a threshold (default 10 000 entries), preventing unbounded growth under sustained insert load.
-
----
-
-## Known limitations
-
-- **Equality only** — no range scans, no ordering, no partial indexes
-- **int8 and int4 only** — other types require a custom opclass
-- **Lossy dead-block accumulation** — deleted rows leave stale block numbers in lossy indexes until the rows are re-inserted. Extra heap rechecks result; no wrong answers.
-- **No composite key packing** — `(company_id, location_id)` as a single int64 is on the roadmap but not yet implemented
-- **ndistinct > 10 000** — roaring indexes grow larger than btree; use btree instead
-
----
-
-## How it works
-
-Each distinct column value maps to one leaf entry in a sorted B-tree-like directory. The entry stores a serialised [CRoaring](https://github.com/RoaringBitmap/CRoaring) bitmap of all linearized TIDs (`(blkno << 9) | (offset - 1)`) matching that value. Bitmaps fit in a single 8 KB page for the target cardinality range; larger bitmaps chain to overflow pages.
-
-At query time, `amgetbitmap` fetches the bitmap for each scan key (one directory lookup + one page read), deserialises it, and adds TIDs to PostgreSQL's `TIDBitmap`. For multi-column `BitmapAnd`, each index contributes its bitmap independently; PostgreSQL intersects them in the executor.
-
-Lossy mode (`roaring_lossy`) stores block numbers instead of TIDs. The bitmap is ~512× smaller per entry; `amrecheck = true` tells the executor to recheck predicates on each matched page.
+[PostgreSQL License](LICENSE) — a liberal OSI-approved license, the same one used
+by PostgreSQL itself.
