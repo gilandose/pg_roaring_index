@@ -143,14 +143,24 @@ roaring_canreturn(Relation index, int attno)
 	Oid opcintype;
 
 	/*
-	 * Key columns: roaring indexes do not store NULLs, so an IndexOnlyScan
-	 * would return 0 for "WHERE col IS NULL" instead of the correct count.
-	 * Disable IndexOnlyScan on key columns; heap fetches remain correct.
+	 * Key columns are returned by reconstructing the value from the equality
+	 * scan key (roaring stores value->bitmap, not a per-TID value), which is
+	 * correct when the column is equality-constrained — the common case, and
+	 * what keeps INCLUDE IndexOnlyScans (e.g. sum(id) WHERE key=x) index-only.
+	 *
+	 * Two unconstrained cases need care:
+	 *   - No equality index clause at all (e.g. WHERE col IS NULL, an
+	 *     inequality, or an unqualified scan): roaring_costestimate prices such
+	 *     paths out so the planner uses a seqscan instead — the correct answer
+	 *     (NULLs are not indexed), avoiding a synthesized-NULL IndexOnlyScan.
+	 *   - ROADMAP LIMITATION: projecting an unconstrained key column of a
+	 *     multi-column index (SELECT a FROM t WHERE b = 5) cannot be
+	 *     reconstructed and currently yields NULL for that column.  The planned
+	 *     fix is a covering store of per-TID key values; see TODO.md.
+	 *
+	 * Hash-keyed types (text/uuid) store hash(value), so the original value is
+	 * not recoverable from storage and the column is never returnable.
 	 */
-	if (false)
-		return false;
-
-	/* INCLUDE columns: hash-keyed types store hash(value), not returnable. */
 	opcintype = index->rd_opcintype[attno - 1];
 	if (opcintype == TEXTOID || opcintype == UUIDOID)
 		return false;

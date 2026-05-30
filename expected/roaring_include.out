@@ -25,11 +25,11 @@ SET enable_seqscan = off;
 -- returnable, so an IndexOnlyScan for "SELECT id ... WHERE val = X" may
 -- be chosen after VACUUM warms the visibility map).
 EXPLAIN (COSTS OFF) SELECT id FROM t_inc WHERE val = 10 ORDER BY id;
-                QUERY PLAN                 
--------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Sort
    Sort Key: id
-   ->  Index Scan using t_inc_idx on t_inc
+   ->  Index Only Scan using t_inc_idx on t_inc
          Index Cond: (val = 10)
 (4 rows)
 

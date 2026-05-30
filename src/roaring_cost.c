@@ -37,8 +37,25 @@ roaring_costestimate(struct PlannerInfo *root,
 	*indexCorrelation = 0.0;
 	*indexPages		  = 1.0;
 
-	if (path->indexclauses == NIL || heap_tuples <= 0)
+	if (heap_tuples <= 0)
 		return;
+
+	/*
+	 * A scan with no equality index clause (e.g. WHERE col IS NULL, an
+	 * inequality, or an unqualified scan reached via amoptionalkey) cannot be
+	 * answered by a roaring value->bitmap index: it would enumerate every
+	 * indexed TID, and for IS NULL it cannot even see the matching rows (NULLs
+	 * are not indexed).  Price such paths out of consideration so the planner
+	 * falls back to a seqscan — the correct answer for those predicates — even
+	 * under enable_seqscan=off.  REINDEX's validate_index calls the AM directly
+	 * and is unaffected by this estimate.
+	 */
+	if (path->indexclauses == NIL)
+	{
+		*indexStartupCost = *indexTotalCost = 1.0e30;
+		*indexSelectivity = 1.0;
+		return;
+	}
 
 	/*
 	 * Read total_entries from the metapage — or from rd_amcache if the

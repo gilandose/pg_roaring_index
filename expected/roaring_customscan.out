@@ -23,7 +23,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cs WHERE val = 3;
          QUERY PLAN         
 ----------------------------
  Custom Scan (RoaringCount)
-   RoaringCount: 1 key
+   RoaringCount: 1 qual
 (2 rows)
 
 -- IN list: still a RoaringCount (sum of disjoint bitmaps).
@@ -31,25 +31,22 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cs WHERE val IN (1, 2, 3);
          QUERY PLAN         
 ----------------------------
  Custom Scan (RoaringCount)
-   RoaringCount: 3 keys
+   RoaringCount: 1 qual
 (2 rows)
 
--- Multi-column index: RoaringCount does not fire
--- (intersection semantics; column-sum ≠ row count).
+-- Multi-column index: RoaringCount fires and intersects the per-column
+-- bitmaps (exact AND), returning the true row count.
 CREATE TABLE t_cs2 (id int, a int4, b int4);
 INSERT INTO t_cs2 SELECT i, (i % 5) + 1, (i % 3) + 1
                   FROM generate_series(1, 500) i;
 CREATE INDEX t_cs2_idx ON t_cs2 USING roaring (a, b);
 VACUUM t_cs2;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cs2 WHERE a = 1 AND b = 1;
-                   QUERY PLAN                    
--------------------------------------------------
- Aggregate
-   ->  Bitmap Heap Scan on t_cs2
-         Recheck Cond: ((a = 1) AND (b = 1))
-         ->  Bitmap Index Scan on t_cs2_idx
-               Index Cond: ((a = 1) AND (b = 1))
-(5 rows)
+         QUERY PLAN         
+----------------------------
+ Custom Scan (RoaringCount)
+   RoaringCount: 2 quals
+(2 rows)
 
 DROP TABLE t_cs2;
 -- ================================================================

@@ -62,32 +62,41 @@ change. Tracked for after pgconf.eu.
   int8-via-hash; verify int2/oid/date/bool/float4/text/uuid/enum end-to-end as
   keys, incl. per-column NULL handling and recheck for the hashed types).
 
-## Open — regression failures still red (4/8, pre-existing, NOT int8)
+## Done — regression suite green (8/8)
 
-- `roaring_customscan`, `roaring_include`: **stale EXPLAIN goldens** — code emits
-  `RoaringCount: N qual(s)` (was `N keys`) and IndexOnlyScan where the golden
-  shows IndexScan (VM now all-visible). Regenerate `expected/` once confirmed
-  intentional.
-- `roaring_basic`, `roaring_multicolumn`: **`IS NULL` returns wrong rows under
-  `enable_seqscan=off`** — see below.
+- Fixed the `IS NULL` / key-column IndexOnlyScan bug (see below) → unblocked
+  `roaring_basic`, `roaring_multicolumn`, `roaring_include`.
+- Regenerated `expected/roaring_customscan.out` and updated the stale test
+  comment: multi-column `count(*)` now fires `RoaringCount` (intersection),
+  which is the branch's feature — the golden predated it.
 
-## Open — correctness gaps (no-key / non-equality scans)
+## Done — IS NULL / no-key scans (cost-estimator gate)
 
-`amoptionalkey = true` lets the planner run the roaring index with **zero
-equality scan keys** (when `enable_seqscan=off` and no usable equality qual).
-The scan then misbehaves; two faces of the same root cause:
+A 0-equality-clause scan (`WHERE col IS NULL`, an inequality, or an unqualified
+scan reached via `amoptionalkey`) cannot be answered by a roaring value->bitmap
+index, and for IS NULL the matching rows aren't even indexed. Previously
+`roaring_costestimate` returned cost 0 for such paths, so the planner picked a
+0-key IndexOnlyScan that synthesized `val = NULL` and matched every row (e.g. 6
+instead of 1).
 
-- **`WHERE col IS NULL`** returns *all indexed (non-NULL) rows* instead of 0
-  (e.g. 6 instead of 1). Fails `roaring_basic` / `roaring_multicolumn` under
-  their `SET enable_seqscan=off`. Normal `IS NULL` (seqscan allowed) is correct.
-- **Unqualified scan** (`GROUP BY col`, no `WHERE`) returns 0 rows instead of
-  all.
+Fix: `roaring_costestimate` prices 0-index-clause paths at ~1e30 so the planner
+uses a seqscan (the correct answer). This keeps `canreturn = true` for key
+columns, so the common `sum(id) WHERE key = x` stays an INDEX-ONLY scan (fast
+payload path). Verified: 8/8 regression green, sum(id) IOS preserved.
 
-Fix direction: when the scan has no equality key, the roaring index cannot
-answer the predicate — it should contribute nothing and let the executor filter
-(or the path should not be chosen). Decide between (a) return empty + rely on
-recheck/seqscan fallback, or (b) `amoptionalkey = false` (forces ≥1 key, but
-must still allow constraining a column *subset* of a multi-column index).
+### Roadmap limitations (documented; need the covering store)
+
+The cost gate fixes *normal* operation. Two edges remain, both because roaring
+reconstructs key values from scan keys rather than storing them per TID:
+
+- **`enable_seqscan = off` forces a 0-key scan**: PG18's disabled-node accounting
+  prefers a non-disabled (1e30-cost) IndexOnlyScan over a disabled seqscan, so
+  IS NULL/inequality can still return wrong results under that explicit setting.
+- **Bare unconstrained key projection**: `SELECT a FROM mc WHERE b = 5` returns
+  NULL for `a` (no scan key to reconstruct it from).
+
+Both are fully fixed by the per-column-directory **covering store** (store key
+values per TID) tracked above.
 
 ## Open — performance follow-ups (optional)
 

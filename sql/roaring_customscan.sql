@@ -27,8 +27,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cs WHERE val = 3;
 -- IN list: still a RoaringCount (sum of disjoint bitmaps).
 EXPLAIN (COSTS OFF) SELECT count(*) FROM t_cs WHERE val IN (1, 2, 3);
 
--- Multi-column index: RoaringCount does not fire
--- (intersection semantics; column-sum ≠ row count).
+-- Multi-column index: RoaringCount fires and intersects the per-column
+-- bitmaps (exact AND), returning the true row count.
 CREATE TABLE t_cs2 (id int, a int4, b int4);
 INSERT INTO t_cs2 SELECT i, (i % 5) + 1, (i % 3) + 1
                   FROM generate_series(1, 500) i;
