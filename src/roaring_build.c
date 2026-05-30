@@ -244,6 +244,7 @@ typedef struct LeafWriter
 	int					max_inline;
 	RoaringDirEntry	   *leaf_entries;	/* one per completed leaf page */
 	uint32				leaf_count;
+	uint32				leaf_cap;		/* allocated slots in leaf_entries */
 	long				nentries;		/* distinct values emitted */
 	Buffer				leaf_buf;
 	Page				leaf_page;
@@ -254,6 +255,64 @@ typedef struct LeafWriter
 	BlockNumber			batch_blknos[ROARING_BUILD_WAL_BATCH];
 	int					batch_n;
 } LeafWriter;
+
+/*
+ * Ensure leaf_entries has room for one more directory entry, doubling the
+ * allocation on demand.  The number of leaf pages is not known until the
+ * sorted stream is fully consumed; for a multi-column index it is far smaller
+ * than the total emitted-tuple count (which is nkeys * nrows), so we grow the
+ * array to the actual leaf-page count rather than pre-sizing by tuple count.
+ */
+static void
+leaf_writer_reserve(LeafWriter *w)
+{
+	if (w->leaf_count < w->leaf_cap)
+		return;
+
+	if (w->leaf_cap == 0)
+	{
+		w->leaf_cap = 1024;
+		w->leaf_entries = (RoaringDirEntry *)
+			palloc_extended((Size) w->leaf_cap * sizeof(RoaringDirEntry),
+							MCXT_ALLOC_HUGE);
+	}
+	else
+	{
+		w->leaf_cap *= 2;
+		w->leaf_entries = (RoaringDirEntry *)
+			repalloc_huge(w->leaf_entries,
+						  (Size) w->leaf_cap * sizeof(RoaringDirEntry));
+	}
+}
+
+/*
+ * Write value's bitmap as an overflow entry on the current leaf page: the
+ * serialized bytes go to an overflow chain and only the small fixed-size
+ * RoaringOverflowEntry header lands on the leaf page, so it always fits.
+ */
+static void
+leaf_emit_overflow(LeafWriter *w, int64 value, roaring64_bitmap_t *bm64,
+				   size_t bitmap_size)
+{
+	char				 *bm_data;
+	RoaringOverflowEntry *oe;
+
+	bm_data = (char *) palloc(bitmap_size);
+	roaring64_bitmap_portable_serialize(bm64, bm_data);
+	oe		= (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
+	oe->value		   = value;
+	oe->cardinality	   = roaring64_cardinality32(bm64);
+	oe->flags		   = ROARING_ENTRY_OVERFLOW;
+	oe->total_len	   = (uint32) bitmap_size;
+	oe->overflow_blkno = roaring_write_overflow_chain(w->index, bm_data,
+													   bitmap_size);
+	pfree(bm_data);
+
+	if (PageAddItem(w->leaf_page, (Item) oe, sizeof(RoaringOverflowEntry),
+					InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+		elog(ERROR, "roaring_build: overflow PageAddItem failed unexpectedly");
+	pfree(oe);
+}
 
 static void
 leaf_writer_emit(LeafWriter *w, int64 value, roaring64_bitmap_t *bm64)
@@ -289,6 +348,7 @@ leaf_writer_emit(LeafWriter *w, int64 value, roaring64_bitmap_t *bm64)
 									PageGetItemId(w->leaf_page, maxoff));
 			old_blkno = BufferGetBlockNumber(w->leaf_buf);
 
+			leaf_writer_reserve(w);
 			w->leaf_entries[w->leaf_count].high_key   = last->value;
 			w->leaf_entries[w->leaf_count].child_page = old_blkno;
 			w->leaf_count++;
@@ -337,25 +397,7 @@ leaf_writer_emit(LeafWriter *w, int64 value, roaring64_bitmap_t *bm64)
 
 	if (bitmap_size > (size_t) w->max_inline)
 	{
-		char				 *bm_data;
-		RoaringOverflowEntry *oe;
-
-		bm_data = (char *) palloc(bitmap_size);
-		roaring64_bitmap_portable_serialize(bm64, bm_data);
-		oe		= (RoaringOverflowEntry *) palloc(sizeof(RoaringOverflowEntry));
-		oe->value		   = value;
-		oe->cardinality	   = roaring64_cardinality32(bm64);
-		oe->flags		   = ROARING_ENTRY_OVERFLOW;
-		oe->total_len	   = (uint32) bitmap_size;
-		oe->overflow_blkno = roaring_write_overflow_chain(w->index, bm_data,
-														   bitmap_size);
-		pfree(bm_data);
-
-		if (PageAddItem(w->leaf_page, (Item) oe,
-						sizeof(RoaringOverflowEntry),
-						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-			elog(ERROR, "roaring_build: PageAddItem failed unexpectedly");
-		pfree(oe);
+		leaf_emit_overflow(w, value, bm64, bitmap_size);
 	}
 	else
 	{
@@ -370,8 +412,19 @@ leaf_writer_emit(LeafWriter *w, int64 value, roaring64_bitmap_t *bm64)
 		if (PageAddItem(w->leaf_page, (Item) le,
 						sizeof(RoaringLeafEntry) + bitmap_size,
 						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-			elog(ERROR, "roaring_build: PageAddItem failed unexpectedly");
-		pfree(le);
+		{
+			/*
+			 * Defensive fallback: the corrected max_inline guarantees an inline
+			 * entry fits a fresh leaf page, so this should be unreachable.  But
+			 * rather than abort a multi-hour build on a boundary miscalculation,
+			 * fall back to overflow — its header is far smaller and fits the
+			 * same page.
+			 */
+			pfree(le);
+			leaf_emit_overflow(w, value, bm64, bitmap_size);
+		}
+		else
+			pfree(le);
 	}
 
 	Assert(w->leaf_spc->entry_count < PG_UINT16_MAX);
@@ -393,6 +446,7 @@ leaf_writer_finish(LeafWriter *w)
 	last   = (RoaringLeafEntry *)
 			 PageGetItem(w->leaf_page, PageGetItemId(w->leaf_page, maxoff));
 
+	leaf_writer_reserve(w);
 	w->leaf_entries[w->leaf_count].high_key   = last->value;
 	w->leaf_entries[w->leaf_count].child_page = blkno;
 	w->leaf_count++;
@@ -428,15 +482,19 @@ write_leaf_and_dir_pages(Relation index,
 						  BlockNumber *rightmost_out)
 {
 	/*
-	 * Max bitmap payload that fits inline on a fresh leaf page.
-	 * PageGetFreeSpace on a fresh page = (BLCKSZ - special) - header - ItemIdData
-	 * Then subtract the fixed RoaringLeafEntry header.
+	 * Max bitmap payload that fits inline on a fresh leaf page.  An item costs
+	 * MAXALIGN(sizeof(RoaringLeafEntry) + bitmap) of data space plus a 4-byte
+	 * line pointer, so we MAXALIGN_DOWN the page's usable space *after*
+	 * reserving the line pointer, then subtract the entry header.  Subtracting
+	 * the (unaligned) line pointer before rounding — as a naive computation
+	 * does — leaves up to MAXIMUM_ALIGNOF-1 bytes of slack, which lets a
+	 * boundary-sized bitmap be classified inline yet fail PageAddItem.
 	 */
-	const int max_inline = (int)(BLCKSZ
-								 - MAXALIGN(sizeof(RoaringLeafSpecial))
-								 - SizeOfPageHeaderData
-								 - sizeof(ItemIdData)
-								 - MAXALIGN(sizeof(RoaringLeafEntry)));
+	const int max_inline = (int)(MAXALIGN_DOWN(BLCKSZ
+									 - SizeOfPageHeaderData
+									 - MAXALIGN(sizeof(RoaringLeafSpecial))
+									 - sizeof(ItemIdData))
+								 - sizeof(RoaringLeafEntry));
 
 	/* Flat-array dir capacity per page (no line pointers). */
 	const uint32 max_dir = (uint32)((BLCKSZ
@@ -460,27 +518,16 @@ write_leaf_and_dir_pages(Relation index,
 	}
 
 	/*
-	 * Pre-check: worst case is one leaf page per distinct value.  If ntuples
-	 * (an upper bound on distinct values) already exceeds the three-level
-	 * directory capacity, fail now before paying the full build cost.
+	 * leaf_entries grows on demand to the actual number of leaf pages (see
+	 * leaf_writer_reserve).  It cannot be pre-sized from the emitted-tuple
+	 * count: for a multi-column index that count is nkeys * nrows, whereas the
+	 * number of distinct column-namespaced values — and hence leaf pages — is
+	 * far smaller.  A genuinely oversized index is caught after streaming, when
+	 * the level-2 directory would overflow max_dir (see Phase B below).
 	 */
-	if (ntuples > (long) max_dir * (long) max_dir * (long) max_dir)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("roaring_build: index too large for three-level directory"),
-				 errdetail("Distinct-value estimate %ld exceeds capacity %ld.",
-						   ntuples, (long) max_dir * (long) max_dir * (long) max_dir),
-				 errhint("Reduce the number of indexed distinct values, "
-						 "or use REINDEX after reducing cardinality.")));
-
-	/* Worst case: one leaf page per distinct value (≤ ntuples). */
-	leaf_entries = palloc_extended(ntuples * sizeof(RoaringDirEntry),
-								   MCXT_ALLOC_HUGE);
-
 	memset(&w, 0, sizeof(w));
 	w.index        = index;
 	w.max_inline   = max_inline;
-	w.leaf_entries = leaf_entries;
 	w.leaf_buf     = InvalidBuffer;
 	w.leftmost     = InvalidBlockNumber;
 	w.rightmost    = InvalidBlockNumber;
@@ -558,7 +605,8 @@ write_leaf_and_dir_pages(Relation index,
 	/* Finalize the last partially filled leaf page. */
 	leaf_writer_finish(&w);
 
-	leaf_count = w.leaf_count;
+	leaf_count   = w.leaf_count;
+	leaf_entries = w.leaf_entries;	/* refresh: array may have been repalloc'd */
 
 	/* ---- Phase B: build directory ---- */
 	if (leaf_count <= max_dir)
@@ -605,9 +653,14 @@ write_leaf_and_dir_pages(Relation index,
 			uint32           k;
 
 			if (l2_count > max_dir)
-				elog(ERROR,
-					 "roaring_build: index too large for three-level directory "
-					 "(%u leaf pages)", leaf_count);
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("roaring_build: index too large for three-level directory"),
+						 errdetail("%u leaf pages exceed capacity %ld.",
+								   leaf_count,
+								   (long) max_dir * (long) max_dir * (long) max_dir),
+						 errhint("Reduce the number of indexed distinct values, "
+								 "or use REINDEX after reducing cardinality.")));
 
 			l2_entries = palloc(l2_count * sizeof(RoaringDirEntry));
 
