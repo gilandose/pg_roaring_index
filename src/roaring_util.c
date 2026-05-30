@@ -30,6 +30,19 @@ roaring_datum_to_key32(Datum d, Oid typid)
 			return DatumGetInt32(d);
 		case INT2OID:
 			return (int32) DatumGetInt16(d);
+		case INT8OID:
+		{
+			/*
+			 * int8 does not fit in the 32-bit multi-column key slot, so it is
+			 * hashed — collisions are resolved by executor recheck (the scan
+			 * marks int8 columns lossy via roaring_set_needs_recheck, and the
+			 * exact-count fast path declines int8 multi-column quals).  A
+			 * lossless multi-column int8 key is tracked as future work (TODO).
+			 */
+			int64 v = DatumGetInt64(d);
+
+			return (int32) hash_bytes((const unsigned char *) &v, sizeof(v));
+		}
 		case BOOLOID:
 			return DatumGetBool(d) ? 1 : 0;
 		case DATEOID:

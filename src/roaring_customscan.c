@@ -42,6 +42,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include <math.h>
 
 /* ----------------------------------------------------------------
  * Private state stored per-scan
@@ -194,21 +195,36 @@ extract_const_keys(Node *clause, IndexOptInfo *ii,
 			return false;
 
 		typid = ii->opcintype[colno];
-		/* Skip hash-keyed types (collisions make count inaccurate). */
+		/*
+		 * Skip hash-keyed types — collisions make the exact count wrong, so we
+		 * decline the fast path and let a recheck scan answer it.  text/uuid are
+		 * always hashed; int8 only in a multi-column key (single-column stores
+		 * it losslessly via roaring_datum_to_key64).
+		 */
 		if (typid == TEXTOID || typid == UUIDOID)
+			return false;
+		if (typid == INT8OID && ii->nkeycolumns > 1)
 			return false;
 		/* NaN float4 is not indexed. */
 		if (typid == FLOAT4OID && isnan(DatumGetFloat4(c->constvalue)))
 			return false;
 		/*
 		 * anyenum opclass stores opcintype = ANYENUMOID (a pseudo-type).
-		 * roaring_datum_to_key64 needs the concrete enum OID to cast correctly;
+		 * roaring_datum_to_key*() needs the concrete enum OID to cast correctly;
 		 * use the Const's own type instead.
 		 */
 		if (typid == ANYENUMOID)
 			typid = c->consttype;
 
-		key = ROARING_COL_KEY(colno + 1, roaring_datum_to_key32(c->constvalue, typid));
+		/*
+		 * Single-column indexes store the raw int64 key (matching the build
+		 * path); multi-column indexes namespace a 32-bit key by column.
+		 */
+		if (ii->nkeycolumns == 1)
+			key = roaring_datum_to_key64(c->constvalue, typid);
+		else
+			key = ROARING_COL_KEY(colno + 1,
+								   roaring_datum_to_key32(c->constvalue, typid));
 
 		*attno_out  = var->varattno;
 		*keys_out   = palloc(sizeof(int64));
@@ -257,6 +273,8 @@ extract_const_keys(Node *clause, IndexOptInfo *ii,
 		typid = ii->opcintype[colno];
 		if (typid == TEXTOID || typid == UUIDOID)
 			return false;
+		if (typid == INT8OID && ii->nkeycolumns > 1)
+			return false;
 
 		arr      = DatumGetArrayTypeP(ac->constvalue);
 		elemtype = ARR_ELEMTYPE(arr);
@@ -286,7 +304,10 @@ extract_const_keys(Node *clause, IndexOptInfo *ii,
 				continue;
 			if (typid == FLOAT4OID && isnan(DatumGetFloat4(elems[i])))
 				continue;
-			keys[nkeys++] = ROARING_COL_KEY(colno + 1, roaring_datum_to_key32(elems[i], typid));
+			keys[nkeys++] = (ii->nkeycolumns == 1)
+				? roaring_datum_to_key64(elems[i], typid)
+				: ROARING_COL_KEY(colno + 1,
+								   roaring_datum_to_key32(elems[i], typid));
 		}
 		pfree(elems);
 		pfree(nulls);
@@ -380,15 +401,18 @@ roaring_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 
 		if (all_ok && num_quals > 0)
 		{
+			List *private_quals = NIL;
+			CustomPath *cpath;
+			int q, i;
+
 			/* Found a usable index! */
 			best_ii = ii;
 			
 			/* Save into private data */
-			List *private_quals = NIL;
-			for (int q = 0; q < num_quals; q++)
+			for (q = 0; q < num_quals; q++)
 			{
 				List *key_list = NIL;
-				for (int i = 0; i < temp_quals[q].nkeys; i++)
+				for (i = 0; i < temp_quals[q].nkeys; i++)
 				{
 					key_list = lappend(key_list,
 									   makeConst(INT8OID, -1, InvalidOid,
@@ -399,7 +423,7 @@ roaring_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 				private_quals = lappend(private_quals, key_list);
 			}
 			
-			CustomPath *cpath = makeNode(CustomPath);
+			cpath = makeNode(CustomPath);
 
 			cpath->path.pathtype          = T_CustomScan;
 			cpath->path.parent            = upper_rel;

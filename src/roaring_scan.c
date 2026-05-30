@@ -136,7 +136,13 @@ roaring_set_needs_recheck(IndexScanDesc scan)
 			continue;	/* defensive: should never happen */
 
 		opcintype = rel->rd_opcintype[attno - 1];
-		if (opcintype == TEXTOID || opcintype == UUIDOID)
+		/*
+		 * text/uuid are always hashed.  int8 is hashed only in the
+		 * multi-column key (the single-column path stores it losslessly via
+		 * roaring_datum_to_key64), so it is lossy only when nkeyatts > 1.
+		 */
+		if (opcintype == TEXTOID || opcintype == UUIDOID ||
+			(opcintype == INT8OID && nkeyatts > 1))
 		{
 			so->needs_recheck = true;
 			break;
@@ -188,6 +194,9 @@ roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 
 	/* Keys are now valid — safe to inspect their attnos for hash-keyed cols. */
 	roaring_set_needs_recheck(scan);
+
+	/* Restart the streaming payload cursor for the new scan. */
+	roaring_payload_cursor_reset(so);
 }
 
 void
@@ -199,6 +208,7 @@ roaring_endscan(IndexScanDesc scan)
 		roaring64_iterator_free(so->scan_iter);
 	if (so->scan_bm)
 		roaring64_bitmap_free(so->scan_bm);
+	roaring_payload_cursor_release(so);
 	pfree(so);
 	scan->opaque = NULL;
 }
@@ -1717,7 +1727,7 @@ roaring_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 		if (natts > nkeys)
 		{
-			values[nkeys] = Int64GetDatum(roaring_payload_fetch(index, linear));
+			values[nkeys] = Int64GetDatum(roaring_payload_fetch_scan(scan, linear));
 			isnull[nkeys] = false;
 		}
 

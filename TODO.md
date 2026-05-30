@@ -33,30 +33,61 @@ several bugs (fixed) and the remaining multi-column work (below).
   mixed/IN/IN+AND and btree best/worst predicates. See the README for setup,
   the mandatory `VACUUM` for `sum(id)` IndexOnlyScan, and reference results.
 
-## Open — finish multi-column so it works fully (multi-column, multi-type)
+## Done — int8 key support (patch; full redesign deferred)
 
-Primary goal. The branch packs each key column value into 32 bits
-(`ROARING_COL_KEY`), so today:
+bigint now works as a key in both single- and multi-column indexes:
+- **single-column**: lossless via `roaring_datum_to_key64` (count path now uses
+  key64 for single-column instead of the multi-column packed key).
+- **multi-column**: hashed into the 32-bit slot (`roaring_datum_to_key32` int8
+  case) with executor **recheck** (flagged in `roaring_set_needs_recheck`); the
+  exact-count fast path declines int8 multi-column quals (`extract_const_keys`),
+  falling back to a recheck bitmap scan. Verified exact vs seqscan, incl.
+  values > int32 and hash collisions.
 
-1. **bigint key columns are rejected** — `roaring index: unsupported column type
-   bigint for multi-column key` (`roaring_util.c:58`). This fails 6/8 regression
-   tests (they index a single bigint column). Need real 64-bit-capable key
-   handling (or a documented, tested narrowing) so multi-column works across
-   `int2/int4/int8/oid/date/float4/bool/text/uuid/...` as the single-column path
-   already does.
-2. **Multi-type coverage** — ensure every supported column type works *as a key*
-   in a multi-column index (currently validated mainly on int4): types,
-   collation/hashing for text/uuid (recheck), NULL handling per column.
-3. **Regression suite green** — once (1)/(2) land, `make installcheck` should
-   pass (`roaring_basic/_multicolumn/_types/_check/_customscan/_include`).
-   Update `expected/` only where behaviour intentionally changed.
+Brought `make installcheck` from 6/8 failing to 4/8 (`roaring_types`,
+`roaring_check` now pass).
 
-## Open — correctness gaps
+### Deferred: lossless multi-column bigint (the real redesign)
 
-- **Unqualified roaring scan returns 0 rows** — a no-`WHERE` scan via the roaring
-  index (e.g. `GROUP BY col` with `enable_seqscan=off`) yields an empty bitmap
-  instead of all rows. Should at minimum raise a clear error (or refuse the path)
-  rather than silently return nothing.
+Hashing means high-cardinality bigint multi-column keys pay recheck cost and
+lose the exact count(*) optimization. A first-class fix is **per-column
+directories** (each key column gets its own directory root in the metapage, so
+every column uses the full 64-bit `key64`). Touches build, scan, count, the
+pending-list entry layout (needs a column tag), metapage and vacuum — a sizable
+change. Tracked for after pgconf.eu.
+
+## Open — finish multi-column multi-type coverage
+
+- Ensure every supported type works *as a multi-column key* (validated: int4,
+  int8-via-hash; verify int2/oid/date/bool/float4/text/uuid/enum end-to-end as
+  keys, incl. per-column NULL handling and recheck for the hashed types).
+
+## Open — regression failures still red (4/8, pre-existing, NOT int8)
+
+- `roaring_customscan`, `roaring_include`: **stale EXPLAIN goldens** — code emits
+  `RoaringCount: N qual(s)` (was `N keys`) and IndexOnlyScan where the golden
+  shows IndexScan (VM now all-visible). Regenerate `expected/` once confirmed
+  intentional.
+- `roaring_basic`, `roaring_multicolumn`: **`IS NULL` returns wrong rows under
+  `enable_seqscan=off`** — see below.
+
+## Open — correctness gaps (no-key / non-equality scans)
+
+`amoptionalkey = true` lets the planner run the roaring index with **zero
+equality scan keys** (when `enable_seqscan=off` and no usable equality qual).
+The scan then misbehaves; two faces of the same root cause:
+
+- **`WHERE col IS NULL`** returns *all indexed (non-NULL) rows* instead of 0
+  (e.g. 6 instead of 1). Fails `roaring_basic` / `roaring_multicolumn` under
+  their `SET enable_seqscan=off`. Normal `IS NULL` (seqscan allowed) is correct.
+- **Unqualified scan** (`GROUP BY col`, no `WHERE`) returns 0 rows instead of
+  all.
+
+Fix direction: when the scan has no equality key, the roaring index cannot
+answer the predicate — it should contribute nothing and let the executor filter
+(or the path should not be chosen). Decide between (a) return empty + rely on
+recheck/seqscan fallback, or (b) `amoptionalkey = false` (forces ≥1 key, but
+must still allow constraining a column *subset* of a multi-column index).
 
 ## Open — performance follow-ups (optional)
 

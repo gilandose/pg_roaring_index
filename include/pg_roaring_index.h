@@ -294,15 +294,24 @@ typedef struct RoaringFreeSpecial
  * (linear_tid % ROARING_PAYLOAD_PK_PER_PAGE).
  * Capacity: (BLCKSZ - SizeOfPageHeaderData - special) / 8 = 1020 entries.
  */
+typedef struct RoaringPayloadEntry
+{
+	uint16		chunk_offset;
+	int64		pk;
+} RoaringPayloadEntry;
+
 typedef struct RoaringPayloadSpecial
 {
-    uint8       page_type;      /* ROARING_PAGE_PAYLOAD */
-    uint8       flags;
-    uint16      entry_count;    /* highest index written + 1 */
-    uint32      reserved;
-} RoaringPayloadSpecial;    /* 8 bytes */
+	uint8		page_type;		/* ROARING_PAGE_PAYLOAD */
+	uint8		flags;
+	uint16		entry_count;
+	BlockNumber	next_page;
+} RoaringPayloadSpecial;	/* 8 bytes */
 
-#define ROARING_PAYLOAD_PK_PER_PAGE     1020    /* (8192 - 24 - 8) / 8 */
+/* One logical payload chunk covers 8192 TIDs (16 blocks) */
+#define ROARING_PAYLOAD_PK_PER_PAGE		8192
+/* 8192 - 24 (header) - 8 (special) = 8160 bytes. 8160 / 16 bytes = 510 */
+#define ROARING_PAYLOAD_MAX_ENTRIES		510
 
 /*
  * T65: Payload directory page — dense array of BlockNumbers.
@@ -390,6 +399,28 @@ typedef struct RoaringScanOpaque
     /* amgettuple (IndexScan / IndexOnlyScan) state — exact mode only */
     roaring64_bitmap_t   *scan_bm;    /* combined result bitmap; NULL until first gettuple */
     roaring64_iterator_t *scan_iter;  /* iterator over scan_bm */
+
+    /*
+     * Streaming payload cursor for IndexOnlyScan INCLUDE projection.  TIDs are
+     * delivered in ascending order, so (payload_idx, chunk_offset) increases
+     * monotonically: we cache the resolved dir levels and the current chain
+     * page (copied locally) and advance forward only, reading each page once
+     * per scan instead of re-walking the dir + chain for every tuple.  Reset by
+     * roaring_payload_cursor_reset() in amrescan.
+     */
+    bool         pay_init;          /* payload_dir_head resolved? */
+    BlockNumber  pay_root_dir;      /* payload_dir_head (Invalid = no payload store) */
+    bool         pay_dir_valid;     /* pay_leaf_dir matches pay_dir_root_idx */
+    uint32       pay_dir_root_idx;
+    BlockNumber  pay_leaf_dir;
+    bool         pay_chain_valid;   /* pay_chain_head matches pay_payload_idx */
+    uint32       pay_payload_idx;
+    BlockNumber  pay_chain_head;
+    BlockNumber  pay_page_blkno;    /* blkno of the locally cached page (Invalid = none) */
+    BlockNumber  pay_page_next;     /* next_page of the cached page */
+    int          pay_page_count;    /* entries on the cached page */
+    uint16       pay_page_maxoff;   /* max chunk_offset on the cached page */
+    RoaringPayloadEntry *pay_page_entries;  /* palloc'd copy of cached page entries */
 } RoaringScanOpaque;
 
 /* ----------
@@ -496,6 +527,10 @@ extern int roaring_pending_merge_threshold_guc;
 /* roaring_payload.c */
 extern void  roaring_payload_insert(Relation index, uint64 linear_tid, int64 pk);
 extern int64 roaring_payload_fetch(Relation index, uint64 linear_tid);
+/* Streaming cursor variant for ascending-TID IndexOnlyScan delivery. */
+extern int64 roaring_payload_fetch_scan(IndexScanDesc scan, uint64 linear_tid);
+extern void  roaring_payload_cursor_reset(RoaringScanOpaque *so);
+extern void  roaring_payload_cursor_release(RoaringScanOpaque *so);
 
 /* roaring_customscan.c */
 extern void roaring_customscan_init(void);

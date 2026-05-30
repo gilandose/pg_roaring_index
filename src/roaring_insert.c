@@ -4,6 +4,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
+#include <math.h>
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
