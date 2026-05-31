@@ -433,6 +433,23 @@ typedef struct RoaringScanOpaque
     int          pay_page_count;    /* entries on the cached page */
     uint16       pay_page_maxoff;   /* max chunk_offset on the cached page */
     RoaringPayloadEntry *pay_page_entries;  /* palloc'd copy of cached page entries */
+
+    /*
+     * Reverse-bitmap projection for returnable key columns whose value is not
+     * pinned by an equality scan key (e.g. SELECT a FROM t WHERE b = 5, or a
+     * column constrained only by IN / IS NOT NULL).  A column's value bitmaps
+     * partition its TIDs, so the bitmap — hence key — containing a TID gives
+     * the value.  Built once, lazily, on the first gettuple that needs it and
+     * only when at least one such column is present (the common
+     * equality-constrained case leaves rev_map NULL → zero overhead).  The map
+     * is keyed by linear_tid; a missing TID means the column is NULL for that
+     * row.  Lives in rev_cxt so it can be dropped wholesale per rescan.
+     */
+    bool          rev_built;                /* reverse map resolved this scan? */
+    struct HTAB  *rev_map;                  /* linear_tid -> RoaringReverseEntry */
+    MemoryContext rev_cxt;                  /* holds rev_map; reset per rescan */
+    int           rev_ncols;                /* number of key columns (entry width) */
+    bool          rev_need[INDEX_MAX_KEYS]; /* key column needs reverse lookup */
 } RoaringScanOpaque;
 
 /* ----------
@@ -471,6 +488,12 @@ extern roaring64_bitmap_t *roaring_read_overflow_bitmap(
  */
 extern int32  roaring_datum_to_key32(Datum d, Oid typid);
 extern int64  roaring_datum_to_key64(Datum d, Oid typid);
+/*
+ * roaring_key32_to_datum — inverse of roaring_datum_to_key32 for the injective
+ * key types (int2/int4/oid/date/bool/float4/enum).  Used by the reverse-bitmap
+ * projection in roaring_gettuple to return an unconstrained key column's value.
+ */
+extern Datum  roaring_key32_to_datum(int32 key32, Oid typid);
 extern bool   roaring_pending_visible(TransactionId xmin, Snapshot snapshot);
 
 /* roaring_vacuum.c — also called from roaring_insert for back-pressure */

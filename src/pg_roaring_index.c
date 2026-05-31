@@ -140,29 +140,39 @@ roaring_validate(Oid opclassoid)
 static bool
 roaring_canreturn(Relation index, int attno)
 {
+	int nkeyatts = IndexRelationGetNumberOfKeyAttributes(index);
 	Oid opcintype;
 
 	/*
-	 * Key columns are returned by reconstructing the value from the equality
-	 * scan key (roaring stores value->bitmap, not a per-TID value), which is
-	 * correct when the column is equality-constrained — the common case, and
-	 * what keeps INCLUDE IndexOnlyScans (e.g. sum(id) WHERE key=x) index-only.
+	 * INCLUDE columns (attno > nkeyatts) are stored verbatim in the payload
+	 * store, so they are always returnable.  They also have no opclass entry,
+	 * so rd_opcintype[attno-1] would read past the array — return early.
+	 */
+	if (attno > nkeyatts)
+		return true;
+
+	/*
+	 * Key columns carry only value->bitmap, not a per-TID value.  A returnable
+	 * key column's value is recovered either from an equality scan key (the
+	 * common case, e.g. sum(id) WHERE key=x stays index-only) or, when the
+	 * column is projected but not equality-constrained (SELECT a FROM t WHERE
+	 * b=5), by the reverse-bitmap lookup in roaring_gettuple — the value bitmaps
+	 * of a column partition its TIDs, so the bitmap containing a TID identifies
+	 * the value.  This requires the key to be losslessly recoverable:
 	 *
-	 * Two unconstrained cases need care:
-	 *   - No equality index clause at all (e.g. WHERE col IS NULL, an
-	 *     inequality, or an unqualified scan): roaring_costestimate prices such
-	 *     paths out so the planner uses a seqscan instead — the correct answer
-	 *     (NULLs are not indexed), avoiding a synthesized-NULL IndexOnlyScan.
-	 *   - ROADMAP LIMITATION: projecting an unconstrained key column of a
-	 *     multi-column index (SELECT a FROM t WHERE b = 5) cannot be
-	 *     reconstructed and currently yields NULL for that column.  The planned
-	 *     fix is a covering store of per-TID key values; see TODO.md.
+	 *   - text/uuid store hash(value): not recoverable — never returnable.
+	 *   - int8 in a MULTI-column index is hashed into the 32-bit key slot
+	 *     (executor recheck), so it too is not recoverable.  Single-column int8
+	 *     keeps the full 64-bit value and stays returnable.
 	 *
-	 * Hash-keyed types (text/uuid) store hash(value), so the original value is
-	 * not recoverable from storage and the column is never returnable.
+	 * The remaining key types (int2/int4/oid/date/bool/float4/enum) encode the
+	 * value injectively in the key and are recoverable; see
+	 * roaring_key32_to_datum().
 	 */
 	opcintype = index->rd_opcintype[attno - 1];
 	if (opcintype == TEXTOID || opcintype == UUIDOID)
+		return false;
+	if (opcintype == INT8OID && nkeyatts > 1)
 		return false;
 	return true;
 }

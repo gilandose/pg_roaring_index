@@ -191,11 +191,16 @@ read / write / merge protocols.
   `IS NOT NULL` *are* supported — each column keeps a NULL bitmap, so
   `WHERE a = 5 AND b IS NULL` composes as a bitmap intersection.)
 - **Hash-encoded keys** (`text`, `uuid`, multi-column `int8`) rely on executor
-  recheck for exactness — extra heap work at high cardinality.
-- **Lossless multi-column `int8`** and a couple of correctness edges (e.g.
-  projecting a bare *unconstrained* key column of a multi-column index,
-  `SELECT a … WHERE b = 5`, and `IS NULL` under a forced `enable_seqscan=off`)
-  are pending a per-column covering store. See [`TODO.md`](TODO.md).
+  recheck for exactness — extra heap work at high cardinality. These keys are
+  *not* index-only-returnable (they store `hash(value)`); projecting them fetches
+  the value from the heap.
+- **Lossless multi-column `int8`** is still pending a per-column covering store
+  (high-cardinality multi-column `int8` keys pay recheck cost). See
+  [`TODO.md`](TODO.md). Projecting a bare *unconstrained* key column of a
+  multi-column index (`SELECT a … WHERE b = 5`) **is** supported for the lossless
+  key types (`int2/int4/oid/date/bool/float4/enum`): the value is reconstructed
+  from the index via reverse-bitmap lookup (a column's value bitmaps partition
+  its TIDs).
 - **Serial index build.** `ambuild` is single-threaded (parallel build is on the
   roadmap); a wide 20-column / 100M-row build takes tens of minutes.
 

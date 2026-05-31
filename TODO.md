@@ -98,12 +98,25 @@ Follow-ups for this feature:
   exact bigint value `ROARING_NULL_COL_KEY(1)` — documented; the covering store
   removes it.
 
-### Remaining canreturn edge (needs the covering store)
+### DONE — bare unconstrained key projection via reverse-bitmap lookup
 
-Unrelated to NULLs: **bare unconstrained key projection**,
-`SELECT a FROM mc WHERE b = 5`, returns NULL for `a` (no scan key to reconstruct
-it from). Fixed by the per-column-directory **covering store** (store key values
-per TID) tracked above.
+**Bare unconstrained key projection** (`SELECT a FROM mc WHERE b = 5`, and
+columns constrained only by `IN` / `IS NOT NULL`) used to return NULL for `a`.
+Now reconstructed from the index: a column's value bitmaps partition its TIDs,
+so the bitmap — hence key — containing a TID identifies the value; a TID in no
+value bitmap is NULL for that column (`roaring_gettuple` reverse map, built once
+per scan, leaf + unmerged-pending, only when a projected key column lacks an
+equality scan key → zero cost on the hot paths). Valid for the **injective key
+types** (`int2/int4/oid/date/bool/float4/enum`) via `roaring_key32_to_datum`.
+
+Hashed key types can't be inverted from `hash(value)`, so multi-column `int8`
+key columns are now `canreturn = false` (text/uuid already were) — projecting
+them is a plain Index Scan that fetches the value from the heap (correct, just
+not index-only). They are recheck-only anyway, so this costs nothing extra. The
+lossless multi-column `int8` covering store (above) would make them returnable.
+Also fixed a latent bug the reverse path exposed: an `IS NULL` scan key used to
+reconstruct a garbage value instead of NULL in the IOS tuple. Covered by
+`expected/roaring_revproj.out` (incl. seqscan oracle cross-checks).
 
 **Considered and rejected: GiST-style "only INCLUDE columns are returnable."**
 The tempting fix is `amcanreturn(key col) = false`, returning only INCLUDE

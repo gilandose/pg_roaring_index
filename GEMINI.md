@@ -65,38 +65,48 @@ Follow PostgreSQL source conventions exactly:
 
 ## Architecture
 
-### Two Operator Classes (two modes)
+### Operator Classes (exact mode only)
 
-Both modes are implemented and registered.
+The index runs exclusively in **exact** mode via the `roaring` access method,
+storing linearized TIDs (`(blkno << 9) | (offset - 1)`) in `roaring64` bitmaps.
+The `roaring_lossy` AM and its page-level opclasses were removed before launch
+(commit `3531df1`) — exact mode is the only mode.
 
-| Opclass | AM | Mode | Bitmap type | Granularity |
-|---|---|---|---|---|
-| `roaring_int8_tid_ops` / `roaring_int4_tid_ops` | `roaring` | Exact | Roaring32 | TID-level |
-| `roaring_int8_page_ops` / `roaring_int4_page_ops` | `roaring_lossy` | Lossy | Roaring32 | Page-level |
+Default (`= equality`) operator classes, one per supported type:
 
-Exact mode stores linearized TIDs (`(blkno << 9) | (offset-1)`). Lossy mode stores block numbers; `amrecheck=true` — the executor rechecks every row on matched pages. Lossy is 10-100× smaller at low cardinality.
+`roaring_int2_tid_ops` · `roaring_int4_tid_ops` · `roaring_int8_tid_ops` ·
+`roaring_bool_tid_ops` · `roaring_date_tid_ops` · `roaring_float4_tid_ops` ·
+`roaring_oid_tid_ops` · `roaring_enum_tid_ops` · `roaring_text_tid_ops` ·
+`roaring_uuid_tid_ops`
+
+`text`, `uuid`, and multi-column `int8` keys are hash-encoded into the key slot
+and rely on executor recheck for exactness; single-column `int8` is lossless.
+The CRoaring `roaring64_*` API is used throughout (the linearized TID needs the
+full 64-bit domain).
 
 ### On-Disk Page Types
 
 Every page carries a `page_type` byte in its special space. The index relation contains these page types in order:
 
-1. **Page 0 — Metapage**: magic (`0x524F4152`), version, root directory block, pending list head/tail, tombstone root, statistics
+1. **Page 0 — Metapage**: magic (`0x524F4152`), version (3), root directory block, 8-way sharded pending list heads (`insert_head`/`merging_head` per shard), payload directory head, statistics. (A tombstone root field exists but the tombstone path is unimplemented.)
 2. **Pages 1..D — Directory**: 2-level sorted array of `(high_key: int64, child_page: BlockNumber)` entries, 16 bytes each (int64 + BlockNumber + 4-byte pad). Always cached.
-3. **Pages D+1..L — Leaf**: Standard PG line-pointer layout. Each item is `RoaringLeafEntry`: `value int64 | cardinality uint32 | flags uint8 | bitmap_data bytes[]`. Entries sorted by value, binary-searched within page. `RoaringLeafSpecial` holds `left_page`/`right_page` for prefix scan
-4. **Overflow pages**: Continuation of bitmaps > ~7KB, chained via `next_page` in special space
-5. **Pending insert pages**: Fixed 16-byte entries (`value int64 | linear_tid uint32 | xmin TransactionId`), 510 per page, append-only linked list. `RoaringPendingSpecial` carries `value_min`/`value_max` for page-skip during scan.
-6. **Pending delete / tombstone pages**: Data structures exist in the metapage and header but the tombstone path is not implemented. `ambulkdelete` instead modifies leaf bitmaps inline.
+3. **Pages D+1..L — Leaf**: Standard PG line-pointer layout. Each item is `RoaringLeafEntry`: `value int64 | cardinality uint32 | flags uint8 | bitmap_data bytes[]`. Entries sorted by value (negative keys — per-column NULL bitmaps — sort first), binary-searched within page. `RoaringLeafSpecial` holds `left_page`/`right_page` for prefix scan.
+4. **Overflow pages**: Continuation of bitmaps > ~7KB, chained via `next_page` in special space.
+5. **Pending insert pages**: Fixed 24-byte entries (`value int64 | linear_tid uint64 | xmin TransactionId | _pad uint32`), `ROARING_PENDING_PER_PAGE` = 339 per page, append-only linked list (8 sharded chains). `RoaringPendingSpecial` carries `value_min`/`value_max` for page-skip during scan.
+6. **Payload pages (`PAYLOAD` 0x07 / `PAYLOAD_DIR` 0x08)**: dense per-TID `int64` array for an `INCLUDE` column, located via a payload directory; read by the streaming payload cursor for IndexOnlyScan projection.
+7. **Tombstone / pending-delete pages**: header data structures exist but the path is unimplemented — `ambulkdelete` modifies leaf bitmaps inline instead.
 
 ### Critical Implementation Notes
 
-**Pending entry format is 16 bytes**:
+**Pending entry format is 24 bytes**:
 ```c
 typedef struct {
-    int64           value;
-    uint32          linear_tid;    /* (blkno<<9)|(offset-1) for exact; blkno for lossy */
+    int64           value;         /* the (possibly column-namespaced) key */
+    uint64          linear_tid;    /* ((uint64)blkno << 9) | (offset - 1) */
     TransactionId   xmin;          /* for MVCC visibility checks */
+    uint32          _pad;          /* keep sizeof == 24, array alignment */
 } RoaringPendingEntry;
-/* 510 entries per 8KB page */
+/* ROARING_PENDING_PER_PAGE = 339 entries per 8KB page; 8 sharded chains */
 ```
 
 **MVCC visibility on pending list**: GIN-style four-state check in `roaring_pending_visible`: handles own-xid, committed, in-progress, aborted, and frozen xids. Aborted entries are dropped silently in `roaring_merge_pending` and by the aborted-xmin check in `ambulkdelete`.
@@ -132,19 +142,25 @@ Datum roaring_handler(PG_FUNCTION_ARGS) {
 ### Source File Layout
 
 ```
-src/pg_roaring_index.c    AM handler registration for both roaring and roaring_lossy
+src/pg_roaring_index.c    roaring AM handler registration (incl. amcanreturn)
 src/roaring_build.c       ambuild: sort-then-batch heap scan → write leaf+dir pages
-src/roaring_insert.c      aminsert: pending list append (exact + lossy variants)
-src/roaring_scan.c        amgetbitmap: dir lookup + bitmap deserialize + pending OR
-                          roaring_getbitmap_lossy: tbm_add_page variant
+src/roaring_insert.c      aminsert: pending list append (single + multi-column)
+src/roaring_scan.c        amgetbitmap / amgettuple: dir lookup, bitmap deserialize,
+                          pending OR, NULL bitmaps, reverse-bitmap key projection
 src/roaring_vacuum.c      ambulkdelete: inline leaf bitmap modification
                           amvacuumcleanup: crash recovery + roaring_merge_pending
-src/roaring_util.c        page alloc, WAL helpers, overflow chain read/write
+src/roaring_customscan.c  RoaringCount custom scan: count(*) via bitmap intersection
+src/roaring_payload.c     INCLUDE payload store + streaming payload cursor
+src/roaring_util.c        page alloc, WAL helpers, overflow chain, key<->datum
 src/roaring_cost.c        amcostestimate
+src/roaring_check.c       roaringcheck() index verification function
+src/roaring_stats.c       roaring_index_stats() introspection
+src/roaring_bgworker.c    background merge worker
 src/vendor/croaring/      CRoaring amalgamation (gitignored, fetch via scripts/)
-sql/                      CREATE EXTENSION SQL
+sql/                      CREATE EXTENSION SQL + regression test inputs
 expected/                 regression test expected output
-bench/                    sweep.sh (cardinality sweep), multicolumn.sh (AND benchmark)
+bench/                    100M roaring-vs-btree benchmark suite (+ README)
+docker/                   containerized PostgreSQL 18 build
 ```
 
 ## Key References
@@ -152,25 +168,29 @@ bench/                    sweep.sh (cardinality sweep), multicolumn.sh (AND benc
 - `src/backend/access/gin/ginfast.c` — pending list template (study before implementing)
 - `src/backend/access/gin/ginvacuum.c` — GIN vacuum / cleanup model
 - `src/backend/access/nbtree/README` — formal concurrency protocol model to emulate
-- `src/backend/access/brin/` — BRIN no-op ambulkdelete + resummarize pattern (lossy mode template)
+- `src/backend/access/brin/` — BRIN no-op ambulkdelete + resummarize pattern
 - `src/backend/storage/page/generic_xlog.c` — WAL strategy used throughout
-- CRoaring: `roaring_bitmap_portable_deserialize_safe()`, `roaring_bitmap_andnot_inplace()`, `roaring_bitmap_get_cardinality()`, `roaring_bitmap_add_many()` are the core API surface (Roaring32 throughout — `roaring64_*` API is not used)
+- CRoaring: `roaring64_bitmap_portable_deserialize_safe()`, `roaring64_bitmap_and_inplace()`, `roaring64_bitmap_get_cardinality()`, `roaring64_bitmap_add()` are the core API surface (the `roaring64_*` API is used throughout, for the 64-bit linearized TID domain)
 
 ## Implementation Status
 
 **Implemented:**
-- `ambuild` (sort-then-batch, single pass over sorted TID array)
-- `aminsert` with pending list, MVCC xmin, back-pressure threshold
-- `amgetbitmap` with directory lookup, overflow chains, pending OR, dual-chain scan, amsearcharray (IN queries)
+- `ambuild` (sort-then-batch, single pass over sorted TID array; tuplesort spill to disk)
+- `aminsert` with 8-way sharded pending list, MVCC xmin, back-pressure threshold
+- `amgetbitmap` / `amgettuple` (IndexScan + IndexOnlyScan) with directory lookup, overflow chains, pending OR, `amsearcharray` (IN queries)
+- Multi-column keys (`(attno << 32) | key32`), per-column bitmap intersection at scan time
+- Per-column **NULL bitmaps**: `IS NULL` / `IS NOT NULL` answered from the index (`amsearchnulls`), composable with equality
+- `INCLUDE` payload column with a streaming payload cursor for index-only projection (e.g. `sum(id)`)
+- **Reverse-bitmap projection**: returns an unconstrained key column (`SELECT a WHERE b=5`, also IN / IS NOT NULL) for the lossless key types; `amcanreturn` honest (text/uuid + multi-col int8 are non-returnable)
+- **RoaringCount** custom scan: `count(*)` (incl. multi-column AND and `IS NULL`) by intersecting bitmaps / reading cardinalities
 - `ambulkdelete`: inline leaf bitmap modification, parallel-safe (`VACUUM_OPTION_PARALLEL_BULKDEL`)
 - `amvacuumcleanup`: crash recovery from interrupted merge + `roaring_merge_pending`
 - `amcostestimate`: cardinality from metapage, RoaringAmCache for plan-time skip
-- Both exact (`roaring`) and lossy (`roaring_lossy`) AMs fully registered
-- WAL safety: all page writes via `generic_xlog`; `pending_merging_head` crash-recovery anchor
+- WAL safety: all page writes via `generic_xlog`; `merging_head` crash-recovery anchor
 - REINDEX CONCURRENTLY: works without code changes
 
 **Not implemented (known deferred):**
 - Tombstone/pending-delete path — `ambulkdelete` modifies leaf bitmaps inline instead
-- Composite key support (`(company_id, location_id)` packed into int64)
-- Adaptive threshold opclass (`roaring_auto_ops`, switches exact↔lossy per value)
-- Lossy dead-block cleanup — stale block numbers accumulate until re-insert
+- Lossless multi-column `int8` (and a per-column covering store to make hashed key columns returnable) — hashed multi-column `int8`/`text`/`uuid` keys rely on executor recheck
+- Composite key support (`(company_id, location_id)` packed into one key)
+- Parallel `ambuild` (build is currently serial)

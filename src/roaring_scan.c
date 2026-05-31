@@ -10,6 +10,7 @@
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/array.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -187,6 +188,12 @@ roaring_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		so->scan_bm = NULL;
 	}
 
+	/* Drop any reverse-bitmap map; rebuilt lazily for the new key set. */
+	so->rev_built = false;
+	so->rev_map   = NULL;
+	if (so->rev_cxt != NULL)
+		MemoryContextReset(so->rev_cxt);
+
 	if (keys && nkeys > 0)
 		memmove(scan->keyData, keys, nkeys * sizeof(ScanKeyData));
 
@@ -208,6 +215,8 @@ roaring_endscan(IndexScanDesc scan)
 		roaring64_iterator_free(so->scan_iter);
 	if (so->scan_bm)
 		roaring64_bitmap_free(so->scan_bm);
+	if (so->rev_cxt != NULL)
+		MemoryContextDelete(so->rev_cxt);
 	roaring_payload_cursor_release(so);
 	pfree(so);
 	scan->opaque = NULL;
@@ -1717,6 +1726,304 @@ roaring_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 }
 
 /* ----------------------------------------------------------------
+ * Reverse-bitmap projection
+ *
+ * Reconstruct a returnable key column's value for an IndexOnlyScan when the
+ * value is not pinned by an equality scan key — e.g. SELECT a FROM t WHERE
+ * b = 5, or a column constrained only by IN / IS NOT NULL.  A column's value
+ * bitmaps partition its TIDs, so the bitmap (hence key) containing a TID
+ * identifies that column's value for the row; a TID in no value bitmap is
+ * NULL for the column.  Built once per scan, only when some projected key
+ * column needs it (equality-constrained scans leave rev_map NULL → no cost).
+ *
+ * roaring_canreturn already makes the non-recoverable key types (text/uuid,
+ * multi-column int8) non-returnable, so any column flagged here is invertible
+ * via roaring_key32_to_datum().
+ * ---------------------------------------------------------------- */
+
+typedef struct RoaringReverseEntry
+{
+	uint64	tid;							/* hash key: linear TID */
+	uint32	known;							/* bit c set ⇒ vals[c] assigned */
+	int32	vals[FLEXIBLE_ARRAY_MEMBER];	/* per-key-column value slot */
+} RoaringReverseEntry;
+
+/* Is column c's value determined without a reverse lookup? */
+static bool
+rev_col_value_pinned(IndexScanDesc scan, int c)
+{
+	for (int i = 0; i < scan->numberOfKeys; i++)
+	{
+		ScanKey sk = &scan->keyData[i];
+
+		if (sk->sk_attno - 1 != c)
+			continue;
+		if (sk->sk_flags & SK_SEARCHNULL)
+			return true;	/* every row has c IS NULL → value is NULL */
+		if (sk->sk_flags & SK_SEARCHNOTNULL)
+			return false;	/* not null, but the value is unknown → reverse */
+		if (sk->sk_flags & SK_SEARCHARRAY)
+			return false;	/* IN list: value varies per row → reverse */
+		return true;		/* plain equality → value = sk_argument */
+	}
+	return false;			/* no scan key on c → reverse */
+}
+
+static void
+rev_scatter(HTAB *map, uint64 tid, int col, int32 val32)
+{
+	bool				 found;
+	RoaringReverseEntry *e = hash_search(map, &tid, HASH_ENTER, &found);
+
+	if (!found)
+		e->known = 0;
+	e->known |= (1u << col);
+	e->vals[col] = val32;
+}
+
+/*
+ * Build the reverse map for any projected, returnable key column whose value
+ * is not pinned by an equality scan key.  Walks the index's value entries
+ * (leaf + pending) once, intersecting each candidate value bitmap with the
+ * scan result so->scan_bm and scattering the value into a per-TID map.
+ */
+static void
+roaring_build_reverse_map(IndexScanDesc scan)
+{
+	RoaringScanOpaque  *so    = (RoaringScanOpaque *) scan->opaque;
+	Relation			index = scan->indexRelation;
+	int					nkeys = index->rd_index->indnkeyatts;
+	bool				any_need = false;
+	BlockNumber			root_blkno;
+	BlockNumber			insert_heads[ROARING_PENDING_SHARDS];
+	BlockNumber			merging_heads[ROARING_PENDING_SHARDS];
+	bool				any_pending = false;
+	Snapshot			snapshot = scan->xs_snapshot;
+	HASHCTL				ctl;
+	BlockNumber			cur;
+
+	so->rev_built = true;
+	so->rev_map   = NULL;
+	so->rev_ncols = nkeys;
+
+	for (int c = 0; c < nkeys && c < INDEX_MAX_KEYS; c++)
+		so->rev_need[c] = false;
+
+	if (!scan->xs_want_itup || so->scan_bm == NULL || nkeys < 2)
+		return;	/* single-column scans never project an unconstrained key col */
+
+	/* Flag the columns that need a reverse lookup. */
+	for (int c = 0; c < nkeys; c++)
+	{
+		Oid typid = index->rd_opcintype[c];
+
+		/* Mirror roaring_canreturn: only recoverable key types qualify. */
+		if (typid == TEXTOID || typid == UUIDOID ||
+			(typid == INT8OID && nkeys > 1))
+			continue;
+		if (rev_col_value_pinned(scan, c))
+			continue;
+		so->rev_need[c] = true;
+		any_need = true;
+	}
+	if (!any_need)
+		return;
+
+	/* Read root + pending heads from the metapage. */
+	{
+		Buffer				 metabuf = ReadBuffer(index, ROARING_METAPAGE_BLKNO);
+		RoaringMetaPageData *meta;
+
+		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+		meta = RoaringPageGetMeta(BufferGetPage(metabuf));
+		roaring_validate_metapage(index, meta);
+		root_blkno = meta->root_directory_page;
+		for (int s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			insert_heads[s]  = meta->shards[s].insert_head;
+			merging_heads[s] = meta->shards[s].merging_head;
+			if (insert_heads[s] != InvalidBlockNumber ||
+				merging_heads[s] != InvalidBlockNumber)
+				any_pending = true;
+		}
+		UnlockReleaseBuffer(metabuf);
+	}
+
+	/*
+	 * Per-scan context so the whole map drops on rescan/endscan.  Anchor it to
+	 * the context 'so' lives in (the scan's lifetime), NOT CurrentMemoryContext
+	 * — during amgettuple that may be a per-tuple context reset between rows,
+	 * which would free the map out from under us.
+	 */
+	if (so->rev_cxt == NULL)
+		so->rev_cxt = AllocSetContextCreate(GetMemoryChunkContext(so),
+											"roaring reverse map",
+											ALLOCSET_DEFAULT_SIZES);
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize   = sizeof(uint64);
+	ctl.entrysize = offsetof(RoaringReverseEntry, vals) + nkeys * sizeof(int32);
+	ctl.hcxt      = so->rev_cxt;
+	so->rev_map = hash_create("roaring reverse map",
+							  1024, &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* --- Leaf walk: scatter each needed value entry intersected with scan_bm. */
+	cur = roaring_dir_lookup(index, root_blkno, INT64_MIN);
+	while (cur != InvalidBlockNumber)
+	{
+		Buffer				buf;
+		Page				page;
+		RoaringLeafSpecial *spc;
+		OffsetNumber		maxoff;
+		BlockNumber			right;
+
+		typedef struct { RoaringOverflowEntry oe; int col; int32 val32; } DeferredOE;
+		DeferredOE *deferred	 = NULL;
+		int			deferred_cap = 0;
+		int			ndeferred	 = 0;
+
+		buf	   = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page   = BufferGetPage(buf);
+		spc	   = (RoaringLeafSpecial *) PageGetSpecialPointer(page);
+		maxoff = PageGetMaxOffsetNumber(page);
+		right  = spc->right_page;
+
+		for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId			  lid	   = PageGetItemId(page, off);
+			Size			  item_len = ItemIdGetLength(lid);
+			RoaringLeafEntry *le	   = (RoaringLeafEntry *) PageGetItem(page, lid);
+			int64			  key	   = le->value;
+			int				  col;
+			int32			  val32;
+
+			if (le->cardinality == 0 || key < 0)
+				continue;			/* empty, or a negative (NULL/sentinel) key */
+			col = (int) ((uint64) key >> 32) - 1;
+			if (col < 0 || col >= nkeys || !so->rev_need[col])
+				continue;
+			val32 = (int32) (uint32) (key & UINT64_C(0xFFFFFFFF));
+
+			if (le->flags & ROARING_ENTRY_OVERFLOW)
+			{
+				if (ndeferred == deferred_cap)
+				{
+					int newcap = (deferred_cap == 0) ? 4 : deferred_cap * 2;
+
+					deferred = (deferred == NULL)
+						? palloc(newcap * sizeof(DeferredOE))
+						: repalloc(deferred, newcap * sizeof(DeferredOE));
+					deferred_cap = newcap;
+				}
+				memcpy(&deferred[ndeferred].oe, le, sizeof(RoaringOverflowEntry));
+				deferred[ndeferred].col   = col;
+				deferred[ndeferred].val32 = val32;
+				ndeferred++;
+			}
+			else
+			{
+				roaring64_bitmap_t *entry_bm;
+
+				if (item_len < sizeof(RoaringLeafEntry))
+					continue;
+				entry_bm = roaring64_bitmap_portable_deserialize_safe(
+					(const char *) (le + 1), item_len - sizeof(RoaringLeafEntry));
+				if (entry_bm != NULL)
+				{
+					roaring64_iterator_t *it;
+
+					roaring64_bitmap_and_inplace(entry_bm, so->scan_bm);
+					it = roaring64_iterator_create(entry_bm);
+					while (roaring64_iterator_has_value(it))
+					{
+						rev_scatter(so->rev_map, roaring64_iterator_value(it),
+									col, val32);
+						roaring64_iterator_advance(it);
+					}
+					roaring64_iterator_free(it);
+					roaring64_bitmap_free(entry_bm);
+				}
+			}
+		}
+
+		UnlockReleaseBuffer(buf);
+
+		for (int j = 0; j < ndeferred; j++)
+		{
+			roaring64_bitmap_t   *oe_bm =
+				roaring_read_overflow_bitmap(index, &deferred[j].oe);
+			roaring64_iterator_t *it;
+
+			roaring64_bitmap_and_inplace(oe_bm, so->scan_bm);
+			it = roaring64_iterator_create(oe_bm);
+			while (roaring64_iterator_has_value(it))
+			{
+				rev_scatter(so->rev_map, roaring64_iterator_value(it),
+							deferred[j].col, deferred[j].val32);
+				roaring64_iterator_advance(it);
+			}
+			roaring64_iterator_free(it);
+			roaring64_bitmap_free(oe_bm);
+		}
+		if (deferred)
+			pfree(deferred);
+
+		cur = right;
+	}
+
+	/* --- Pending walk: a row's value may still be unmerged. */
+	if (any_pending)
+	{
+		for (int s = 0; s < ROARING_PENDING_SHARDS; s++)
+		{
+			for (int pass = 0; pass < 2; pass++)
+			{
+				BlockNumber pcur = (pass == 0) ? insert_heads[s] : merging_heads[s];
+
+				while (pcur != InvalidBlockNumber)
+				{
+					Buffer				   pbuf = ReadBuffer(index, pcur);
+					Page				   ppage;
+					RoaringPendingSpecial *pspc;
+					RoaringPendingEntry	  *raw;
+
+					LockBuffer(pbuf, BUFFER_LOCK_SHARE);
+					ppage = BufferGetPage(pbuf);
+					pspc  = (RoaringPendingSpecial *) PageGetSpecialPointer(ppage);
+					if (pspc->page_type != ROARING_PAGE_PENDING_INSERT)
+					{
+						UnlockReleaseBuffer(pbuf);
+						break;
+					}
+					raw = (RoaringPendingEntry *) PageGetContents(ppage);
+					for (uint16 k = 0; k < pspc->entry_count; k++)
+					{
+						int64	val = raw[k].value;
+						uint64	tid = raw[k].linear_tid;
+						int		col;
+
+						if (val < 0)
+							continue;
+						col = (int) ((uint64) val >> 32) - 1;
+						if (col < 0 || col >= nkeys || !so->rev_need[col])
+							continue;
+						if (!roaring_pending_visible(raw[k].xmin, snapshot))
+							continue;
+						if (!roaring64_bitmap_contains(so->scan_bm, tid))
+							continue;
+						rev_scatter(so->rev_map, tid, col,
+									(int32) (uint32) (val & UINT64_C(0xFFFFFFFF)));
+					}
+					pcur = pspc->next_page;
+					UnlockReleaseBuffer(pbuf);
+				}
+			}
+		}
+	}
+}
+
+/* ----------------------------------------------------------------
  * roaring_gettuple
  *
  * amgettuple for exact mode: enables IndexScan and IndexOnlyScan paths.
@@ -1769,9 +2076,11 @@ roaring_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	/*
 	 * T65: IndexOnlyScan projection.  Build xs_itup from scan keys (key
-	 * columns) and the payload store (INCLUDE columns).  If the index has no
-	 * INCLUDE columns but xs_want_itup is still set (single-column IOS),
-	 * we still need to return the key column value from the scan key.
+	 * columns) and the payload store (INCLUDE columns).  A key column's value
+	 * comes from a plain equality scan key when present; otherwise (the column
+	 * is projected but constrained by IN / IS NOT NULL, or not at all) the
+	 * reverse-bitmap map supplies it.  IS NULL columns and TIDs absent from
+	 * every value bitmap are left NULL.
 	 */
 	if (scan->xs_want_itup)
 	{
@@ -1785,14 +2094,41 @@ roaring_gettuple(IndexScanDesc scan, ScanDirection dir)
 		for (i = 0; i < natts; i++)
 			isnull[i] = true;
 
+		/* Key columns pinned by a plain equality scan key. */
 		for (i = 0; i < scan->numberOfKeys; i++)
 		{
-			int col = scan->keyData[i].sk_attno - 1;
+			ScanKey sk  = &scan->keyData[i];
+			int     col = sk->sk_attno - 1;
 
-			if (col >= 0 && col < nkeys)
+			if (col < 0 || col >= nkeys)
+				continue;
+			/* IS NULL → leave NULL; IS NOT NULL / IN → reverse map fills it. */
+			if (sk->sk_flags & (SK_ISNULL | SK_SEARCHARRAY))
+				continue;
+			values[col] = sk->sk_argument;
+			isnull[col] = false;
+		}
+
+		/* Returnable key cols not pinned above: reconstruct via reverse map. */
+		if (!so->rev_built)
+			roaring_build_reverse_map(scan);
+		if (so->rev_map != NULL)
+		{
+			bool				 found;
+			RoaringReverseEntry *e = hash_search(so->rev_map, &linear,
+												 HASH_FIND, &found);
+
+			for (i = 0; i < nkeys; i++)
 			{
-				values[col] = scan->keyData[i].sk_argument;
-				isnull[col] = false;
+				if (!so->rev_need[i] || !isnull[i])
+					continue;
+				if (found && (e->known & (1u << i)))
+				{
+					values[i] = roaring_key32_to_datum(e->vals[i],
+													   index->rd_opcintype[i]);
+					isnull[i] = false;
+				}
+				/* else: TID in no value bitmap for col i ⇒ column is NULL. */
 			}
 		}
 
