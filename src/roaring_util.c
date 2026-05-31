@@ -124,55 +124,6 @@ roaring_datum_to_key64(Datum d, Oid typid)
 }
 
 /*
- * roaring_key32_to_datum
- *
- * Inverse of roaring_datum_to_key32 for the injective (non-hashed) key types.
- * Reconstructs a Datum of type 'typid' from the 32-bit value slot of a
- * multi-column key, used by the reverse-bitmap projection in roaring_gettuple
- * to return an unconstrained key column's value.
- *
- * Only valid for types that roaring_datum_to_key32 maps injectively:
- * int2/int4/oid/date/bool/float4 and enum (Oid).  text/uuid and (multi-column)
- * int8 are hashed — they are not returnable (roaring_canreturn returns false),
- * so they never reach here.
- */
-Datum
-roaring_key32_to_datum(int32 key32, Oid typid)
-{
-	switch (typid)
-	{
-		case INT4OID:
-			return Int32GetDatum(key32);
-		case INT2OID:
-			return Int16GetDatum((int16) key32);
-		case BOOLOID:
-			return BoolGetDatum(key32 != 0);
-		case DATEOID:
-			return Int32GetDatum(key32);	/* DateADT is int32 */
-		case OIDOID:
-			return ObjectIdGetDatum((Oid)(uint32) key32);
-		case FLOAT4OID:
-		{
-			/* key32 is the IEEE 754 bit pattern (±0.0 both collapsed to 0). */
-			float4 f;
-			uint32 bits = (uint32) key32;
-
-			memcpy(&f, &bits, sizeof(f));
-			return Float4GetDatum(f);
-		}
-		default:
-			/* Enum types are stored as their Oid. */
-			if (get_typtype(typid) == TYPTYPE_ENUM)
-				return ObjectIdGetDatum((Oid)(uint32) key32);
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("roaring index: type %s is not reverse-recoverable "
-							"from a 32-bit key", format_type_be(typid))));
-			return (Datum) 0;
-	}
-}
-
-/*
  * roaring_validate_metapage
  *
  * Check magic and CRoaring format version.  Called from every AM entry point

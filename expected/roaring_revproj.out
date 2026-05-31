@@ -1,202 +1,131 @@
 -- ================================================================
--- roaring_revproj: reverse-bitmap projection of returnable key columns
+-- roaring_revproj: projecting an UNCONSTRAINED key column
 --
--- An IndexOnlyScan that projects a key column whose value is NOT pinned by
--- an equality scan key (SELECT a WHERE b = 5, or a column constrained only by
--- IN / IS NOT NULL) reconstructs the value from the index: a column's value
--- bitmaps partition its TIDs, so the bitmap (hence key) containing a TID gives
--- the value; a TID in no value bitmap is NULL for that column.
+-- A roaring key column can be returned by an IndexOnlyScan only when it is
+-- pinned by an equality clause.  Projecting a key column with no equality
+-- clause (SELECT a WHERE b=5, or a column constrained only by IN / IS NOT NULL)
+-- cannot be reconstructed from the index, so the planner suppresses the
+-- IndexOnlyScan for that shape (roaring_suppress_unreturnable_ios) and uses a
+-- bitmap/heap/seq scan that projects the column correctly from the heap.
 --
--- Each index result is cross-checked against a seqscan oracle.
+-- The common fast paths — INCLUDE projection (sum(id)) and equality-pinned key
+-- projection — must stay index-only.  Correctness is cross-checked against a
+-- forced-seqscan oracle.
 -- ================================================================
 CREATE EXTENSION IF NOT EXISTS pg_roaring_index;
 NOTICE:  extension "pg_roaring_index" already exists, skipping
-CREATE TABLE rp (id int, a int, b int, d date, f float4);
-INSERT INTO rp SELECT g,
-       CASE WHEN g % 7 = 0 THEN NULL ELSE g % 10 END,   -- a: scattered NULLs
-       g % 4,                                            -- b
-       DATE '2020-01-01' + (g % 5),                      -- d
-       (g % 3)::float4 + 0.5                             -- f
-  FROM generate_series(1, 200) g;
-CREATE INDEX rp_idx ON rp USING roaring (a, b, d, f);
--- post-build (pending) rows, including a NULL key column
-INSERT INTO rp VALUES (201, 5, 1, DATE '2020-01-02', 1.5),
-                      (202, NULL, 1, DATE '2020-01-02', 2.5);
-VACUUM rp;   -- merge pending into the leaf bitmaps
-SET enable_seqscan = off;
--- Plan: projecting the unconstrained key column a is still an Index Only Scan.
-EXPLAIN (COSTS OFF) SELECT a FROM rp WHERE b = 1;
-             QUERY PLAN             
-------------------------------------
- Index Only Scan using rp_idx on rp
-   Index Cond: (b = 1)
-(2 rows)
-
--- int reconstruction incl. NULLs (unconstrained projection).
-SELECT a AS a_idx, count(*) FROM rp WHERE b = 1 GROUP BY a ORDER BY a NULLS LAST;
- a_idx | count 
--------+-------
-     1 |     8
-     3 |     9
-     5 |    10
-     7 |     9
-     9 |     8
-       |     8
-(6 rows)
-
--- date + float4 reconstruction.
-SELECT d AS d_idx, count(*) FROM rp WHERE b = 2 GROUP BY d ORDER BY d;
-   d_idx    | count 
-------------+-------
- 01-01-2020 |    10
- 01-02-2020 |    10
- 01-03-2020 |    10
- 01-04-2020 |    10
- 01-05-2020 |    10
-(5 rows)
-
-SELECT f AS f_idx, count(*) FROM rp WHERE b = 2 GROUP BY f ORDER BY f;
- f_idx | count 
--------+-------
-   0.5 |    17
-   1.5 |    16
-   2.5 |    17
+CREATE TABLE rv (id bigint, a int, b int);
+-- a and b independent: for a fixed b, a ranges over 0..49
+INSERT INTO rv SELECT g, g % 50, (g / 50) % 40
+               FROM generate_series(1, 40000) g;
+CREATE INDEX rv_idx ON rv USING roaring (a, b) INCLUDE (id);
+VACUUM ANALYZE rv;
+-- ----------------------------------------------------------------
+-- Fast paths stay index-only.
+-- ----------------------------------------------------------------
+-- INCLUDE projection: the flagship sum(id) path.
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rv WHERE b = 7;
+                QUERY PLAN                
+------------------------------------------
+ Aggregate
+   ->  Index Only Scan using rv_idx on rv
+         Index Cond: (b = 7)
 (3 rows)
 
--- projected column constrained by IN (value varies per row → reverse map).
-SELECT a AS in_idx, count(*) FROM rp WHERE a IN (3,5,9) AND b = 1 GROUP BY a ORDER BY a;
- in_idx | count 
---------+-------
-      3 |     9
-      5 |    10
-      9 |     8
+-- Equality-pinned key projection: a is reconstructable from a = 5.
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rv WHERE a = 5;
+                QUERY PLAN                
+------------------------------------------
+ Aggregate
+   ->  Index Only Scan using rv_idx on rv
+         Index Cond: (a = 5)
 (3 rows)
 
--- projected column constrained only by IS NOT NULL (value unknown → reverse).
-SELECT a AS nn_idx, count(*) FROM rp WHERE a IS NOT NULL AND b = 3 GROUP BY a ORDER BY a;
- nn_idx | count 
---------+-------
-      1 |     9
-      3 |     9
-      5 |     8
-      7 |     8
-      9 |     9
+-- ----------------------------------------------------------------
+-- Unconstrained key projection is NOT index-only, and is correct.
+-- ----------------------------------------------------------------
+-- a has no equality clause here, so the IndexOnlyScan is suppressed.
+SELECT 'idx' AS src, a, count(*) FROM rv WHERE b = 7 GROUP BY a ORDER BY a LIMIT 5;
+ src | a | count 
+-----+---+-------
+ idx | 0 |    20
+ idx | 1 |    20
+ idx | 2 |    20
+ idx | 3 |    20
+ idx | 4 |    20
 (5 rows)
 
--- Seqscan oracle: every count above must match.
-SET enable_seqscan = on;
+-- projecting a constrained only by IS NOT NULL is likewise not reconstructable.
+SELECT 'idx' AS src, a, count(*) FROM rv WHERE b = 7 AND a IS NOT NULL
+  GROUP BY a ORDER BY a LIMIT 5;
+ src | a | count 
+-----+---+-------
+ idx | 0 |    20
+ idx | 1 |    20
+ idx | 2 |    20
+ idx | 3 |    20
+ idx | 4 |    20
+(5 rows)
+
+-- Oracle: force a sequential scan and compare.
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
-SELECT a AS a_seq, count(*) FROM rp WHERE b = 1 GROUP BY a ORDER BY a NULLS LAST;
- a_seq | count 
--------+-------
-     1 |     8
-     3 |     9
-     5 |    10
-     7 |     9
-     9 |     8
-       |     8
-(6 rows)
-
-SELECT d AS d_seq, count(*) FROM rp WHERE b = 2 GROUP BY d ORDER BY d;
-   d_seq    | count 
-------------+-------
- 01-01-2020 |    10
- 01-02-2020 |    10
- 01-03-2020 |    10
- 01-04-2020 |    10
- 01-05-2020 |    10
+SET enable_indexonlyscan = off;
+SELECT 'seq' AS src, a, count(*) FROM rv WHERE b = 7 GROUP BY a ORDER BY a LIMIT 5;
+ src | a | count 
+-----+---+-------
+ seq | 0 |    20
+ seq | 1 |    20
+ seq | 2 |    20
+ seq | 3 |    20
+ seq | 4 |    20
 (5 rows)
 
-SELECT f AS f_seq, count(*) FROM rp WHERE b = 2 GROUP BY f ORDER BY f;
- f_seq | count 
--------+-------
-   0.5 |    17
-   1.5 |    16
-   2.5 |    17
-(3 rows)
-
-SELECT a AS in_seq, count(*) FROM rp WHERE a IN (3,5,9) AND b = 1 GROUP BY a ORDER BY a;
- in_seq | count 
---------+-------
-      3 |     9
-      5 |    10
-      9 |     8
-(3 rows)
-
-SELECT a AS nn_seq, count(*) FROM rp WHERE a IS NOT NULL AND b = 3 GROUP BY a ORDER BY a;
- nn_seq | count 
---------+-------
-      1 |     9
-      3 |     9
-      5 |     8
-      7 |     8
-      9 |     9
+SELECT 'seq' AS src, a, count(*) FROM rv WHERE b = 7 AND a IS NOT NULL
+  GROUP BY a ORDER BY a LIMIT 5;
+ src | a | count 
+-----+---+-------
+ seq | 0 |    20
+ seq | 1 |    20
+ seq | 2 |    20
+ seq | 3 |    20
+ seq | 4 |    20
 (5 rows)
 
 RESET enable_indexscan;
 RESET enable_bitmapscan;
-RESET enable_seqscan;
-DROP TABLE rp;
--- ----------------------------------------------------------------
--- Unmerged pending: the projected column's value lives only in the
--- pending list (no VACUUM) and must still be reconstructed.
--- ----------------------------------------------------------------
-CREATE TABLE rpp (id int, a int, b int);
-INSERT INTO rpp SELECT g, g % 6, g % 3 FROM generate_series(1, 60) g;
-CREATE INDEX rpp_idx ON rpp USING roaring (a, b);
-INSERT INTO rpp VALUES (101, 2, 1), (102, 4, 1), (103, NULL, 1);  -- pending
+RESET enable_indexonlyscan;
+-- The degenerate case (seqscan off, paths pruned) must still be correct — the
+-- hook adds a bitmap-heap fallback (and a seqscan backstop) so it never NULLs.
 SET enable_seqscan = off;
-SELECT a AS pend_idx, count(*) FROM rpp WHERE b = 1 GROUP BY a ORDER BY a NULLS LAST;
- pend_idx | count 
-----------+-------
-        1 |    10
-        2 |     1
-        4 |    11
-          |     1
-(4 rows)
+SELECT 'idx_noseq' AS src, a, count(*) FROM rv WHERE b = 7 GROUP BY a ORDER BY a LIMIT 3;
+    src    | a | count 
+-----------+---+-------
+ idx_noseq | 0 |    20
+ idx_noseq | 1 |    20
+ idx_noseq | 2 |    20
+(3 rows)
 
-SET enable_seqscan = on;
-SET enable_indexscan = off;
-SET enable_bitmapscan = off;
-SELECT a AS pend_seq, count(*) FROM rpp WHERE b = 1 GROUP BY a ORDER BY a NULLS LAST;
- pend_seq | count 
-----------+-------
-        1 |    10
-        2 |     1
-        4 |    11
-          |     1
-(4 rows)
-
-RESET enable_indexscan;
-RESET enable_bitmapscan;
 RESET enable_seqscan;
-DROP TABLE rpp;
+DROP TABLE rv;
 -- ----------------------------------------------------------------
--- Multi-column int8 key is hashed (canreturn = false): projecting it is
--- NOT an Index Only Scan, but the values are still correct (via the heap).
+-- Multi-column int8 key is hashed (canreturn = false): not returnable, so
+-- projecting it is never an IndexOnlyScan, and the values are correct.
 -- ----------------------------------------------------------------
-CREATE TABLE r8 (id int, a int8, b int);
+CREATE TABLE r8 (id int, k int8, b int);
 INSERT INTO r8 SELECT g, (g % 5)::int8 * 1000000000000, g % 3
-               FROM generate_series(1, 60) g;
-CREATE INDEX r8_idx ON r8 USING roaring (a, b);
-VACUUM r8;
+               FROM generate_series(1, 4000) g;
+CREATE INDEX r8_idx ON r8 USING roaring (k, b);
+VACUUM ANALYZE r8;
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT a FROM r8 WHERE b = 1;   -- Index Scan, not Index Only
-          QUERY PLAN           
--------------------------------
- Index Scan using r8_idx on r8
-   Index Cond: (b = 1)
-(2 rows)
-
-SELECT a AS i8_idx, count(*) FROM r8 WHERE b = 1 GROUP BY a ORDER BY a;
-    i8_idx     | count 
+SELECT k, count(*) FROM r8 WHERE b = 1 GROUP BY k ORDER BY k;
+       k       | count 
 ---------------+-------
-             0 |     4
- 1000000000000 |     4
- 2000000000000 |     4
- 3000000000000 |     4
- 4000000000000 |     4
+             0 |   267
+ 1000000000000 |   267
+ 2000000000000 |   267
+ 3000000000000 |   266
+ 4000000000000 |   267
 (5 rows)
 
 RESET enable_seqscan;

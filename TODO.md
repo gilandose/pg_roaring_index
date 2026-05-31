@@ -98,25 +98,47 @@ Follow-ups for this feature:
   exact bigint value `ROARING_NULL_COL_KEY(1)` — documented; the covering store
   removes it.
 
-### DONE — bare unconstrained key projection via reverse-bitmap lookup
+### DONE — bare unconstrained key projection via planner steering
 
 **Bare unconstrained key projection** (`SELECT a FROM mc WHERE b = 5`, and
-columns constrained only by `IN` / `IS NOT NULL`) used to return NULL for `a`.
-Now reconstructed from the index: a column's value bitmaps partition its TIDs,
-so the bitmap — hence key — containing a TID identifies the value; a TID in no
-value bitmap is NULL for that column (`roaring_gettuple` reverse map, built once
-per scan, leaf + unmerged-pending, only when a projected key column lacks an
-equality scan key → zero cost on the hot paths). Valid for the **injective key
-types** (`int2/int4/oid/date/bool/float4/enum`) via `roaring_key32_to_datum`.
+columns constrained only by `IN` / `IS NOT NULL`) used to return NULL for `a`:
+the planner chose an IndexOnlyScan (because `amcanreturn` says key columns are
+returnable, which keeps `sum(id) WHERE key=x` index-only), but roaring cannot
+reconstruct an *unconstrained* key column, so the IOS handed back NULL.
 
-Hashed key types can't be inverted from `hash(value)`, so multi-column `int8`
-key columns are now `canreturn = false` (text/uuid already were) — projecting
-them is a plain Index Scan that fetches the value from the heap (correct, just
-not index-only). They are recheck-only anyway, so this costs nothing extra. The
-lossless multi-column `int8` covering store (above) would make them returnable.
-Also fixed a latent bug the reverse path exposed: an `IS NULL` scan key used to
-reconstruct a garbage value instead of NULL in the IOS tuple. Covered by
-`expected/roaring_revproj.out` (incl. seqscan oracle cross-checks).
+The key realization: roaring's own **bitmap-heap scan already projects any
+column correctly from the heap** — `SELECT a WHERE b=5` is correct the moment
+the planner picks the bitmap path instead of the IOS. So this is purely a plan
+selection problem, fixed with zero storage and no value reconstruction:
+
+- A `set_rel_pathlist_hook` (`roaring_suppress_unreturnable_ios`) inspects each
+  roaring IndexOnlyScan path. Using the target list + filter quals (which the
+  planner *can* see, unlike `amgettuple`), it detects when a *needed* key column
+  has no equality clause and **penalizes that path's `disabled_nodes`**, so the
+  planner prefers any heap-projecting plan. Columns appearing only in an index
+  condition (e.g. `count(*) WHERE v IS NOT NULL`) are not "needed to return" and
+  stay index-only.
+- `add_path` may have already pruned every heap-projecting alternative as
+  dominated by the (then-cheaper) IOS, so the hook **re-adds a bitmap-heap path**
+  over the same index clauses (roaring-native, selectivity-aware) plus a seqscan
+  backstop. On larger tables a surviving bitmap path is cheaper and wins anyway.
+
+Result (10M ClickBench): `sum(id) WHERE os=2` stays Index Only Scan at ~0.93 s
+(no regression); `SELECT regionid WHERE counterid=62` becomes a Bitmap Heap Scan
+returning correct values. Works for *all* key types (the heap has the real
+value), so it also covers text/uuid/multi-column int8. Covered by
+`expected/roaring_revproj.out` with seqscan-oracle cross-checks.
+
+Also kept from this work: multi-column `int8` key columns are `canreturn = false`
+(hashed → recheck-only, never index-only-returnable; text/uuid already were), and
+the `IS NULL` IOS tuple now yields NULL rather than a garbage value.
+
+Earlier dead-ends (kept for the record): a per-TID **reverse-bitmap** map in
+`amgettuple` reconstructed values from the value-bitmap partition, but the AM
+can't see the target list so it mapped *every* unconstrained column —
+`sum(id) WHERE os=2` blew up to 12 s on the 10M smoke test. A work-budget gate
+bounded the blow-up but still over-mapped and silently NULLed large projections.
+Both were abandoned in favour of the planner-steering approach above.
 
 **Considered and rejected: GiST-style "only INCLUDE columns are returnable."**
 The tempting fix is `amcanreturn(key col) = false`, returning only INCLUDE

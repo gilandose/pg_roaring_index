@@ -197,10 +197,11 @@ read / write / merge protocols.
 - **Lossless multi-column `int8`** is still pending a per-column covering store
   (high-cardinality multi-column `int8` keys pay recheck cost). See
   [`TODO.md`](TODO.md). Projecting a bare *unconstrained* key column of a
-  multi-column index (`SELECT a … WHERE b = 5`) **is** supported for the lossless
-  key types (`int2/int4/oid/date/bool/float4/enum`): the value is reconstructed
-  from the index via reverse-bitmap lookup (a column's value bitmaps partition
-  its TIDs).
+  multi-column index (`SELECT a … WHERE b = 5`) returns the correct value but is
+  **not index-only**: the planner steers it to a bitmap-heap scan (which projects
+  the column from the heap) instead of an IndexOnlyScan that could only return
+  NULL. `sum(id) … WHERE key = x` and other INCLUDE / equality-pinned projections
+  stay index-only.
 - **Serial index build.** `ambuild` is single-threaded (parallel build is on the
   roadmap); a wide 20-column / 100M-row build takes tens of minutes.
 

@@ -152,22 +152,22 @@ roaring_canreturn(Relation index, int attno)
 		return true;
 
 	/*
-	 * Key columns carry only value->bitmap, not a per-TID value.  A returnable
-	 * key column's value is recovered either from an equality scan key (the
-	 * common case, e.g. sum(id) WHERE key=x stays index-only) or, when the
-	 * column is projected but not equality-constrained (SELECT a FROM t WHERE
-	 * b=5), by the reverse-bitmap lookup in roaring_gettuple — the value bitmaps
-	 * of a column partition its TIDs, so the bitmap containing a TID identifies
-	 * the value.  This requires the key to be losslessly recoverable:
+	 * Key columns carry only value->bitmap, not a per-TID value.  In an
+	 * IndexOnlyScan a key column's value can therefore be produced only when it
+	 * is pinned by an equality scan key (the common case, e.g. sum(id) WHERE
+	 * key=x stays index-only, key reconstructed from the scan key).  Returning
+	 * true here is honest for that case but NOT for projecting an
+	 * *unconstrained* key column (SELECT a FROM t WHERE b=5), which the index
+	 * cannot reconstruct — so the planner suppresses the IndexOnlyScan path for
+	 * that shape and routes it to a bitmap/heap scan that projects from the heap
+	 * (see roaring_suppress_unreturnable_ios in roaring_customscan.c).
 	 *
-	 *   - text/uuid store hash(value): not recoverable — never returnable.
+	 * Hash-keyed types can never be returned (the stored hash is not the value),
+	 * so they are not returnable at all:
+	 *   - text/uuid store hash(value).
 	 *   - int8 in a MULTI-column index is hashed into the 32-bit key slot
-	 *     (executor recheck), so it too is not recoverable.  Single-column int8
-	 *     keeps the full 64-bit value and stays returnable.
-	 *
-	 * The remaining key types (int2/int4/oid/date/bool/float4/enum) encode the
-	 * value injectively in the key and are recoverable; see
-	 * roaring_key32_to_datum().
+	 *     (executor recheck).  Single-column int8 keeps the full 64-bit value
+	 *     and stays returnable.
 	 */
 	opcintype = index->rd_opcintype[attno - 1];
 	if (opcintype == TEXTOID || opcintype == UUIDOID)

@@ -34,7 +34,10 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/paths.h"
 #include "optimizer/planner.h"
+#include "access/sysattr.h"
 #include "storage/bufmgr.h"
 #include "commands/explain_format.h"
 #include "utils/array.h"
@@ -66,6 +69,7 @@ typedef struct RoaringCountState
  * Saved previous hook pointer
  * ---------------------------------------------------------------- */
 static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
+static set_rel_pathlist_hook_type   prev_set_rel_pathlist_hook   = NULL;
 
 /* Cached AM OID — set in roaring_customscan_init(), never changes. */
 static Oid roaring_exact_amoid = InvalidOid;
@@ -853,6 +857,170 @@ roaring_count_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 }
 
 /* ----------------------------------------------------------------
+ * Planner steering: drop IndexOnlyScan paths that would return NULL
+ *
+ * A roaring key column can be produced by an IndexOnlyScan only when it is
+ * pinned by an equality scan key (roaring_gettuple fills it from the key).  A
+ * key column that is *needed* (projected, or referenced by a rechecked filter)
+ * without an equality clause — SELECT a FROM t WHERE b = 5, or a column
+ * constrained only by IN / IS NOT NULL — cannot be reconstructed and would come
+ * back NULL.  amcanreturn is static and cannot see the query, so the planner
+ * builds such an IOS path anyway.  Here, with the target list in hand, we drop
+ * those paths; the planner then falls back to a bitmap-heap (or index) scan
+ * that projects the column correctly from the heap.  The common shapes —
+ * INCLUDE projection (sum(id) WHERE key=x) and equality-pinned key projection
+ * (SELECT os WHERE os=2) — are unaffected and stay index-only.
+ * ---------------------------------------------------------------- */
+static bool
+roaring_ios_returns_null_key(RelOptInfo *rel, IndexPath *ipath)
+{
+	IndexOptInfo *index  = ipath->indexinfo;
+	Bitmapset	 *needed = NULL;
+	Bitmapset	 *eqcols = NULL;
+	ListCell	 *lc;
+	bool		  unsafe = false;
+	int			  c;
+
+	/*
+	 * Columns whose value the IndexOnlyScan must actually produce: the output
+	 * target list, plus any rechecked filter quals.  A column that appears only
+	 * in an index condition (equality / IN / IS [NOT] NULL) is handled by the
+	 * scan itself and is NOT returned — so count(*) WHERE v IS NOT NULL needs
+	 * nothing from v and must stay index-only.
+	 */
+	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &needed);
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+		ListCell	 *lc2;
+		bool		  is_index_cond = false;
+
+		foreach(lc2, ipath->indexclauses)
+			if (((IndexClause *) lfirst(lc2))->rinfo == ri)
+			{
+				is_index_cond = true;
+				break;
+			}
+		if (!is_index_cond)
+			pull_varattnos((Node *) ri->clause, rel->relid, &needed);
+	}
+
+	/*
+	 * Which index key columns are pinned to a single value by their clause.
+	 * roaring supports only equality, IN (ScalarArrayOpExpr) and IS [NOT] NULL
+	 * (NullTest), so a clause pins the value unless it is an IN list (value
+	 * varies per row) or IS NOT NULL (value unknown).  Plain equality pins it —
+	 * and note `bool_col = true` is simplified to a bare Var, not an OpExpr, so
+	 * we must not test for OpExpr specifically.  IS NULL pins it to NULL, which
+	 * roaring_gettuple reproduces correctly.
+	 */
+	foreach(lc, ipath->indexclauses)
+	{
+		IndexClause *ic     = (IndexClause *) lfirst(lc);
+		Node	    *clause = (Node *) ic->rinfo->clause;
+		bool		 pins   = true;
+
+		if (IsA(clause, ScalarArrayOpExpr))
+			pins = false;
+		else if (IsA(clause, NullTest) &&
+				 ((NullTest *) clause)->nulltesttype == IS_NOT_NULL)
+			pins = false;
+		if (pins)
+			eqcols = bms_add_member(eqcols, ic->indexcol);
+	}
+
+	for (c = 0; c < index->nkeycolumns; c++)
+	{
+		AttrNumber attno = index->indexkeys[c];
+
+		if (attno <= 0)
+			continue;	/* expression / whole-row / system column */
+		if (!bms_is_member(attno - FirstLowInvalidHeapAttributeNumber, needed))
+			continue;	/* this key column isn't needed by the query */
+		if (!bms_is_member(c, eqcols))
+		{
+			unsafe = true;	/* needed key column with no equality clause */
+			break;
+		}
+	}
+
+	bms_free(needed);
+	bms_free(eqcols);
+	return unsafe;
+}
+
+static void
+roaring_suppress_unreturnable_ios(PlannerInfo *root, RelOptInfo *rel,
+								  Index rti, RangeTblEntry *rte)
+{
+	ListCell  *lc;
+	IndexPath *unsafe_ios = NULL;
+
+	if (prev_set_rel_pathlist_hook)
+		prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	if (rte->rtekind != RTE_RELATION || rel->reloptkind != RELOPT_BASEREL)
+		return;
+
+	/* Lazy AM OID lookup (syscache is unavailable at _PG_init time). */
+	if (roaring_exact_amoid == InvalidOid)
+	{
+		HeapTuple tup = SearchSysCache1(AMNAME, CStringGetDatum("roaring"));
+
+		if (!HeapTupleIsValid(tup))
+			return;
+		roaring_exact_amoid = ((Form_pg_am) GETSTRUCT(tup))->oid;
+		ReleaseSysCache(tup);
+	}
+
+	foreach(lc, rel->pathlist)
+	{
+		Path *path = (Path *) lfirst(lc);
+
+		if (IsA(path, IndexPath) &&
+			path->pathtype == T_IndexOnlyScan &&
+			((IndexPath *) path)->indexinfo->relam == roaring_exact_amoid &&
+			roaring_ios_returns_null_key(rel, (IndexPath *) path))
+		{
+			/*
+			 * This IndexOnlyScan would hand back NULL for a key column the query
+			 * needs (it has no equality clause to reconstruct it from).  Mark it
+			 * heavily disabled rather than removing it: PG compares
+			 * disabled_nodes ahead of cost, so the planner now prefers any other
+			 * plan — bitmap-heap / index / seq scan, all of which project the
+			 * column correctly from the heap.
+			 */
+			path->disabled_nodes += 1000000;
+			if (unsafe_ios == NULL)
+				unsafe_ios = (IndexPath *) path;
+		}
+	}
+
+	/*
+	 * Guarantee a correct, selectivity-aware fallback exists.  When
+	 * enable_seqscan was off (or the table is small), add_path may already have
+	 * pruned every heap-projecting path as "dominated" by the then-cheaper IOS,
+	 * leaving only the now-penalized IOS.  Re-add a bitmap-heap scan over the
+	 * same index conditions — roaring's native strength, and far better than a
+	 * seqscan for a selective predicate — which projects the column from the
+	 * heap.  A seqscan is added too as a backstop for non-selective predicates.
+	 * On larger tables a surviving (cheaper) bitmap-heap path still wins, so
+	 * these only matter in the degenerate case.
+	 */
+	if (unsafe_ios != NULL)
+	{
+		IndexPath *bmq = create_index_path(root, unsafe_ios->indexinfo,
+										   unsafe_ios->indexclauses,
+										   NIL, NIL, NIL, ForwardScanDirection,
+										   false, NULL, 1.0, false);
+
+		add_path(rel, (Path *) create_bitmap_heap_path(root, rel, (Path *) bmq,
+													   NULL, 1.0, 0));
+		add_path(rel, create_seqscan_path(root, rel, NULL, 0));
+	}
+}
+
+/* ----------------------------------------------------------------
  * Initialisation — called from _PG_init
  * ---------------------------------------------------------------- */
 void
@@ -865,4 +1033,6 @@ roaring_customscan_init(void)
 	RegisterCustomScanMethods(&roaring_count_scan_methods);
 	prev_create_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook      = roaring_create_upper_paths;
+	prev_set_rel_pathlist_hook   = set_rel_pathlist_hook;
+	set_rel_pathlist_hook        = roaring_suppress_unreturnable_ios;
 }
