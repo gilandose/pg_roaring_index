@@ -109,6 +109,46 @@ SELECT 'idx_noseq' AS src, a, count(*) FROM rv WHERE b = 7 GROUP BY a ORDER BY a
 RESET enable_seqscan;
 DROP TABLE rv;
 -- ----------------------------------------------------------------
+-- Partitioned table: set_rel_pathlist runs for each partition child
+-- (RELOPT_OTHER_MEMBER_REL), which the hook must steer too — otherwise the
+-- per-partition IndexOnlyScan would project NULL.
+-- ----------------------------------------------------------------
+CREATE TABLE pp (id bigint, a int, b int) PARTITION BY RANGE (id);
+CREATE TABLE pp0 PARTITION OF pp FOR VALUES FROM (0) TO (10000);
+CREATE TABLE pp1 PARTITION OF pp FOR VALUES FROM (10000) TO (20000);
+INSERT INTO pp SELECT g, g % 50, (g / 50) % 40 FROM generate_series(1, 19999) g;
+CREATE INDEX ON pp USING roaring (a, b);
+VACUUM ANALYZE pp;
+SET enable_seqscan = off;
+SELECT 'part_idx' AS src, a, count(*) FROM pp WHERE b = 7 GROUP BY a ORDER BY a LIMIT 5;
+   src    | a | count 
+----------+---+-------
+ part_idx | 0 |    10
+ part_idx | 1 |    10
+ part_idx | 2 |    10
+ part_idx | 3 |    10
+ part_idx | 4 |    10
+(5 rows)
+
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = off;
+RESET enable_seqscan;
+SELECT 'part_seq' AS src, a, count(*) FROM pp WHERE b = 7 GROUP BY a ORDER BY a LIMIT 5;
+   src    | a | count 
+----------+---+-------
+ part_seq | 0 |    10
+ part_seq | 1 |    10
+ part_seq | 2 |    10
+ part_seq | 3 |    10
+ part_seq | 4 |    10
+(5 rows)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+RESET enable_indexonlyscan;
+DROP TABLE pp;
+-- ----------------------------------------------------------------
 -- Multi-column int8 key is hashed (canreturn = false): not returnable, so
 -- projecting it is never an IndexOnlyScan, and the values are correct.
 -- ----------------------------------------------------------------

@@ -896,11 +896,20 @@ roaring_ios_returns_null_key(RelOptInfo *rel, IndexPath *ipath)
 		bool		  is_index_cond = false;
 
 		foreach(lc2, ipath->indexclauses)
-			if (((IndexClause *) lfirst(lc2))->rinfo == ri)
+		{
+			RestrictInfo *iri = ((IndexClause *) lfirst(lc2))->rinfo;
+
+			/*
+			 * Usually the same RestrictInfo object, but an equivalence-class
+			 * derived clause can be a different node with the same meaning, so
+			 * fall back to a structural compare.
+			 */
+			if (iri == ri || equal(iri->clause, ri->clause))
 			{
 				is_index_cond = true;
 				break;
 			}
+		}
 		if (!is_index_cond)
 			pull_varattnos((Node *) ri->clause, rel->relid, &needed);
 	}
@@ -954,12 +963,20 @@ roaring_suppress_unreturnable_ios(PlannerInfo *root, RelOptInfo *rel,
 								  Index rti, RangeTblEntry *rte)
 {
 	ListCell  *lc;
-	IndexPath *unsafe_ios = NULL;
+	IndexPath *unsafe_ios     = NULL;
+	bool	   has_heap_path = false;
 
 	if (prev_set_rel_pathlist_hook)
 		prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
-	if (rte->rtekind != RTE_RELATION || rel->reloptkind != RELOPT_BASEREL)
+	/*
+	 * Plain base rels and partition children (set_rel_pathlist runs for each
+	 * RELOPT_OTHER_MEMBER_REL too — a partitioned roaring index would otherwise
+	 * escape the check and project NULL).
+	 */
+	if (rte->rtekind != RTE_RELATION ||
+		(rel->reloptkind != RELOPT_BASEREL &&
+		 rel->reloptkind != RELOPT_OTHER_MEMBER_REL))
 		return;
 
 	/* Lazy AM OID lookup (syscache is unavailable at _PG_init time). */
@@ -976,6 +993,14 @@ roaring_suppress_unreturnable_ios(PlannerInfo *root, RelOptInfo *rel,
 	foreach(lc, rel->pathlist)
 	{
 		Path *path = (Path *) lfirst(lc);
+
+		/*
+		 * Any non-IndexOnlyScan scan path (seq / bitmap-heap / plain index)
+		 * projects from the heap and is a correct fallback, so we only need to
+		 * synthesize one below if every such path was pruned.
+		 */
+		if (path->pathtype != T_IndexOnlyScan)
+			has_heap_path = true;
 
 		if (IsA(path, IndexPath) &&
 			path->pathtype == T_IndexOnlyScan &&
@@ -997,17 +1022,16 @@ roaring_suppress_unreturnable_ios(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
-	 * Guarantee a correct, selectivity-aware fallback exists.  When
-	 * enable_seqscan was off (or the table is small), add_path may already have
-	 * pruned every heap-projecting path as "dominated" by the then-cheaper IOS,
-	 * leaving only the now-penalized IOS.  Re-add a bitmap-heap scan over the
-	 * same index conditions — roaring's native strength, and far better than a
-	 * seqscan for a selective predicate — which projects the column from the
-	 * heap.  A seqscan is added too as a backstop for non-selective predicates.
-	 * On larger tables a surviving (cheaper) bitmap-heap path still wins, so
-	 * these only matter in the degenerate case.
+	 * Guarantee a correct, selectivity-aware fallback exists — but only in the
+	 * degenerate case where add_path already pruned every heap-projecting path
+	 * as "dominated" by the then-cheaper IOS (e.g. enable_seqscan off, or a
+	 * small table), leaving only the now-penalized IOS.  When a heap-projecting
+	 * path still survives it is cheaper than the penalized IOS and wins on its
+	 * own, so we skip the (wasted) path construction.  The bitmap-heap path is
+	 * roaring's native strength and far better than a seqscan for a selective
+	 * predicate; the seqscan is a backstop for non-selective ones.
 	 */
-	if (unsafe_ios != NULL)
+	if (unsafe_ios != NULL && !has_heap_path)
 	{
 		IndexPath *bmq = create_index_path(root, unsafe_ios->indexinfo,
 										   unsafe_ios->indexclauses,
